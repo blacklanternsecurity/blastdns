@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use utils::parse_resolver;
 use worker::{QuerySpec, ResolverWorker, WorkItem};
 
-pub use config::{BlastDNSConfig, DEFAULT_THREADS_PER_RESOLVER, DEFAULT_REQUEST_TIMEOUT};
+pub use config::{BlastDNSConfig, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER};
 pub use error::BlastDNSError;
 
 /// Primary API surface for performing DNS lookups concurrently.
@@ -111,7 +111,6 @@ mod tests {
         assert!(matches!(err, BlastDNSError::NoResolvers));
     }
 
-
     #[test]
     fn parse_resolver_accepts_portless_ip() {
         let addr = parse_resolver("203.0.113.10").expect("should parse");
@@ -126,10 +125,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_worker_handles_real_resolver() {
-        let resolver: SocketAddr = "127.0.0.1:53".parse().unwrap();
-        let mut config = BlastDNSConfig::default();
-        config.request_timeout = Duration::from_secs(1);
-        config.threads_per_resolver = 1;
+        let resolver: SocketAddr = "127.0.0.1:5353".parse().unwrap();
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(1),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
 
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
         ResolverWorker::spawn(resolver, rx, config.clone(), 0);
@@ -167,10 +168,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_worker_handles_ipv6_resolver() {
-        let resolver: SocketAddr = "[::1]:53".parse().unwrap();
-        let mut config = BlastDNSConfig::default();
-        config.request_timeout = Duration::from_secs(1);
-        config.threads_per_resolver = 1;
+        let resolver: SocketAddr = "[::1]:5353".parse().unwrap();
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(1),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
 
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
         ResolverWorker::spawn(resolver, rx, config.clone(), 0);

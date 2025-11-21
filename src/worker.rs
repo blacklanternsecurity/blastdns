@@ -13,7 +13,7 @@ use hickory_client::{
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::{error::BlastDNSError, BlastDNSConfig};
+use crate::{BlastDNSConfig, error::BlastDNSError};
 
 /// DNS query specification containing the hostname and record type to query.
 #[derive(Debug)]
@@ -79,15 +79,10 @@ impl ResolverWorker {
     async fn run(self) -> Result<(), BlastDNSError> {
         let mut client = self.init_client().await?;
 
-        loop {
-            match self.work_rx.recv().await {
-                Ok(work_item) => {
-                    let WorkItem { query, responder } = work_item;
-                    let result = self.handle_query(&mut client, query).await;
-                    let _ = responder.send(result);
-                }
-                Err(_) => break,
-            }
+        while let Ok(work_item) = self.work_rx.recv().await {
+            let WorkItem { query, responder } = work_item;
+            let result = self.handle_query(&mut client, query).await;
+            let _ = responder.send(result);
         }
 
         Ok(())
@@ -125,11 +120,11 @@ impl ResolverWorker {
         query: QuerySpec,
     ) -> Result<DnsResponse, BlastDNSError> {
         let QuerySpec { host, record_type } = query;
-        
+
         if self.config.debug {
             eprintln!("[{}] Querying {} {}", self.resolver, host, record_type);
         }
-        
+
         let name = Name::from_ascii(&host)
             .map_err(|source| BlastDNSError::InvalidHostname { name: host, source })?;
 
