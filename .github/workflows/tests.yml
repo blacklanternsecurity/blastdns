@@ -25,7 +25,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
       - name: Start dnsmasq
-        run: sudo dnsmasq --no-daemon --no-hosts --no-resolv --port=53 --server=1.1.1.1 &
+        run: dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1 &
 
       - name: Run tests
         run: cargo test --all --locked --verbose -- --include-ignored

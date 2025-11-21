@@ -135,12 +135,25 @@ Later we will implement error handling, retries, caching, and penalties/timeouts
 
 ## Testing
 
-To run the full test suite including integration tests, you'll need a local DNS server running on `127.0.0.1:53` and `[::1]:53`.
+To run the full test suite including integration tests, you'll need a local DNS server running on `127.0.0.1:5353` and `[::1]:5353`.
+
+Install `dnsmasq`:
+
+```bash
+# Arch Linux
+sudo pacman -S dnsmasq
+
+# Debian/Ubuntu
+sudo apt install dnsmasq
+
+# macOS
+brew install dnsmasq
+```
 
 Start a simple DNS server using `dnsmasq`:
 
 ```bash
-sudo dnsmasq --no-daemon --no-hosts --no-resolv --port=53 --server=1.1.1.1
+dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1
 ```
 
 Then run tests with:
