@@ -4,6 +4,8 @@ use std::time::Duration;
 pub const DEFAULT_THREADS_PER_RESOLVER: usize = 1;
 /// Default timeout in milliseconds used for each resolver request.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Default number of retry attempts per hostname.
+pub const DEFAULT_MAX_RETRIES: usize = 3;
 
 /// Configuration knobs for [`BlastDNSClient`].
 #[derive(Clone, Debug)]
@@ -14,6 +16,8 @@ pub struct BlastDNSConfig {
     pub request_timeout: Duration,
     /// Enable debug logging for DNS lookups.
     pub debug: bool,
+    /// How many times to retry a failed lookup.
+    pub max_retries: usize,
 }
 
 impl Default for BlastDNSConfig {
@@ -22,6 +26,7 @@ impl Default for BlastDNSConfig {
             threads_per_resolver: DEFAULT_THREADS_PER_RESOLVER,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             debug: false,
+            max_retries: DEFAULT_MAX_RETRIES,
         }
     }
 }

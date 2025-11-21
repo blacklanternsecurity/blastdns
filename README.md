@@ -8,6 +8,7 @@ An async rust library for DNS lookups. Can be used to perform simple, one-off lo
 
 ```rust
 use blastdns::{BlastDNSClient, BlastDNSConfig};
+use futures::StreamExt;
 use hickory_client::proto::rr::RecordType;
 use std::time::Duration;
 
@@ -32,19 +33,30 @@ let result = client.resolve("example.com", RecordType::A).await?;
 
 // print the result as serde JSON
 println!("{}", serde_json::to_string_pretty(&result).unwrap());
+
+// bulk lookups stream back as soon as each resolver answers
+let wordlist = ["one.example", "two.example", "three.example"];
+let mut stream = client.resolve_batch(wordlist, RecordType::A);
+while let Some((host, outcome)) = stream.next().await {
+    match outcome {
+        Ok(response) => println!("{}: {} answers", host, response.answers().len()),
+        Err(err) => eprintln!("{} failed: {err}", host),
+    }
+}
 ```
 
 ### CLI
 
-The CLI is a thin wrapper around the Rust API, and is useful for performing DNS lookups. It outputs to JSON, by serializing hickory's `DnsResponse`:
+The CLI streams JSON records for each hostname in an input file, resolving them with the same worker pool used by the library:
 
 ```bash
-$ blastdns example.com --rdtype A --resolvers resolvers.txt
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt
 ```
+
+`hosts.txt` and the resolver file both accept one entry per line (comments via `#` are ignored).
 
 Additional CLI options:
 - `--threads-per-resolver N`: Number of worker tasks per resolver (default: 1)
-- `--queue-capacity N`: Override the bounded queue capacity
 - `--timeout-ms N`: Per-request timeout in milliseconds (default: 3000)
 
 ## Architecture
