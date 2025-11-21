@@ -58,6 +58,8 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt
 Additional CLI options:
 - `--threads-per-resolver N`: Number of worker tasks per resolver (default: 1)
 - `--timeout-ms N`: Per-request timeout in milliseconds (default: 3000)
+- `--purgatory-threshold N`: Consecutive worker errors before it rests (default: 10)
+- `--purgatory-sentence-ms N`: How long a resting worker stays idle (default: 1000)
 
 ## Architecture
 

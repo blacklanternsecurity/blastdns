@@ -10,8 +10,8 @@ use hickory_client::{
         xfer::DnsResponse,
     },
 };
-use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tokio::{sync::oneshot, time::sleep};
+use tracing::debug;
 
 use crate::{BlastDNSConfig, error::BlastDNSError};
 
@@ -69,7 +69,7 @@ impl ResolverWorker {
             match worker.run().await {
                 Ok(()) => debug!("resolver worker {resolver_addr} (#{worker_idx}) shutting down"),
                 Err(err) => {
-                    warn!("resolver worker {resolver_addr} (#{worker_idx}) exited: {err:?}")
+                    eprintln!("resolver worker {resolver_addr} (#{worker_idx}) exited: {err:?}")
                 }
             }
         });
@@ -78,11 +78,39 @@ impl ResolverWorker {
     /// Main worker loop that receives and processes queries until the channel closes.
     async fn run(self) -> Result<(), BlastDNSError> {
         let mut client = self.init_client().await?;
+        let mut consecutive_errors = 0usize;
 
-        while let Ok(work_item) = self.work_rx.recv().await {
+        loop {
+            if self.config.purgatory_threshold > 0
+                && consecutive_errors >= self.config.purgatory_threshold
+            {
+                let sentence = self.config.purgatory_sentence;
+                if !sentence.is_zero() {
+                    eprintln!(
+                        "resolver worker {} entering purgatory for {:?} after {} errors",
+                        self.resolver, sentence, consecutive_errors
+                    );
+                    sleep(sentence).await;
+                }
+                consecutive_errors = 0;
+            }
+
+            let work_item = match self.work_rx.recv().await {
+                Ok(item) => item,
+                Err(_) => break,
+            };
+
             let WorkItem { query, responder } = work_item;
-            let result = self.handle_query(&mut client, query).await;
-            let _ = responder.send(result);
+            match self.handle_query(&mut client, query).await {
+                Ok(response) => {
+                    consecutive_errors = 0;
+                    let _ = responder.send(Ok(response));
+                }
+                Err(err) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let _ = responder.send(Err(err));
+                }
+            }
         }
 
         Ok(())
@@ -106,7 +134,7 @@ impl ResolverWorker {
         let resolver = self.resolver;
         tokio::spawn(async move {
             if let Err(err) = bg.await {
-                warn!("resolver {resolver} background task exited: {err}");
+                eprintln!("resolver {resolver} background task exited: {err}");
             }
         });
 

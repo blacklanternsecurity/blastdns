@@ -2,8 +2,8 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use blastdns::{
-    BlastDNSClient, BlastDNSConfig, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_THREADS_PER_RESOLVER,
+    BlastDNSClient, BlastDNSConfig, DEFAULT_MAX_RETRIES, DEFAULT_PURGATORY_SENTENCE,
+    DEFAULT_PURGATORY_THRESHOLD, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
 };
 use clap::Parser;
 use futures::StreamExt;
@@ -34,6 +34,12 @@ struct Args {
     /// Enable debug logging to show which resolver handles each query.
     #[arg(long)]
     debug: bool,
+    /// Consecutive worker errors before the worker rests.
+    #[arg(long, default_value_t = DEFAULT_PURGATORY_THRESHOLD)]
+    purgatory_threshold: usize,
+    /// How many milliseconds a worker stays in purgatory.
+    #[arg(long, default_value_t = DEFAULT_PURGATORY_SENTENCE.as_millis() as u64)]
+    purgatory_sentence_ms: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -50,6 +56,8 @@ async fn main() -> Result<()> {
         request_timeout: timeout,
         debug: args.debug,
         max_retries: args.retries,
+        purgatory_threshold: args.purgatory_threshold,
+        purgatory_sentence: Duration::from_millis(args.purgatory_sentence_ms),
     };
 
     let client = BlastDNSClient::with_config(resolvers, config).await?;
