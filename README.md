@@ -148,3 +148,17 @@ Then run tests with:
 ```bash
 cargo test -- --ignored
 ```
+
+## Linting
+
+Run clippy for lints:
+
+```bash
+cargo clippy --all-targets --all-features
+```
+
+Run rustfmt for formatting:
+
+```bash
+cargo fmt --all
+```
