@@ -36,4 +36,3 @@ pub enum BlastDNSError {
         source: ClientError,
     },
 }
-

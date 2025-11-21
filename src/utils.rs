@@ -20,4 +20,3 @@ pub(crate) fn parse_resolver(input: &str) -> Result<SocketAddr, BlastDNSError> {
         }
     }
 }
-

@@ -13,7 +13,7 @@ use hickory_client::{
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::{error::BlastDNSError, BlastDNSConfig};
+use crate::{BlastDNSConfig, error::BlastDNSError};
 
 /// DNS query specification containing the hostname and record type to query.
 #[derive(Debug)]
@@ -125,11 +125,11 @@ impl ResolverWorker {
         query: QuerySpec,
     ) -> Result<DnsResponse, BlastDNSError> {
         let QuerySpec { host, record_type } = query;
-        
+
         if self.config.debug {
             eprintln!("[{}] Querying {} {}", self.resolver, host, record_type);
         }
-        
+
         let name = Name::from_ascii(&host)
             .map_err(|source| BlastDNSError::InvalidHostname { name: host, source })?;
 

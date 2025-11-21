@@ -1,7 +1,9 @@
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
-use blastdns::{BlastDNSClient, BlastDNSConfig, DEFAULT_THREADS_PER_RESOLVER, DEFAULT_REQUEST_TIMEOUT};
+use blastdns::{
+    BlastDNSClient, BlastDNSConfig, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
+};
 use clap::Parser;
 use hickory_client::proto::rr::RecordType;
 use serde_json::to_string_pretty;

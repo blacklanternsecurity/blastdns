@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use utils::parse_resolver;
 use worker::{QuerySpec, ResolverWorker, WorkItem};
 
-pub use config::{BlastDNSConfig, DEFAULT_THREADS_PER_RESOLVER, DEFAULT_REQUEST_TIMEOUT};
+pub use config::{BlastDNSConfig, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER};
 pub use error::BlastDNSError;
 
 /// Primary API surface for performing DNS lookups concurrently.
@@ -110,7 +110,6 @@ mod tests {
             .expect_err("expected failure");
         assert!(matches!(err, BlastDNSError::NoResolvers));
     }
-
 
     #[test]
     fn parse_resolver_accepts_portless_ip() {
