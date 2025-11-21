@@ -79,15 +79,10 @@ impl ResolverWorker {
     async fn run(self) -> Result<(), BlastDNSError> {
         let mut client = self.init_client().await?;
 
-        loop {
-            match self.work_rx.recv().await {
-                Ok(work_item) => {
-                    let WorkItem { query, responder } = work_item;
-                    let result = self.handle_query(&mut client, query).await;
-                    let _ = responder.send(result);
-                }
-                Err(_) => break,
-            }
+        while let Ok(work_item) = self.work_rx.recv().await {
+            let WorkItem { query, responder } = work_item;
+            let result = self.handle_query(&mut client, query).await;
+            let _ = responder.send(result);
         }
 
         Ok(())

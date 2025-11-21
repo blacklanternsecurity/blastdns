@@ -38,10 +38,11 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to load resolvers from {}", args.resolvers.display()))?;
 
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
-    let mut config = BlastDNSConfig::default();
-    config.threads_per_resolver = args.threads_per_resolver.max(1);
-    config.request_timeout = timeout;
-    config.debug = args.debug;
+    let config = BlastDNSConfig {
+        threads_per_resolver: args.threads_per_resolver.max(1),
+        request_timeout: timeout,
+        debug: args.debug,
+    };
 
     let client = BlastDNSClient::with_config(resolvers, config).await?;
     let response = client.resolve(&args.host, args.record_type).await?;

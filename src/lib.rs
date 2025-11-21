@@ -126,9 +126,11 @@ mod tests {
     #[tokio::test]
     async fn resolver_worker_handles_real_resolver() {
         let resolver: SocketAddr = "127.0.0.1:53".parse().unwrap();
-        let mut config = BlastDNSConfig::default();
-        config.request_timeout = Duration::from_secs(1);
-        config.threads_per_resolver = 1;
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(1),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
 
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
         ResolverWorker::spawn(resolver, rx, config.clone(), 0);
@@ -167,9 +169,11 @@ mod tests {
     #[tokio::test]
     async fn resolver_worker_handles_ipv6_resolver() {
         let resolver: SocketAddr = "[::1]:53".parse().unwrap();
-        let mut config = BlastDNSConfig::default();
-        config.request_timeout = Duration::from_secs(1);
-        config.threads_per_resolver = 1;
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(1),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
 
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
         ResolverWorker::spawn(resolver, rx, config.clone(), 0);
