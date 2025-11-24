@@ -231,14 +231,7 @@ To run the full test suite including integration tests, you'll need a local DNS 
 Install `dnsmasq`:
 
 ```bash
-# Arch Linux
-sudo pacman -S dnsmasq
-
-# Debian/Ubuntu
 sudo apt install dnsmasq
-
-# macOS
-brew install dnsmasq
 ```
 
 Start a simple DNS server using `dnsmasq`:
