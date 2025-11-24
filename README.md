@@ -5,8 +5,10 @@ An async rust library for DNS lookups. Can be used to perform simple, one-off lo
 ## Features
 
 BlastDNS is a:
+
 - [CLI tool](#cli)
 - [Rust library](#rust-api)
+- [Python library](#python-api)
 
 ### CLI
 
@@ -177,6 +179,40 @@ while let Some((host, outcome)) = stream.next().await {
     }
 }
 ```
+
+### Python API
+
+The `blastdns` Python package is a thin wrapper around the Rust library.
+
+```bash
+# install python dependencies
+uv sync
+# build and install the rust->python bindings
+uv run maturin develop
+# run tests
+uv run pytest
+```
+
+To use it in Python, you can use the `Client` class:
+
+```python
+import json
+import asyncio
+from blastdns import Client, ClientConfig
+
+
+async def main():
+    resolvers = ["1.1.1.1:53"]
+    client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
+
+    response = await client.resolve("example.com", "AAAA")
+    print(json.dumps(response, indent=2))
+
+
+asyncio.run(main())
+```
+
+`Client.resolve(host, record_type=None)` defaults to `A` records and returns the same JSON-shaped dictionaries the CLI prints, so you can reuse downstream tooling. `ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
 
 ## Architecture
 

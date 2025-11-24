@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
+
+[project]
+name = "blastdns"
+version = "0.1.0"
+description = "Async Python interface on top of the BlastDNS resolver"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2.12.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "maturin>=1.10",
+]
+
+[tool.maturin]
+features = ["python"]
+module-name = "blastdns._native"
