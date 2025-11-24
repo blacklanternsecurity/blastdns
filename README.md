@@ -50,7 +50,11 @@ while let Some((host, outcome)) = stream.next().await {
 The CLI streams JSON records for each hostname in an input file, resolving them with the same worker pool used by the library:
 
 ```bash
-$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+# send all results to jq
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq
+
+# print only the raw IPv4 addresses
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answers[].rdata.A'
 ```
 
 `hosts.txt` and the resolver file both accept one entry per line (comments via `#` are ignored).
@@ -60,6 +64,89 @@ Additional CLI options:
 - `--timeout-ms N`: Per-request timeout in milliseconds (default: 3000)
 - `--purgatory-threshold N`: Consecutive worker errors before it rests (default: 10)
 - `--purgatory-sentence-ms N`: How long a resting worker stays idle (default: 1000)
+
+#### Example JSON output
+
+```json
+{
+  "host": "microsoft.com",
+  "response": {
+    "additionals": [],
+    "answers": [
+      {
+        "dns_class": "IN",
+        "name_labels": "microsoft.com.",
+        "rdata": {
+          "A": "13.107.213.41"
+        },
+        "ttl": 1968
+      },
+      {
+        "dns_class": "IN",
+        "name_labels": "microsoft.com.",
+        "rdata": {
+          "A": "13.107.246.41"
+        },
+        "ttl": 1968
+      }
+    ],
+    "edns": {
+      "flags": {
+        "dnssec_ok": false,
+        "z": 0
+      },
+      "max_payload": 1232,
+      "options": {
+        "options": []
+      },
+      "rcode_high": 0,
+      "version": 0
+    },
+    "header": {
+      "additional_count": 1,
+      "answer_count": 2,
+      "authentic_data": false,
+      "authoritative": false,
+      "checking_disabled": false,
+      "id": 62150,
+      "message_type": "Response",
+      "name_server_count": 0,
+      "op_code": "Query",
+      "query_count": 1,
+      "recursion_available": true,
+      "recursion_desired": true,
+      "response_code": "NoError",
+      "truncation": false
+    },
+    "name_servers": [],
+    "queries": [
+      {
+        "name": "microsoft.com.",
+        "query_class": "IN",
+        "query_type": "A"
+      }
+    ],
+    "signature": []
+  }
+}
+```
+
+#### Debug Logging
+
+BlastDNS uses the standard Rust `tracing` ecosystem. Enable debug logging by setting the `RUST_LOG` environment variable:
+
+```bash
+# Show debug logs from blastdns only
+RUST_LOG=blastdns=debug blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+
+# Show debug logs from everything
+RUST_LOG=debug blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+
+# Show trace-level logs for detailed internal behavior
+RUST_LOG=blastdns=trace blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+```
+
+Valid log levels (from least to most verbose): `error`, `warn`, `info`, `debug`, `trace`
 
 ## Architecture
 

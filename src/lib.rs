@@ -10,3 +10,4 @@ pub use config::{
     DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
 };
 pub use error::BlastDNSError;
+pub use utils::check_ulimits;

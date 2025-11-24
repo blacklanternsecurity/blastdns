@@ -86,13 +86,15 @@ impl ResolverWorker {
             {
                 let sentence = self.config.purgatory_sentence;
                 if !sentence.is_zero() {
-                    eprintln!(
-                        "resolver worker {} entering purgatory for {:?} after {} errors",
-                        self.resolver, sentence, consecutive_errors
+                    debug!(
+                        resolver = %self.resolver,
+                        sentence = ?sentence,
+                        consecutive_errors,
+                        "entering purgatory"
                     );
                     sleep(sentence).await;
                 }
-                consecutive_errors = 0;
+                consecutive_errors = consecutive_errors.saturating_sub(1);
             }
 
             let work_item = match self.work_rx.recv().await {
@@ -103,7 +105,7 @@ impl ResolverWorker {
             let WorkItem { query, responder } = work_item;
             match self.handle_query(&mut client, query).await {
                 Ok(response) => {
-                    consecutive_errors = 0;
+                    consecutive_errors = consecutive_errors.saturating_sub(1);
                     let _ = responder.send(Ok(response));
                 }
                 Err(err) => {
@@ -149,9 +151,12 @@ impl ResolverWorker {
     ) -> Result<DnsResponse, BlastDNSError> {
         let QuerySpec { host, record_type } = query;
 
-        if self.config.debug {
-            eprintln!("[{}] Querying {} {}", self.resolver, host, record_type);
-        }
+        debug!(
+            resolver = %self.resolver,
+            host,
+            %record_type,
+            "querying DNS resolver"
+        );
 
         let name = Name::from_ascii(&host)
             .map_err(|source| BlastDNSError::InvalidHostname { name: host, source })?;
