@@ -4,46 +4,9 @@ An async rust library for DNS lookups. Can be used to perform simple, one-off lo
 
 ## Features
 
-### Rust API
-
-```rust
-use blastdns::{BlastDNSClient, BlastDNSConfig};
-use futures::StreamExt;
-use hickory_client::proto::rr::RecordType;
-use std::time::Duration;
-
-// read DNS resolvers from a file (one per line -> vector of strings)
-let resolvers = std::fs::read_to_string("resolvers.txt")
-    .expect("Failed to read resolvers file")
-    .lines()
-    .map(str::to_string)
-    .collect::<Vec<String>>();
-
-// create a new blastdns client with default config
-let client = BlastDNSClient::new(resolvers).await?;
-
-// or with custom config
-let mut config = BlastDNSConfig::default();
-config.threads_per_resolver = 5;
-config.request_timeout = Duration::from_secs(2);
-let client = BlastDNSClient::with_config(resolvers, config).await?;
-
-// lookup a domain
-let result = client.resolve("example.com", RecordType::A).await?;
-
-// print the result as serde JSON
-println!("{}", serde_json::to_string_pretty(&result).unwrap());
-
-// bulk lookups stream back as soon as each resolver answers
-let wordlist = ["one.example", "two.example", "three.example"];
-let mut stream = client.resolve_batch(wordlist, RecordType::A);
-while let Some((host, outcome)) = stream.next().await {
-    match outcome {
-        Ok(response) => println!("{}: {} answers", host, response.answers().len()),
-        Err(err) => eprintln!("{} failed: {err}", host),
-    }
-}
-```
+BlastDNS is a:
+- [CLI tool](#cli)
+- [Rust library](#rust-api)
 
 ### CLI
 
@@ -57,15 +20,41 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq
 $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answers[].rdata.A'
 ```
 
-`hosts.txt` and the resolver file both accept one entry per line (comments via `#` are ignored).
+#### CLI Help
 
-Additional CLI options:
-- `--threads-per-resolver N`: Number of worker tasks per resolver (default: 1)
-- `--timeout-ms N`: Per-request timeout in milliseconds (default: 3000)
-- `--purgatory-threshold N`: Consecutive worker errors before it rests (default: 10)
-- `--purgatory-sentence-ms N`: How long a resting worker stays idle (default: 1000)
+```
+$ blastdns --help
+BlastDNS - Async DNS spray client
+
+Usage: blastdns [OPTIONS] --resolvers <FILE> <HOSTS_TO_RESOLVE>
+
+Arguments:
+  <HOSTS_TO_RESOLVE>  File containing hostnames to resolve (one per line)
+
+Options:
+      --rdtype <RECORD_TYPE>
+          Record type to query (A, AAAA, MX, ...) [default: A]
+      --resolvers <FILE>
+          File containing DNS nameservers (one per line)
+      --threads-per-resolver <THREADS_PER_RESOLVER>
+          Worker threads per resolver [default: 2]
+      --timeout-ms <TIMEOUT_MS>
+          Per-request timeout in milliseconds [default: 1000]
+      --retries <RETRIES>
+          Retry attempts after a resolver failure [default: 10]
+      --purgatory-threshold <PURGATORY_THRESHOLD>
+          Consecutive errors before a worker is put into timeout [default: 5]
+      --purgatory-sentence-ms <PURGATORY_SENTENCE_MS>
+          How many milliseconds a worker stays in timeout [default: 1000]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
 
 #### Example JSON output
+
+BlastDNS outputs to JSON by default:
 
 ```json
 {
@@ -147,6 +136,47 @@ RUST_LOG=blastdns=trace blastdns hosts.txt --rdtype A --resolvers resolvers.txt
 ```
 
 Valid log levels (from least to most verbose): `error`, `warn`, `info`, `debug`, `trace`
+
+### Rust API
+
+```rust
+use blastdns::{BlastDNSClient, BlastDNSConfig};
+use futures::StreamExt;
+use hickory_client::proto::rr::RecordType;
+use std::time::Duration;
+
+// read DNS resolvers from a file (one per line -> vector of strings)
+let resolvers = std::fs::read_to_string("resolvers.txt")
+    .expect("Failed to read resolvers file")
+    .lines()
+    .map(str::to_string)
+    .collect::<Vec<String>>();
+
+// create a new blastdns client with default config
+let client = BlastDNSClient::new(resolvers).await?;
+
+// or with custom config
+let mut config = BlastDNSConfig::default();
+config.threads_per_resolver = 5;
+config.request_timeout = Duration::from_secs(2);
+let client = BlastDNSClient::with_config(resolvers, config).await?;
+
+// lookup a domain
+let result = client.resolve("example.com", RecordType::A).await?;
+
+// print the result as serde JSON
+println!("{}", serde_json::to_string_pretty(&result).unwrap());
+
+// bulk lookups stream back as soon as each resolver answers
+let wordlist = ["one.example", "two.example", "three.example"];
+let mut stream = client.resolve_batch(wordlist, RecordType::A);
+while let Some((host, outcome)) = stream.next().await {
+    match outcome {
+        Ok(response) => println!("{}: {} answers", host, response.answers().len()),
+        Err(err) => eprintln!("{} failed: {err}", host),
+    }
+}
+```
 
 ## Architecture
 
