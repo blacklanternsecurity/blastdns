@@ -4,11 +4,12 @@ use crossfire::{MAsyncRx, MAsyncTx, mpmc};
 use futures::stream::{self, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
 use tokio::sync::oneshot;
+use tracing::debug;
 
 use crate::{
     config::BlastDNSConfig,
     error::BlastDNSError,
-    utils::parse_resolver,
+    utils::{check_ulimits, parse_resolver},
     worker::{QuerySpec, ResolverWorker, WorkItem},
 };
 
@@ -45,6 +46,11 @@ impl BlastDNSClient {
             .collect::<Result<_, _>>()?;
 
         let resolver_count = parsed.len();
+
+        // Check system ulimits before spawning workers
+        check_ulimits(resolver_count, config.threads_per_resolver)
+            .map_err(|e| BlastDNSError::Configuration(e.to_string()))?;
+
         let queue_capacity = (resolver_count * config.threads_per_resolver).max(1);
 
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
@@ -70,15 +76,13 @@ impl BlastDNSClient {
         let attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..attempts {
-            if self.config.debug {
-                eprintln!(
-                    "[blastdns] attempt {}/{} for {} {}",
-                    attempt + 1,
-                    attempts,
-                    host,
-                    record_type
-                );
-            }
+            debug!(
+                attempt = attempt + 1,
+                attempts,
+                host,
+                %record_type,
+                "attempting DNS resolution"
+            );
 
             let query = QuerySpec {
                 host: host.clone(),
@@ -96,9 +100,7 @@ impl BlastDNSClient {
                 Err(err) => {
                     let work_item = err.0;
                     work_item.respond(Err(BlastDNSError::QueueClosed));
-                    if self.config.debug {
-                        eprintln!("[blastdns] failed to enqueue {host}: queue closed");
-                    }
+                    debug!(host, "failed to enqueue: queue closed");
                     return Err(BlastDNSError::QueueClosed);
                 }
             };
@@ -106,15 +108,13 @@ impl BlastDNSClient {
             match response {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
-                    if self.config.debug {
-                        eprintln!(
-                            "[blastdns] attempt {}/{} for {} failed: {}",
-                            attempt + 1,
-                            attempts,
-                            host,
-                            err
-                        );
-                    }
+                    debug!(
+                        attempt = attempt + 1,
+                        attempts,
+                        host,
+                        error = %err,
+                        "DNS resolution attempt failed"
+                    );
                     if attempt + 1 == attempts || !err.is_retryable() {
                         return Err(err);
                     }

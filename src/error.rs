@@ -35,6 +35,8 @@ pub enum BlastDNSError {
         #[source]
         source: ClientError,
     },
+    #[error("configuration error: {0}")]
+    Configuration(String),
 }
 
 impl BlastDNSError {
