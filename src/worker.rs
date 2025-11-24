@@ -48,6 +48,7 @@ pub(crate) struct ResolverWorker {
     resolver: SocketAddr,
     config: BlastDNSConfig,
     work_rx: MAsyncRx<WorkItem>,
+    client: Option<Client>,
 }
 
 impl ResolverWorker {
@@ -64,6 +65,7 @@ impl ResolverWorker {
                 resolver: resolver_addr,
                 config,
                 work_rx,
+                client: None,
             };
 
             match worker.run().await {
@@ -76,8 +78,7 @@ impl ResolverWorker {
     }
 
     /// Main worker loop that receives and processes queries until the channel closes.
-    async fn run(self) -> Result<(), BlastDNSError> {
-        let mut client = self.init_client().await?;
+    async fn run(mut self) -> Result<(), BlastDNSError> {
         let mut consecutive_errors = 0usize;
 
         loop {
@@ -102,8 +103,13 @@ impl ResolverWorker {
                 Err(_) => break,
             };
 
+            // Lazy initialization: create client on first use
+            if self.client.is_none() {
+                self.client = Some(self.init_client().await?);
+            }
+
             let WorkItem { query, responder } = work_item;
-            match self.handle_query(&mut client, query).await {
+            match self.handle_query(query).await {
                 Ok(response) => {
                     consecutive_errors = consecutive_errors.saturating_sub(1);
                     let _ = responder.send(Ok(response));
@@ -144,11 +150,7 @@ impl ResolverWorker {
     }
 
     /// Executes a DNS query using the client and returns the response.
-    async fn handle_query(
-        &self,
-        client: &mut Client,
-        query: QuerySpec,
-    ) -> Result<DnsResponse, BlastDNSError> {
+    async fn handle_query(&mut self, query: QuerySpec) -> Result<DnsResponse, BlastDNSError> {
         let QuerySpec { host, record_type } = query;
 
         debug!(
@@ -161,7 +163,9 @@ impl ResolverWorker {
         let name = Name::from_ascii(&host)
             .map_err(|source| BlastDNSError::InvalidHostname { name: host, source })?;
 
-        client
+        self.client
+            .as_mut()
+            .unwrap()
             .query(name, DNSClass::IN, record_type)
             .await
             .map_err(|source| BlastDNSError::ResolverRequestFailed {
