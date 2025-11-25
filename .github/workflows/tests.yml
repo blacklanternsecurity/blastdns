@@ -67,25 +67,25 @@ jobs:
         run: uv sync
 
       - name: Build Python extension
-        run: maturin develop --release
+        run: uv run maturin develop --release
 
       - name: Run Python tests
-        run: pytest blastdns/tests -vv
+        run: uv run pytest blastdns/tests -vv
 
-  rust-publish:
-    needs: rust-tests
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+  # rust-publish:
+  #   needs: rust-tests
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     
-    steps:
-      - uses: actions/checkout@v5
+  #   steps:
+  #     - uses: actions/checkout@v5
       
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          profile: minimal
+  #     - name: Install Rust toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #         toolchain: stable
+  #         override: true
+  #         profile: minimal
       
-      - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #     - name: Publish to crates.io
+  #       run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
