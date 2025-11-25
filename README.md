@@ -4,15 +4,15 @@ An async rust library for DNS lookups. Can be used to perform simple, one-off lo
 
 ## Features
 
-BlastDNS is a:
+BlastDNS is simultaneously a:
 
-- [CLI tool](#cli)
+- [Rust CLI tool](#cli)
 - [Rust library](#rust-api)
 - [Python library](#python-api)
 
 ### CLI
 
-The CLI streams JSON records for each hostname in an input file, resolving them with the same worker pool used by the library:
+The CLI mass-resolves hosts based on a list of resolvers, outputting results to JSON.
 
 ```bash
 # send all results to jq
