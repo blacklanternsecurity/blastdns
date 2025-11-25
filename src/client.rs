@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
 use futures::stream::{self, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
-use tokio::sync::oneshot;
+use tokio::sync::{OnceCell, oneshot};
 use tracing::debug;
 
 use crate::{
@@ -14,12 +14,23 @@ use crate::{
 };
 
 /// Primary API surface for performing DNS lookups concurrently.
-#[derive(Debug)]
 pub struct BlastDNSClient {
     resolvers: Vec<SocketAddr>,
     work_tx: MAsyncTx<WorkItem>,
+    work_rx: MAsyncRx<WorkItem>,
     config: BlastDNSConfig,
     queue_capacity: usize,
+    workers_spawned: OnceCell<()>,
+}
+
+impl std::fmt::Debug for BlastDNSClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlastDNSClient")
+            .field("resolvers", &self.resolvers)
+            .field("config", &self.config)
+            .field("queue_capacity", &self.queue_capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result item produced by [`BlastDNSClient::resolve_batch`].
@@ -27,12 +38,12 @@ pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
 impl BlastDNSClient {
     /// Build a client using the default configuration.
-    pub async fn new(resolvers: Vec<String>) -> Result<Self, BlastDNSError> {
-        Self::with_config(resolvers, BlastDNSConfig::default()).await
+    pub fn new(resolvers: Vec<String>) -> Result<Self, BlastDNSError> {
+        Self::with_config(resolvers, BlastDNSConfig::default())
     }
 
     /// Build a client with an explicit configuration.
-    pub async fn with_config(
+    pub fn with_config(
         resolvers: Vec<String>,
         config: BlastDNSConfig,
     ) -> Result<Self, BlastDNSError> {
@@ -55,15 +66,23 @@ impl BlastDNSClient {
 
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
-        let client = Self {
+        Ok(Self {
             resolvers: parsed,
             work_tx,
+            work_rx,
             config,
             queue_capacity,
-        };
-        client.spawn_workers(work_rx);
+            workers_spawned: OnceCell::new(),
+        })
+    }
 
-        Ok(client)
+    /// Ensure workers are spawned (called lazily on first use).
+    async fn ensure_workers(&self) {
+        self.workers_spawned
+            .get_or_init(|| async {
+                self.spawn_workers(self.work_rx.clone());
+            })
+            .await;
     }
 
     /// Enqueue a DNS lookup and await the resolver result.
@@ -72,6 +91,8 @@ impl BlastDNSClient {
         host: S,
         record_type: RecordType,
     ) -> Result<DnsResponse, BlastDNSError> {
+        self.ensure_workers().await;
+
         let host = host.into();
         let attempts = self.config.max_retries.saturating_add(1);
 
@@ -174,11 +195,9 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn rejects_empty_resolvers() {
-        let err = BlastDNSClient::new(Vec::new())
-            .await
-            .expect_err("expected failure");
+    #[test]
+    fn rejects_empty_resolvers() {
+        let err = BlastDNSClient::new(Vec::new()).expect_err("expected failure");
         assert!(matches!(err, BlastDNSError::NoResolvers));
     }
 
@@ -275,9 +294,7 @@ mod tests {
             ..Default::default()
         };
 
-        let client = BlastDNSClient::with_config(resolvers, config)
-            .await
-            .expect("client init");
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();

@@ -18,22 +18,15 @@ class ClientConfig(BaseModel):
 
 class Client:
     def __init__(self, resolvers, config=None):
-        self._resolvers = list(resolvers)
-        self._config = (config or ClientConfig()).to_dict()
-        self._inner = None
-
-    async def _ensure_inner(self):
-        if self._inner is not None:
-            return
         if _native is None:
             raise RuntimeError(
                 "blastdns native module is unavailable. "
                 "Build it via `maturin develop --features python` "
                 "or `cargo build --features python` before using Client."
             )
-        self._inner = await _native.Client.create(self._resolvers, self._config)
+        config_dict = (config or ClientConfig()).to_dict()
+        self._inner = _native.Client(list(resolvers), config_dict)
 
     async def resolve(self, host, record_type=None):
-        await self._ensure_inner()
         return await self._inner.resolve(host, record_type)
 

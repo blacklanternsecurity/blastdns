@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         purgatory_sentence: Duration::from_millis(args.purgatory_sentence_ms),
     };
 
-    let client = BlastDNSClient::with_config(resolvers, config).await?;
+    let client = BlastDNSClient::with_config(resolvers, config)?;
     let mut stream = client.resolve_batch(hosts, args.record_type);
 
     while let Some((host, outcome)) = stream.next().await {

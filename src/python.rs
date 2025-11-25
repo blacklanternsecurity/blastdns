@@ -5,7 +5,7 @@ use std::time::Duration;
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyType};
+use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use crate::client::BlastDNSClient;
@@ -19,27 +19,19 @@ pub struct PyBlastDNSClient {
 
 #[pymethods]
 impl PyBlastDNSClient {
-    #[classmethod]
+    #[new]
     #[pyo3(signature = (resolvers, config = None))]
-    fn create<'py>(
-        _cls: &Bound<'py, PyType>,
-        py: Python<'py>,
-        resolvers: Vec<String>,
-        config: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn new(resolvers: Vec<String>, config: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         let config = config
             .as_ref()
             .map(config_from_py)
             .transpose()?
             .unwrap_or_else(BlastDNSConfig::default);
 
-        future_into_py(py, async move {
-            let client = BlastDNSClient::with_config(resolvers, config)
-                .await
-                .map_err(PyErr::from)?;
-            Ok(PyBlastDNSClient {
-                inner: Arc::new(client),
-            })
+        let client = BlastDNSClient::with_config(resolvers, config).map_err(PyErr::from)?;
+
+        Ok(PyBlastDNSClient {
+            inner: Arc::new(client),
         })
     }
 
