@@ -9,6 +9,7 @@ description = "Async Python interface on top of the BlastDNS resolver"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "orjson>=3.11.4",
     "pydantic>=2.12.4",
 ]
 
