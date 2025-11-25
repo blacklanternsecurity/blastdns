@@ -1,6 +1,8 @@
 mod client;
 mod config;
 mod error;
+#[cfg(feature = "python")]
+mod python;
 mod utils;
 mod worker;
 

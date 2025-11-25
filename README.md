@@ -4,13 +4,15 @@ An async rust library for DNS lookups. Can be used to perform simple, one-off lo
 
 ## Features
 
-BlastDNS is a:
-- [CLI tool](#cli)
+BlastDNS is simultaneously a:
+
+- [Rust CLI tool](#cli)
 - [Rust library](#rust-api)
+- [Python library](#python-api)
 
 ### CLI
 
-The CLI streams JSON records for each hostname in an input file, resolving them with the same worker pool used by the library:
+The CLI mass-resolves hosts based on a list of resolvers, outputting results to JSON.
 
 ```bash
 # send all results to jq
@@ -178,6 +180,40 @@ while let Some((host, outcome)) = stream.next().await {
 }
 ```
 
+### Python API
+
+The `blastdns` Python package is a thin wrapper around the Rust library.
+
+```bash
+# install python dependencies
+uv sync
+# build and install the rust->python bindings
+uv run maturin develop
+# run tests
+uv run pytest
+```
+
+To use it in Python, you can use the `Client` class:
+
+```python
+import json
+import asyncio
+from blastdns import Client, ClientConfig
+
+
+async def main():
+    resolvers = ["1.1.1.1:53"]
+    client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
+
+    response = await client.resolve("example.com", "AAAA")
+    print(json.dumps(response, indent=2))
+
+
+asyncio.run(main())
+```
+
+`Client.resolve(host, record_type=None)` defaults to `A` records and returns the same JSON-shaped dictionaries the CLI prints, so you can reuse downstream tooling. `ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
+
 ## Architecture
 
 BlastDNS is built on top of [`hickory-dns`](https://github.com/hickory-dns/hickory-dns), but only makes use of the low-level Client API, not the Resolver API.
@@ -195,14 +231,7 @@ To run the full test suite including integration tests, you'll need a local DNS 
 Install `dnsmasq`:
 
 ```bash
-# Arch Linux
-sudo pacman -S dnsmasq
-
-# Debian/Ubuntu
 sudo apt install dnsmasq
-
-# macOS
-brew install dnsmasq
 ```
 
 Start a simple DNS server using `dnsmasq`:

@@ -39,6 +39,30 @@ pub fn check_ulimits(num_resolvers: usize, threads_per_resolver: usize) -> Resul
             }
         }
 
+        let hard_limit = rlimit.rlim_max;
+
+        if rlimit.rlim_cur < hard_limit {
+            let desired = libc::rlimit {
+                rlim_cur: hard_limit,
+                rlim_max: hard_limit,
+            };
+
+            unsafe {
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &desired) != 0 {
+                    bail!(
+                        "failed to raise RLIMIT_NOFILE to hard limit (soft={}, hard={}): {}",
+                        rlimit.rlim_cur,
+                        hard_limit,
+                        std::io::Error::last_os_error()
+                    );
+                }
+
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) != 0 {
+                    bail!("failed to re-read RLIMIT_NOFILE after raising it");
+                }
+            }
+        }
+
         let current_limit = rlimit.rlim_cur;
         let total_workers = num_resolvers * threads_per_resolver;
 
@@ -49,7 +73,7 @@ pub fn check_ulimits(num_resolvers: usize, threads_per_resolver: usize) -> Resul
 
         if current_limit < required as u64 {
             bail!(
-                "NOFILE limit too low: current={}, required={}\n\
+                "NOFILE limit too low even after raising soft limit: current={}, required={}\n\
                  {} resolvers × {} threads/resolver = {} workers (need ~{} FDs)\n\
                  Increase with: ulimit -n {} (or higher)",
                 current_limit,
