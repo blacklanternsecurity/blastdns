@@ -48,7 +48,7 @@ jobs:
           python-version: '3.x'
 
       - name: Run streaming test
-        run: python test-streaming.py
+        run: python tests/test-streaming.py
 
   python-tests:
     needs: rust-tests
