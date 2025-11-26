@@ -57,47 +57,6 @@ impl PyBlastDNSClient {
             dns_response_to_bytes(response)
         })
     }
-
-    #[pyo3(signature = (hosts, queue, sentinel, record_type = None))]
-    fn resolve_batch<'py>(
-        &self,
-        py: Python<'py>,
-        hosts: Bound<'py, PyAny>,
-        queue: Bound<'py, PyAny>,
-        sentinel: Bound<'py, PyAny>,
-        record_type: Option<&str>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.inner.clone();
-        let record_type = parse_record_type(record_type)?;
-        let hosts_iter = PythonHosts::new(hosts.unbind())?;
-        let iterator_error = hosts_iter.error_handle();
-        let queue = queue.unbind();
-        let sentinel = sentinel.unbind();
-
-        future_into_py(py, async move {
-            let mut stream = client.resolve_batch(futures::stream::iter(hosts_iter), record_type);
-            let stream_result = async {
-                while let Some((host, result)) = stream.next().await {
-                    let payload = match result {
-                        Ok(response) => dns_response_to_bytes(response)?,
-                        Err(err) => error_to_bytes(err)?,
-                    };
-                    enqueue_result(&queue, &host, &payload)?;
-                }
-
-                if let Some(err) = iterator_error.lock().unwrap().take() {
-                    return Err(err);
-                }
-
-                Ok(())
-            }
-            .await;
-
-            send_sentinel(&queue, &sentinel)?;
-
-            stream_result
-        })
-    }
 }
 
 fn parse_record_type(input: Option<&str>) -> PyResult<RecordType> {
