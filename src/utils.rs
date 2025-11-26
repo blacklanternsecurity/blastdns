@@ -86,9 +86,11 @@ pub fn check_ulimits(num_resolvers: usize, threads_per_resolver: usize) -> Resul
             );
         }
 
-        eprintln!(
+        tracing::debug!(
             "ulimit check: NOFILE={} (need ~{} for {} workers)",
-            current_limit, required, total_workers
+            current_limit,
+            required,
+            total_workers
         );
     }
 

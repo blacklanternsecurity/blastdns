@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -29,6 +29,26 @@ jobs:
 
       - name: Run tests
         run: cargo test --all --locked --verbose -- --include-ignored
+
+  cli-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Run streaming test
+        run: python test-streaming.py
 
   python-tests:
     needs: rust-tests
@@ -78,7 +98,7 @@ jobs:
   #   if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     
   #   steps:
-  #     - uses: actions/checkout@v5
+  #     - uses: actions/checkout@v6
       
   #     - name: Install Rust toolchain
   #       uses: actions-rs/toolchain@v1

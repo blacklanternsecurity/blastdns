@@ -147,27 +147,26 @@ impl BlastDNSClient {
     }
 
     /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
-    pub fn resolve_batch<'a, I, S>(
+    pub fn resolve_batch<'a, S>(
         &'a self,
-        hosts: I,
+        hosts: S,
         record_type: RecordType,
-    ) -> impl stream::Stream<Item = BatchResult> + 'a
+    ) -> impl stream::Stream<Item = BatchResult> + Unpin + 'a
     where
-        I: IntoIterator<Item = S>,
-        I::IntoIter: 'a,
-        S: Into<String>,
+        S: stream::Stream<Item = String> + Unpin + 'a,
     {
         let concurrency = self.queue_capacity.max(1);
-        stream::iter(hosts)
-            .map(move |host| {
-                let host_string = host.into();
-                let label = host_string.clone();
-                async move {
-                    let result = self.resolve(host_string, record_type).await;
-                    (label, result)
-                }
-            })
-            .buffer_unordered(concurrency)
+        Box::pin(
+            hosts
+                .map(move |host| {
+                    let label = host.clone();
+                    async move {
+                        let result = self.resolve(host, record_type).await;
+                        (label, result)
+                    }
+                })
+                .buffer_unordered(concurrency * 2),
+        )
     }
 
     fn spawn_workers(&self, work_rx: MAsyncRx<WorkItem>) {
@@ -298,7 +297,7 @@ mod tests {
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();
-        let mut stream = client.resolve_batch(inputs, RecordType::A);
+        let mut stream = client.resolve_batch(stream::iter(inputs), RecordType::A);
 
         let mut seen = Vec::new();
         while let Some((host, result)) = stream.next().await {

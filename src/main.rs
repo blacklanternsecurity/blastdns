@@ -6,17 +6,19 @@ use blastdns::{
     DEFAULT_PURGATORY_THRESHOLD, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
 };
 use clap::Parser;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use hickory_client::proto::rr::RecordType;
 use serde_json::{json, to_string};
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "BlastDNS - Async DNS spray client", long_about = None)]
 struct Args {
-    /// File containing hostnames to resolve (one per line).
+    /// File containing hostnames to resolve (one per line). Reads from stdin if not specified.
     #[arg(value_name = "HOSTS_TO_RESOLVE")]
-    hosts: PathBuf,
+    hosts: Option<String>,
     /// Record type to query (A, AAAA, MX, ...).
     #[arg(long = "rdtype", default_value = "A", value_parser = parse_record_type)]
     record_type: RecordType,
@@ -50,8 +52,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let resolvers = load_resolvers(&args.resolvers)
         .with_context(|| format!("failed to load resolvers from {}", args.resolvers.display()))?;
-    let hosts = load_hosts(&args.hosts)
-        .with_context(|| format!("failed to load hostnames from {}", args.hosts.display()))?;
+    let hosts = load_hosts(args.hosts.as_deref())
+        .await
+        .with_context(|| "failed to load hostnames")?;
 
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
     let config = BlastDNSConfig {
@@ -105,20 +108,30 @@ fn load_resolvers(path: &PathBuf) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn load_hosts(path: &PathBuf) -> Result<Vec<String>> {
-    let buf = std::fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in buf.lines() {
-        let trimmed = line.split('#').next().unwrap_or("").trim();
-        if trimmed.is_empty() {
-            continue;
+async fn load_hosts(
+    path: Option<&str>,
+) -> Result<std::pin::Pin<Box<dyn Stream<Item = String> + Send>>> {
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match path {
+        None => Box::new(tokio::io::stdin()),
+        Some(p) => Box::new(File::open(p).await?),
+    };
+
+    let lines = BufReader::new(reader).lines();
+
+    let stream = futures::stream::unfold(lines, |mut lines| async move {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let trimmed = line.split('#').next().unwrap_or("").trim();
+                    if !trimmed.is_empty() {
+                        return Some((trimmed.to_string(), lines));
+                    }
+                    // Skip empty lines, continue loop
+                }
+                Ok(None) | Err(_) => return None,
+            }
         }
-        out.push(trimmed.to_string());
-    }
+    });
 
-    if out.is_empty() {
-        bail!("host list `{}` is empty", path.display());
-    }
-
-    Ok(out)
+    Ok(Box::pin(stream))
 }

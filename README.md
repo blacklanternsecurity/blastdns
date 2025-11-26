@@ -20,6 +20,9 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq
 
 # print only the raw IPv4 addresses
 $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answers[].rdata.A'
+
+# load from stdin
+$ cat hosts.txt | blastdns --rdtype A --resolvers resolvers.txt
 ```
 
 #### CLI Help
@@ -28,10 +31,10 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answer
 $ blastdns --help
 BlastDNS - Async DNS spray client
 
-Usage: blastdns [OPTIONS] --resolvers <FILE> <HOSTS_TO_RESOLVE>
+Usage: blastdns [OPTIONS] --resolvers <FILE> [HOSTS_TO_RESOLVE]
 
 Arguments:
-  <HOSTS_TO_RESOLVE>  File containing hostnames to resolve (one per line)
+  [HOSTS_TO_RESOLVE]  File containing hostnames to resolve (one per line). Reads from stdin if not specified
 
 Options:
       --rdtype <RECORD_TYPE>
@@ -45,7 +48,7 @@ Options:
       --retries <RETRIES>
           Retry attempts after a resolver failure [default: 10]
       --purgatory-threshold <PURGATORY_THRESHOLD>
-          Consecutive errors before a worker is put into timeout [default: 5]
+          Consecutive errors before a worker is put into timeout [default: 10]
       --purgatory-sentence-ms <PURGATORY_SENTENCE_MS>
           How many milliseconds a worker stays in timeout [default: 1000]
   -h, --help
