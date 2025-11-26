@@ -1,15 +1,16 @@
+use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAnyMethods;
-use pyo3::types::{PyBytes, PyIterator};
+use pyo3::types::{PyAnyMethods, PyIterator};
 use pyo3_async_runtimes::tokio::future_into_py;
+use tokio::sync::Mutex as TokioMutex;
 
-use crate::client::BlastDNSClient;
+use crate::client::{BatchResult, BlastDNSClient};
 use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
 use crate::error::BlastDNSError;
 
@@ -57,6 +58,85 @@ impl PyBlastDNSClient {
             dns_response_to_bytes(response)
         })
     }
+
+    #[pyo3(signature = (hosts, record_type = None))]
+    fn resolve_batch(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+    ) -> PyResult<PyBatchIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch (it handles spawn_blocking internally)
+        let result_stream = self.inner.resolve_batch(rust_iter, record_type);
+
+        Ok(PyBatchIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
+        })
+    }
+}
+
+#[pyclass]
+pub struct PyBatchIterator {
+    inner: Arc<TokioMutex<Pin<Box<dyn Stream<Item = BatchResult> + Send>>>>,
+}
+
+#[pymethods]
+impl PyBatchIterator {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let mut stream = inner.lock().await;
+            match stream.next().await {
+                Some((host, result)) => {
+                    let payload = match result {
+                        Ok(response) => dns_response_to_bytes(response)?,
+                        Err(err) => error_to_bytes(err)?,
+                    };
+                    Ok((host, payload))
+                }
+                None => Err(PyStopIteration::new_err("end of stream")),
+            }
+        })
+    }
+}
+
+struct PythonHostIterator {
+    iterator: Py<PyIterator>,
+}
+
+impl PythonHostIterator {
+    fn new(iterator: Py<PyIterator>) -> Self {
+        Self { iterator }
+    }
+}
+
+impl Iterator for PythonHostIterator {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::attach(|py| {
+            let iter = self.iterator.bind(py);
+            match iter.call_method0("__next__") {
+                Ok(item) => item.extract::<String>().ok(),
+                Err(e) if e.is_instance_of::<PyStopIteration>(py) => None,
+                Err(_) => None,
+            }
+        })
+    }
 }
 
 fn parse_record_type(input: Option<&str>) -> PyResult<RecordType> {
@@ -85,89 +165,6 @@ fn error_to_bytes(err: BlastDNSError) -> PyResult<Vec<u8>> {
     let payload = serde_json::json!({ "error": err.to_string() });
     serde_json::to_vec(&payload)
         .map_err(|e| PyValueError::new_err(format!("failed to serialize error payload: {e}")))
-}
-
-fn enqueue_result(queue: &Py<PyAny>, host: &str, payload: &[u8]) -> PyResult<()> {
-    Python::attach(|py| {
-        let queue = queue.bind(py);
-        queue.call_method1("put_nowait", ((host, PyBytes::new(py, payload)),))?;
-        Ok(())
-    })
-}
-
-fn send_sentinel(queue: &Py<PyAny>, sentinel: &Py<PyAny>) -> PyResult<()> {
-    Python::attach(|py| {
-        let queue = queue.bind(py);
-        let sentinel = sentinel.bind(py);
-        queue.call_method1("put_nowait", (sentinel,))?;
-        Ok(())
-    })
-}
-
-struct PythonHosts {
-    iterator: Py<PyIterator>,
-    error: Arc<Mutex<Option<PyErr>>>,
-}
-
-impl PythonHosts {
-    fn new(obj: Py<PyAny>) -> PyResult<Self> {
-        Python::attach(|py| {
-            let iterator = obj.bind(py).try_iter()?.unbind();
-            Ok(Self {
-                iterator,
-                error: Arc::new(Mutex::new(None)),
-            })
-        })
-    }
-
-    fn error_handle(&self) -> Arc<Mutex<Option<PyErr>>> {
-        Arc::clone(&self.error)
-    }
-}
-
-impl IntoIterator for PythonHosts {
-    type Item = String;
-    type IntoIter = PythonHostsIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        PythonHostsIter {
-            iterator: self.iterator,
-            error: self.error,
-        }
-    }
-}
-
-struct PythonHostsIter {
-    iterator: Py<PyIterator>,
-    error: Arc<Mutex<Option<PyErr>>>,
-}
-
-impl Iterator for PythonHostsIter {
-    type Item = String;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Python::attach(|py| {
-            let iterator_obj = self.iterator.clone_ref(py);
-            let iterator = iterator_obj.bind(py);
-            match iterator.call_method0("__next__") {
-                Ok(obj) => match obj.extract::<String>() {
-                    Ok(host) => Some(host),
-                    Err(err) => {
-                        *self.error.lock().unwrap() = Some(err);
-                        None
-                    }
-                },
-                Err(err) => {
-                    if err.is_instance_of::<PyStopIteration>(py) {
-                        None
-                    } else {
-                        *self.error.lock().unwrap() = Some(err);
-                        None
-                    }
-                }
-            }
-        })
-    }
 }
 
 impl From<BlastDNSError> for PyErr {

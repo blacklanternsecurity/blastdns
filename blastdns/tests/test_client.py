@@ -58,29 +58,55 @@ async def test_client_resolve_supports_default_record_type():
     assert result["queries"][0]["query_type"] == "A"
 
 
-# @pytest.mark.asyncio
-# async def test_client_resolve_batch_streams_results_and_accepts_generators():
-#     client = Client(["127.0.0.1:5353"])
+@pytest.mark.asyncio
+async def test_client_resolve_batch_streams_results():
+    client = Client(["127.0.0.1:5353"])
 
-#     hosts_list = ["example.com", "example.net"]
-#     seen_hosts = []
+    hosts_list = ["example.com", "example.net", "example.org"]
+    seen_hosts = []
 
-#     async for host, result in client.resolve_batch(hosts_list, "A"):
-#         assert "queries" in result
-#         seen_hosts.append(host)
+    async for host, result in client.resolve_batch(hosts_list, "A"):
+        seen_hosts.append(host)
+        # Check for either success or error format
+        if "error" in result:
+            assert isinstance(result["error"], str)
+        else:
+            assert "queries" in result
+            assert "answers" in result
+            assert result["queries"][0]["query_type"] == "A"
 
-#     assert sorted(seen_hosts) == sorted(hosts_list)
+    assert sorted(seen_hosts) == sorted(hosts_list)
 
-#     # Now verify that we can pass a generator and that it is consumed lazily.
-#     def host_gen():
-#         for i in range(5):
-#             yield f"example{i}.com"
 
-#     gen_hosts = host_gen()
-#     count = 0
-#     async for host, result in client.resolve_batch(gen_hosts, "A"):
-#         assert "queries" in result
-#         assert host.startswith("example")
-#         count += 1
+@pytest.mark.asyncio
+async def test_client_resolve_batch_accepts_generators():
+    client = Client(["127.0.0.1:5353"])
 
-#     assert count == 5
+    def host_gen():
+        for domain in ["com", "net", "org"]:
+            yield f"example.{domain}"
+
+    count = 0
+    async for host, result in client.resolve_batch(host_gen(), "A"):
+        assert host.startswith("example.")
+        if "error" not in result:
+            assert "queries" in result
+        count += 1
+
+    assert count == 3
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_batch_handles_mixed_success_and_failure():
+    client = Client(["127.0.0.1:5353"])
+
+    # Mix valid and invalid hosts
+    hosts = ["example.com", "invalid-host-that-does-not-exist-12345.com"]
+    results = {}
+
+    async for host, result in client.resolve_batch(hosts, "A"):
+        results[host] = result
+
+    assert len(results) == 2
+    # At least one should succeed
+    assert any("answers" in r for r in results.values())

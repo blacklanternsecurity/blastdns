@@ -104,3 +104,25 @@ class Client:
         """
         raw = await self._inner.resolve(host, record_type)
         return orjson.loads(raw)
+
+    async def resolve_batch(self, hosts, record_type=None):
+        """Resolve multiple hostnames concurrently, yielding results as they complete.
+
+        `hosts` is an iterable of hostname strings. `record_type` is a string such
+        as `"A"`, `"AAAA"`, `"MX"`, etc. If omitted or `None`, it defaults to `"A"`.
+
+        This method is an async generator that yields `(host, result)` tuples as
+        resolutions complete. Results are unordered (faster hosts complete first).
+
+        For successful resolutions, `result` is a dict matching the format from
+        `resolve()`. For failures, `result` is `{"error": "error message"}`.
+
+        Example:
+            async for host, result in client.resolve_batch(["example.com", "google.com"], "A"):
+                if "error" in result:
+                    print(f"{host} failed: {result['error']}")
+                else:
+                    print(f"{host} resolved: {result}")
+        """
+        async for host, raw in self._inner.resolve_batch(hosts, record_type):
+            yield (host, orjson.loads(raw))

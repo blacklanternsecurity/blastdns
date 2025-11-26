@@ -1,9 +1,13 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
 use tokio::sync::{OnceCell, oneshot};
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::{
@@ -147,21 +151,27 @@ impl BlastDNSClient {
     }
 
     /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
-    pub fn resolve_batch<'a, S>(
-        &'a self,
-        hosts: S,
+    pub fn resolve_batch<I>(
+        self: &Arc<Self>,
+        hosts: I,
         record_type: RecordType,
-    ) -> impl stream::Stream<Item = BatchResult> + Unpin + 'a
+    ) -> impl stream::Stream<Item = BatchResult> + Unpin + Send + 'static
     where
-        S: stream::Stream<Item = String> + Unpin + 'a,
+        I: Iterator<Item = String> + Send + 'static,
     {
-        let concurrency = self.queue_capacity.max(1);
+        let client = Arc::clone(self);
+        let concurrency = client.queue_capacity.max(1);
+
+        // Convert iterator to stream using spawn_blocking to avoid blocking Tokio
+        let host_stream = BlockingIteratorStream::new(hosts);
+
         Box::pin(
-            hosts
+            host_stream
                 .map(move |host| {
+                    let client = Arc::clone(&client);
                     let label = host.clone();
                     async move {
-                        let result = self.resolve(host, record_type).await;
+                        let result = client.resolve(host, record_type).await;
                         (label, result)
                     }
                 })
@@ -176,6 +186,57 @@ impl BlastDNSClient {
             for worker_idx in 0..threads {
                 ResolverWorker::spawn(resolver, work_rx.clone(), self.config.clone(), worker_idx);
             }
+        }
+    }
+}
+
+/// Stream adapter that wraps an iterator and polls it via spawn_blocking
+struct BlockingIteratorStream<I> {
+    iterator: Arc<Mutex<I>>,
+    pending: Option<JoinHandle<Option<String>>>,
+}
+
+impl<I> BlockingIteratorStream<I>
+where
+    I: Iterator<Item = String> + Send + 'static,
+{
+    fn new(iterator: I) -> Self {
+        Self {
+            iterator: Arc::new(Mutex::new(iterator)),
+            pending: None,
+        }
+    }
+}
+
+impl<I> Stream for BlockingIteratorStream<I>
+where
+    I: Iterator<Item = String> + Send + 'static,
+{
+    type Item = String;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // If no pending task, spawn one
+        if self.pending.is_none() {
+            let iterator = Arc::clone(&self.iterator);
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut iter = iterator.lock().unwrap();
+                iter.next()
+            });
+            self.pending = Some(handle);
+        }
+
+        // Poll the pending task
+        let handle = self.pending.as_mut().unwrap();
+        match Pin::new(handle).poll(cx) {
+            Poll::Ready(Ok(result)) => {
+                self.pending = None;
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_)) => {
+                self.pending = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -293,11 +354,11 @@ mod tests {
             ..Default::default()
         };
 
-        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+        let client = Arc::new(BlastDNSClient::with_config(resolvers, config).expect("client init"));
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();
-        let mut stream = client.resolve_batch(stream::iter(inputs), RecordType::A);
+        let mut stream = client.resolve_batch(inputs.into_iter(), RecordType::A);
 
         let mut seen = Vec::new();
         while let Some((host, result)) = stream.next().await {

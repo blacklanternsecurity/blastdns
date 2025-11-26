@@ -1,4 +1,11 @@
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, stdin},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use blastdns::{
@@ -6,11 +13,9 @@ use blastdns::{
     DEFAULT_PURGATORY_THRESHOLD, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
 };
 use clap::Parser;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use hickory_client::proto::rr::RecordType;
 use serde_json::{json, to_string};
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -52,9 +57,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let resolvers = load_resolvers(&args.resolvers)
         .with_context(|| format!("failed to load resolvers from {}", args.resolvers.display()))?;
-    let hosts = load_hosts(args.hosts.as_deref())
-        .await
-        .with_context(|| "failed to load hostnames")?;
+    let hosts = load_hosts(args.hosts.clone()).with_context(|| "failed to load hostnames")?;
 
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
     let config = BlastDNSConfig {
@@ -65,7 +68,7 @@ async fn main() -> Result<()> {
         purgatory_sentence: Duration::from_millis(args.purgatory_sentence_ms),
     };
 
-    let client = BlastDNSClient::with_config(resolvers, config)?;
+    let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);
     let mut stream = client.resolve_batch(hosts, args.record_type);
 
     while let Some((host, outcome)) = stream.next().await {
@@ -108,30 +111,20 @@ fn load_resolvers(path: &PathBuf) -> Result<Vec<String>> {
     Ok(out)
 }
 
-async fn load_hosts(
-    path: Option<&str>,
-) -> Result<std::pin::Pin<Box<dyn Stream<Item = String> + Send>>> {
-    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match path {
-        None => Box::new(tokio::io::stdin()),
-        Some(p) => Box::new(File::open(p).await?),
+fn load_hosts(path: Option<String>) -> Result<impl Iterator<Item = String> + Send> {
+    let reader: Box<dyn BufRead + Send> = match path {
+        None => Box::new(BufReader::new(stdin())),
+        Some(p) => Box::new(BufReader::new(File::open(p)?)),
     };
 
-    let lines = BufReader::new(reader).lines();
-
-    let stream = futures::stream::unfold(lines, |mut lines| async move {
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.split('#').next().unwrap_or("").trim();
-                    if !trimmed.is_empty() {
-                        return Some((trimmed.to_string(), lines));
-                    }
-                    // Skip empty lines, continue loop
-                }
-                Ok(None) | Err(_) => return None,
+    Ok(reader.lines().filter_map(|line| {
+        line.ok().and_then(|l| {
+            let trimmed = l.split('#').next().unwrap_or("").trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
             }
-        }
-    });
-
-    Ok(Box::pin(stream))
+        })
+    }))
 }
