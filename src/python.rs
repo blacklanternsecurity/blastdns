@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::stream::{Stream, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
-use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyIterator};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -108,7 +108,7 @@ impl PyBatchIterator {
                     };
                     Ok((host, payload))
                 }
-                None => Err(PyStopIteration::new_err("end of stream")),
+                None => Err(PyStopAsyncIteration::new_err("end of stream")),
             }
         })
     }
@@ -125,16 +125,14 @@ impl PythonHostIterator {
 }
 
 impl Iterator for PythonHostIterator {
-    type Item = String;
+    type Item = Result<String, PyErr>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Python::attach(|py| {
             let iter = self.iterator.bind(py);
-            match iter.call_method0("__next__") {
-                Ok(item) => item.extract::<String>().ok(),
-                Err(e) if e.is_instance_of::<PyStopIteration>(py) => None,
-                Err(_) => None,
-            }
+            iter.into_iter()
+                .next()
+                .map(|result| result.and_then(|item| item.extract()))
         })
     }
 }
@@ -177,4 +175,45 @@ impl From<BlastDNSError> for PyErr {
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::{PyList, PyModule};
+
+    #[test]
+    fn python_iterator_error_handling() {
+        pyo3::append_to_inittab!(_native);
+        Python::initialize();
+
+        Python::attach(|py| {
+            // Normal iteration with StopIteration
+            let list = PyList::new(py, ["a", "b", "c"]).unwrap();
+            let py_iter = list.try_iter().unwrap().unbind();
+            let mut rust_iter = PythonHostIterator::new(py_iter);
+
+            assert!(matches!(rust_iter.next(), Some(Ok(s)) if s == "a"));
+            assert!(matches!(rust_iter.next(), Some(Ok(s)) if s == "b"));
+            assert!(matches!(rust_iter.next(), Some(Ok(s)) if s == "c"));
+            assert!(rust_iter.next().is_none());
+
+            // Iterator yielding non-string returns error
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+            let py_iter = list.try_iter().unwrap().unbind();
+            let mut rust_iter = PythonHostIterator::new(py_iter);
+
+            assert!(matches!(rust_iter.next(), Some(Err(_))));
+
+            // Iterator whose __next__ raises a Python exception returns Err(...)
+            let code = c"class FailingIter:\n    def __iter__(self): return self\n    def __next__(self): raise RuntimeError('failure')";
+            let module = PyModule::from_code(py, code, c"test.py", c"test").unwrap();
+            let cls = module.getattr("FailingIter").unwrap();
+            let failing_iter = cls.call0().unwrap();
+            let py_iter = failing_iter.try_iter().unwrap().unbind();
+            let mut rust_iter = PythonHostIterator::new(py_iter);
+
+            assert!(matches!(rust_iter.next(), Some(Err(_))));
+        });
+    }
 }

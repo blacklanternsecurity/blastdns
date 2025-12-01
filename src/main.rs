@@ -69,7 +69,10 @@ async fn main() -> Result<()> {
     };
 
     let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);
-    let mut stream = client.resolve_batch(hosts, args.record_type);
+    let mut stream = client.resolve_batch(
+        hosts.map(Ok::<_, std::convert::Infallible>),
+        args.record_type,
+    );
 
     while let Some((host, outcome)) = stream.next().await {
         match outcome {

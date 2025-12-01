@@ -151,13 +151,14 @@ impl BlastDNSClient {
     }
 
     /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
-    pub fn resolve_batch<I>(
+    pub fn resolve_batch<I, E>(
         self: &Arc<Self>,
         hosts: I,
         record_type: RecordType,
     ) -> impl stream::Stream<Item = BatchResult> + Unpin + Send + 'static
     where
-        I: Iterator<Item = String> + Send + 'static,
+        I: Iterator<Item = Result<String, E>> + Send + 'static,
+        E: std::error::Error + Send + 'static,
     {
         let client = Arc::clone(self);
         let concurrency = client.queue_capacity.max(1);
@@ -167,6 +168,15 @@ impl BlastDNSClient {
 
         Box::pin(
             host_stream
+                .filter_map(|result| async move {
+                    match result {
+                        Ok(host) => Some(host),
+                        Err(e) => {
+                            eprintln!("Iterator error: {}", e);
+                            None
+                        }
+                    }
+                })
                 .map(move |host| {
                     let client = Arc::clone(&client);
                     let label = host.clone();
@@ -191,14 +201,15 @@ impl BlastDNSClient {
 }
 
 /// Stream adapter that wraps an iterator and polls it via spawn_blocking
-struct BlockingIteratorStream<I> {
+struct BlockingIteratorStream<I, T> {
     iterator: Arc<Mutex<I>>,
-    pending: Option<JoinHandle<Option<String>>>,
+    pending: Option<JoinHandle<Option<T>>>,
 }
 
-impl<I> BlockingIteratorStream<I>
+impl<I, T> BlockingIteratorStream<I, T>
 where
-    I: Iterator<Item = String> + Send + 'static,
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
 {
     fn new(iterator: I) -> Self {
         Self {
@@ -208,11 +219,12 @@ where
     }
 }
 
-impl<I> Stream for BlockingIteratorStream<I>
+impl<I, T> Stream for BlockingIteratorStream<I, T>
 where
-    I: Iterator<Item = String> + Send + 'static,
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
 {
-    type Item = String;
+    type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // If no pending task, spawn one
@@ -358,7 +370,10 @@ mod tests {
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();
-        let mut stream = client.resolve_batch(inputs.into_iter(), RecordType::A);
+        let mut stream = client.resolve_batch(
+            inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+        );
 
         let mut seen = Vec::new();
         while let Some((host, result)) = stream.next().await {
