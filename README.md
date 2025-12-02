@@ -251,7 +251,7 @@ sudo apt install dnsmasq
 Start the test DNS server:
 
 ```bash
-./scripts/start-test-dns.sh
+sudo ./scripts/start-test-dns.sh
 ```
 
 Then run tests with:

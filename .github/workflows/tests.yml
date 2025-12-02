@@ -25,7 +25,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
       - name: Start test DNS server
-        run: ./scripts/start-test-dns.sh
+        run: sudo ./scripts/start-test-dns.sh
 
       - name: Run tests
         run: cargo test --all --locked --verbose -- --include-ignored
