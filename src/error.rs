@@ -35,4 +35,31 @@ pub enum BlastDNSError {
         #[source]
         source: ClientError,
     },
+    #[error("configuration error: {0}")]
+    Configuration(String),
+}
+
+impl BlastDNSError {
+    /// Returns `true` when the error is transient and worth retrying.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            BlastDNSError::ResolverRequestFailed { .. } | BlastDNSError::WorkerDropped
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlastDNSError;
+
+    #[test]
+    fn retryable_errors_flagged() {
+        assert!(BlastDNSError::WorkerDropped.is_retryable());
+    }
+
+    #[test]
+    fn non_retryable_errors_rejected() {
+        assert!(!BlastDNSError::QueueClosed.is_retryable());
+    }
 }

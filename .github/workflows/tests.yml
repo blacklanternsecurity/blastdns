@@ -5,8 +5,12 @@ on:
     branches: [ stable ]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  rust-tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,8 +28,96 @@ jobs:
       - name: Install dnsmasq
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
-      - name: Start dnsmasq
-        run: dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1 &
+      - name: Start test DNS server
+        run: sudo ./scripts/start-test-dns.sh
 
       - name: Run tests
         run: cargo test --all --locked --verbose -- --include-ignored
+      
+      - name: Stop test DNS server
+        if: always()
+        run: ./scripts/stop-test-dns.sh || true
+
+  cli-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Run streaming test
+        run: python tests/test-streaming.py
+
+  python-tests:
+    needs: rust-tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dnsmasq
+        run: sudo apt-get update && sudo apt-get install -y dnsmasq
+
+      - name: Start test DNS server
+        run: sudo ./scripts/start-test-dns.sh
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install Python dependencies
+        run: uv sync
+
+      - name: Build Python extension
+        run: uv run maturin develop --release
+
+      - name: Run Python tests
+        run: uv run pytest blastdns/tests -vv
+      
+      - name: Stop test DNS server
+        if: always()
+        run: sudo ./scripts/stop-test-dns.sh || true
+
+  # rust-publish:
+  #   needs: rust-tests
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
+    
+  #   steps:
+  #     - uses: actions/checkout@v6
+      
+  #     - name: Install Rust toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #         toolchain: stable
+  #         override: true
+  #         profile: minimal
+      
+  #     - name: Publish to crates.io
+  #       run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

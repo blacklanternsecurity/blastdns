@@ -4,10 +4,160 @@ An async rust library for DNS lookups. Can be used to perform simple, one-off lo
 
 ## Features
 
+BlastDNS is simultaneously a:
+
+- [Rust CLI tool](#cli)
+- [Rust library](#rust-api)
+- [Python library](#python-api)
+
+## Benchmark
+
+20K DNS lookups against local `dnsmasq`, with 100 workers:
+
+| Library         | Language    | Time   | QPS    | Success Rate | vs dnspython   |
+|-----------------|-------------|--------|--------|--------------|----------------|
+| massdns         | C           | 0.308s | 65,019 | 100%         | 31.52x         |
+| blastdns-cli    | Rust        | 0.336s | 59,548 | 100%         | 28.86x         |
+| blastdns-python | Python+Rust | 1.564s | 12,791 | 100%         | 6.20x          |
+| dnspython       | Python      | 9.695s | 2,063  | 100%         | 1.00x          |
+
+### CLI
+
+The CLI mass-resolves hosts using a specified list of resolvers. It outputs to JSON.
+
+```bash
+# send all results to jq
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq
+
+# print only the raw IPv4 addresses
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answers[].rdata.A'
+
+# load from stdin
+$ cat hosts.txt | blastdns --rdtype A --resolvers resolvers.txt
+```
+
+#### CLI Help
+
+```
+$ blastdns --help
+BlastDNS - Async DNS spray client
+
+Usage: blastdns [OPTIONS] --resolvers <FILE> [HOSTS_TO_RESOLVE]
+
+Arguments:
+  [HOSTS_TO_RESOLVE]  File containing hostnames to resolve (one per line). Reads from stdin if not specified
+
+Options:
+      --rdtype <RECORD_TYPE>
+          Record type to query (A, AAAA, MX, ...) [default: A]
+      --resolvers <FILE>
+          File containing DNS nameservers (one per line)
+      --threads-per-resolver <THREADS_PER_RESOLVER>
+          Worker threads per resolver [default: 2]
+      --timeout-ms <TIMEOUT_MS>
+          Per-request timeout in milliseconds [default: 1000]
+      --retries <RETRIES>
+          Retry attempts after a resolver failure [default: 10]
+      --purgatory-threshold <PURGATORY_THRESHOLD>
+          Consecutive errors before a worker is put into timeout [default: 10]
+      --purgatory-sentence-ms <PURGATORY_SENTENCE_MS>
+          How many milliseconds a worker stays in timeout [default: 1000]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+#### Example JSON output
+
+BlastDNS outputs to JSON by default:
+
+```json
+{
+  "host": "microsoft.com",
+  "response": {
+    "additionals": [],
+    "answers": [
+      {
+        "dns_class": "IN",
+        "name_labels": "microsoft.com.",
+        "rdata": {
+          "A": "13.107.213.41"
+        },
+        "ttl": 1968
+      },
+      {
+        "dns_class": "IN",
+        "name_labels": "microsoft.com.",
+        "rdata": {
+          "A": "13.107.246.41"
+        },
+        "ttl": 1968
+      }
+    ],
+    "edns": {
+      "flags": {
+        "dnssec_ok": false,
+        "z": 0
+      },
+      "max_payload": 1232,
+      "options": {
+        "options": []
+      },
+      "rcode_high": 0,
+      "version": 0
+    },
+    "header": {
+      "additional_count": 1,
+      "answer_count": 2,
+      "authentic_data": false,
+      "authoritative": false,
+      "checking_disabled": false,
+      "id": 62150,
+      "message_type": "Response",
+      "name_server_count": 0,
+      "op_code": "Query",
+      "query_count": 1,
+      "recursion_available": true,
+      "recursion_desired": true,
+      "response_code": "NoError",
+      "truncation": false
+    },
+    "name_servers": [],
+    "queries": [
+      {
+        "name": "microsoft.com.",
+        "query_class": "IN",
+        "query_type": "A"
+      }
+    ],
+    "signature": []
+  }
+}
+```
+
+#### Debug Logging
+
+BlastDNS uses the standard Rust `tracing` ecosystem. Enable debug logging by setting the `RUST_LOG` environment variable:
+
+```bash
+# Show debug logs from blastdns only
+RUST_LOG=blastdns=debug blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+
+# Show debug logs from everything
+RUST_LOG=debug blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+
+# Show trace-level logs for detailed internal behavior
+RUST_LOG=blastdns=trace blastdns hosts.txt --rdtype A --resolvers resolvers.txt
+```
+
+Valid log levels (from least to most verbose): `error`, `warn`, `info`, `debug`, `trace`
+
 ### Rust API
 
 ```rust
 use blastdns::{BlastDNSClient, BlastDNSConfig};
+use futures::StreamExt;
 use hickory_client::proto::rr::RecordType;
 use std::time::Duration;
 
@@ -32,20 +182,51 @@ let result = client.resolve("example.com", RecordType::A).await?;
 
 // print the result as serde JSON
 println!("{}", serde_json::to_string_pretty(&result).unwrap());
+
+// bulk lookups stream back as soon as each resolver answers
+let wordlist = ["one.example", "two.example", "three.example"];
+let mut stream = client.resolve_batch(wordlist, RecordType::A);
+while let Some((host, outcome)) = stream.next().await {
+    match outcome {
+        Ok(response) => println!("{}: {} answers", host, response.answers().len()),
+        Err(err) => eprintln!("{} failed: {err}", host),
+    }
+}
 ```
 
-### CLI
+### Python API
 
-The CLI is a thin wrapper around the Rust API, and is useful for performing DNS lookups. It outputs to JSON, by serializing hickory's `DnsResponse`:
+The `blastdns` Python package is a thin wrapper around the Rust library.
 
 ```bash
-$ blastdns example.com --rdtype A --resolvers resolvers.txt
+# install python dependencies
+uv sync
+# build and install the rust->python bindings
+uv run maturin develop
+# run tests
+uv run pytest
 ```
 
-Additional CLI options:
-- `--threads-per-resolver N`: Number of worker tasks per resolver (default: 1)
-- `--queue-capacity N`: Override the bounded queue capacity
-- `--timeout-ms N`: Per-request timeout in milliseconds (default: 3000)
+To use it in Python, you can use the `Client` class:
+
+```python
+import json
+import asyncio
+from blastdns import Client, ClientConfig
+
+
+async def main():
+    resolvers = ["1.1.1.1:53"]
+    client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
+
+    response = await client.resolve("example.com", "AAAA")
+    print(json.dumps(response, indent=2))
+
+
+asyncio.run(main())
+```
+
+`Client.resolve(host, record_type=None)` defaults to `A` records and returns the same JSON-shaped dictionaries the CLI prints, so you can reuse downstream tooling. `ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
 
 ## Architecture
 
@@ -53,85 +234,9 @@ BlastDNS is built on top of [`hickory-dns`](https://github.com/hickory-dns/hicko
 
 BlastDNS is designed to be faster the more resolvers you give it.
 
-Beneath the hood of the `BlastDNSClient`, each resolver gets its own `ResolverWorker` tasks, with a configurable number of workers per resolver (default: 1, configurable via `BlastDNSConfig.threads_per_resolver`).
+Beneath the hood of the `BlastDNSClient`, each resolver gets its own `ResolverWorker` tasks, with a configurable number of workers per resolver (default: 2, configurable via `BlastDNSConfig.threads_per_resolver`).
 
 When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which contains the request (host + rdtype) and a oneshot channel to hold the result. This `WorkItem` is put into a [crossfire](https://github.com/frostyplanet/crossfire-rs) MPMC queue, to be picked up by the first available `ResolverWorker`. Workers are spawned immediately during client instantiation.
-
-### Work queue layout
-
-We use crossfire's lockless `mpmc::bounded_async` channel so that every API call (producer) can push a `WorkItem` and every `ResolverWorker` (consumer) can pop whichever request is next without additional locking overhead. The bounded flavor gives us built-in backpressure when callers enqueue faster than workers can drain.
-
-1. Size the queue based on how many lookups you want to have in-flight (a good default is `resolvers.len() * threads_per_resolver`).
-2. Build the queue once in `BlastDNSClient::with_config` and hand a cloned `MAsyncRx` handle to each worker when spawned.
-3. On `resolve`, send the `WorkItem` through the channel and await the result via the oneshot receiver.
-4. Inside each worker task, loop on `work_rx.recv().await`, fire the query against its resolver, and fulfill the responder stored in the `WorkItem`.
-
-```rust
-use crossfire::mpmc;
-
-// Internal implementation (not public API)
-let queue_depth = resolvers.len() * threads_per_resolver;
-let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_depth);
-
-for resolver in resolvers.iter() {
-    for worker_idx in 0..threads_per_resolver {
-        ResolverWorker::spawn(*resolver, work_rx.clone(), config.clone(), worker_idx);
-    }
-}
-
-// later inside BlastDNSClient::resolve
-let (tx, rx) = oneshot::channel();
-let work_item = WorkItem::new(query, tx);
-work_tx.send(work_item).await?;
-rx.await?
-```
-
-Because both endpoints are async, everything runs on the same runtime as the client, and workers can still be simple blocking tasks by calling `recv()` from a blocking context with the `From` conversion to `MRx` if we ever need to bridge runtimes.
-
-### Hickory client wiring
-
-Each `ResolverWorker` wraps a dedicated `hickory_client::client::Client` instance, which Hickory documents as a handle to an unbounded request queue backed by a background task (`bg`) that multiplexes I/O to the resolver socket. That background future **must** be spawned before we issue queries, otherwise the queue never drains.
-
-1. Create a UDP stream using `UdpClientStream::builder` and configure the timeout.
-2. Call `Client::connect(stream)` to obtain `(client, bg)`.
-3. Spawn `bg` immediately on the worker runtime so Hickory can pump the socket.
-4. Hold onto the `Client` and service each `WorkItem` via `client.query(name, DNSClass::IN, record_type).await`.
-
-```rust
-use hickory_client::client::{Client, ClientHandle};
-use hickory_client::proto::{
-    runtime::TokioRuntimeProvider,
-    rr::{DNSClass, Name, RecordType},
-    udp::UdpClientStream,
-    xfer::DnsResponse,
-};
-
-async fn init_hickory_client(resolver: SocketAddr, timeout: Duration) -> Result<Client, BlastDNSError> {
-    let provider = TokioRuntimeProvider::new();
-    let stream = UdpClientStream::builder(resolver, provider)
-        .with_timeout(Some(timeout))
-        .build();
-
-    let (client, bg) = Client::connect(stream).await?;
-    tokio::spawn(bg); // runs the multiplexed exchange loop
-    Ok(client)
-}
-
-async fn resolve_once(
-    client: &mut Client,
-    host: &str,
-    record_type: RecordType,
-) -> Result<DnsResponse, BlastDNSError> {
-    let name = Name::from_ascii(host)?;
-    Ok(client.query(name, DNSClass::IN, record_type).await?)
-}
-```
-
-Because the I/O path already multiplexes requests internally, we can share a single client per resolver worker and still issue multiple inflight queries—Hickory's internal exchange mechanism coalesces them and the background future handles I/O.
-
-### Future additions (not to be implemented yet)
-
-Later we will implement error handling, retries, caching, and penalties/timeouts for badly behaving resolvers. But for now, just a simple client with parallel resolution.
 
 ## Testing
 
@@ -140,26 +245,25 @@ To run the full test suite including integration tests, you'll need a local DNS 
 Install `dnsmasq`:
 
 ```bash
-# Arch Linux
-sudo pacman -S dnsmasq
-
-# Debian/Ubuntu
 sudo apt install dnsmasq
-
-# macOS
-brew install dnsmasq
 ```
 
-Start a simple DNS server using `dnsmasq`:
+Start the test DNS server:
 
 ```bash
-dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1
+sudo ./scripts/start-test-dns.sh
 ```
 
 Then run tests with:
 
 ```bash
 cargo test -- --ignored
+```
+
+When done, stop the test DNS server:
+
+```bash
+./scripts/stop-test-dns.sh
 ```
 
 ## Linting

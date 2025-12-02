@@ -10,8 +10,8 @@ use hickory_client::{
         xfer::DnsResponse,
     },
 };
-use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tokio::{sync::oneshot, time::sleep};
+use tracing::debug;
 
 use crate::{BlastDNSConfig, error::BlastDNSError};
 
@@ -48,6 +48,7 @@ pub(crate) struct ResolverWorker {
     resolver: SocketAddr,
     config: BlastDNSConfig,
     work_rx: MAsyncRx<WorkItem>,
+    client: Option<Client>,
 }
 
 impl ResolverWorker {
@@ -64,25 +65,60 @@ impl ResolverWorker {
                 resolver: resolver_addr,
                 config,
                 work_rx,
+                client: None,
             };
 
             match worker.run().await {
                 Ok(()) => debug!("resolver worker {resolver_addr} (#{worker_idx}) shutting down"),
                 Err(err) => {
-                    warn!("resolver worker {resolver_addr} (#{worker_idx}) exited: {err:?}")
+                    eprintln!("resolver worker {resolver_addr} (#{worker_idx}) exited: {err:?}")
                 }
             }
         });
     }
 
     /// Main worker loop that receives and processes queries until the channel closes.
-    async fn run(self) -> Result<(), BlastDNSError> {
-        let mut client = self.init_client().await?;
+    async fn run(mut self) -> Result<(), BlastDNSError> {
+        let mut consecutive_errors = 0usize;
 
-        while let Ok(work_item) = self.work_rx.recv().await {
+        loop {
+            if self.config.purgatory_threshold > 0
+                && consecutive_errors >= self.config.purgatory_threshold
+            {
+                let sentence = self.config.purgatory_sentence;
+                if !sentence.is_zero() {
+                    debug!(
+                        resolver = %self.resolver,
+                        sentence = ?sentence,
+                        consecutive_errors,
+                        "entering purgatory"
+                    );
+                    sleep(sentence).await;
+                }
+                consecutive_errors = consecutive_errors.saturating_sub(1);
+            }
+
+            let work_item = match self.work_rx.recv().await {
+                Ok(item) => item,
+                Err(_) => break,
+            };
+
+            // Lazy initialization: create client on first use
+            if self.client.is_none() {
+                self.client = Some(self.init_client().await?);
+            }
+
             let WorkItem { query, responder } = work_item;
-            let result = self.handle_query(&mut client, query).await;
-            let _ = responder.send(result);
+            match self.handle_query(query).await {
+                Ok(response) => {
+                    consecutive_errors = consecutive_errors.saturating_sub(1);
+                    let _ = responder.send(Ok(response));
+                }
+                Err(err) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let _ = responder.send(Err(err));
+                }
+            }
         }
 
         Ok(())
@@ -106,7 +142,7 @@ impl ResolverWorker {
         let resolver = self.resolver;
         tokio::spawn(async move {
             if let Err(err) = bg.await {
-                warn!("resolver {resolver} background task exited: {err}");
+                eprintln!("resolver {resolver} background task exited: {err}");
             }
         });
 
@@ -114,21 +150,22 @@ impl ResolverWorker {
     }
 
     /// Executes a DNS query using the client and returns the response.
-    async fn handle_query(
-        &self,
-        client: &mut Client,
-        query: QuerySpec,
-    ) -> Result<DnsResponse, BlastDNSError> {
+    async fn handle_query(&mut self, query: QuerySpec) -> Result<DnsResponse, BlastDNSError> {
         let QuerySpec { host, record_type } = query;
 
-        if self.config.debug {
-            eprintln!("[{}] Querying {} {}", self.resolver, host, record_type);
-        }
+        debug!(
+            resolver = %self.resolver,
+            host,
+            %record_type,
+            "querying DNS resolver"
+        );
 
         let name = Name::from_ascii(&host)
             .map_err(|source| BlastDNSError::InvalidHostname { name: host, source })?;
 
-        client
+        self.client
+            .as_mut()
+            .unwrap()
             .query(name, DNSClass::IN, record_type)
             .await
             .map_err(|source| BlastDNSError::ResolverRequestFailed {
