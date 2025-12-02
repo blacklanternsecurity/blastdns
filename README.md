@@ -10,9 +10,20 @@ BlastDNS is simultaneously a:
 - [Rust library](#rust-api)
 - [Python library](#python-api)
 
+## Benchmark
+
+20K DNS lookups against local `dnsmasq`, with 100 workers:
+
+| Library         | Language    | Time   | QPS    | Success Rate | vs dnspython   |
+|-----------------|-------------|--------|--------|--------------|----------------|
+| massdns         | C           | 0.308s | 65,019 | 100%         | 31.52x         |
+| blastdns-cli    | Rust        | 0.336s | 59,548 | 100%         | 28.86x         |
+| blastdns-python | Python+Rust | 1.564s | 12,791 | 100%         | 6.20x          |
+| dnspython       | Python      | 9.695s | 2,063  | 100%         | 1.00x          |
+
 ### CLI
 
-The CLI mass-resolves hosts based on a list of resolvers, outputting results to JSON.
+The CLI mass-resolves hosts using a specified list of resolvers. It outputs to JSON.
 
 ```bash
 # send all results to jq
@@ -237,16 +248,22 @@ Install `dnsmasq`:
 sudo apt install dnsmasq
 ```
 
-Start a simple DNS server using `dnsmasq`:
+Start the test DNS server:
 
 ```bash
-dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1
+./scripts/start-test-dns.sh
 ```
 
 Then run tests with:
 
 ```bash
 cargo test -- --ignored
+```
+
+When done, stop the test DNS server:
+
+```bash
+./scripts/stop-test-dns.sh
 ```
 
 ## Linting

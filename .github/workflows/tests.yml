@@ -24,11 +24,15 @@ jobs:
       - name: Install dnsmasq
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
-      - name: Start dnsmasq
-        run: dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1 &
+      - name: Start test DNS server
+        run: ./scripts/start-test-dns.sh
 
       - name: Run tests
         run: cargo test --all --locked --verbose -- --include-ignored
+      
+      - name: Stop test DNS server
+        if: always()
+        run: ./scripts/stop-test-dns.sh || true
 
   cli-tests:
     runs-on: ubuntu-latest
@@ -77,8 +81,8 @@ jobs:
       - name: Install dnsmasq
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
-      - name: Start dnsmasq
-        run: dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1 &
+      - name: Start test DNS server
+        run: ./scripts/start-test-dns.sh
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -91,6 +95,10 @@ jobs:
 
       - name: Run Python tests
         run: uv run pytest blastdns/tests -vv
+      
+      - name: Stop test DNS server
+        if: always()
+        run: ./scripts/stop-test-dns.sh || true
 
   # rust-publish:
   #   needs: rust-tests

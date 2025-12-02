@@ -110,3 +110,49 @@ async def test_client_resolve_batch_handles_mixed_success_and_failure():
     assert len(results) == 2
     # At least one should succeed
     assert any("answers" in r for r in results.values())
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_multi_requires_at_least_one_record_type():
+    client = Client(["127.0.0.1:5353"])
+    
+    with pytest.raises(RuntimeError, match="at least one record type"):
+        await client.resolve_multi("example.com", [])
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_multi_resolves_multiple_types():
+    client = Client(["127.0.0.1:5353"])
+    
+    results = await client.resolve_multi("example.com", ["A", "AAAA", "MX"])
+    
+    # Should return a dict with all requested record types
+    assert isinstance(results, dict)
+    assert set(results.keys()) == {"A", "AAAA", "MX"}
+    
+    # A record should have answers
+    assert "answers" in results["A"]
+    assert len(results["A"]["answers"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_multi_handles_mixed_success_failure():
+    client = Client(["127.0.0.1:5353"])
+    
+    # Request common types that should succeed and potentially one that might not have records
+    results = await client.resolve_multi("example.com", ["A", "AAAA", "CAA"])
+    
+    # All record types should be present in results
+    assert len(results) == 3
+    assert "A" in results
+    assert "AAAA" in results
+    assert "CAA" in results
+    
+    # A should succeed
+    assert "answers" in results["A"]
+    
+    # Individual results can succeed or fail (error key present)
+    for record_type, result in results.items():
+        assert isinstance(result, dict)
+        # Each result should have either answers or error
+        assert "queries" in result or "error" in result

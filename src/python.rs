@@ -59,6 +59,42 @@ impl PyBlastDNSClient {
         })
     }
 
+    fn resolve_multi<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = client
+                .resolve_multi(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
+            // Convert HashMap<RecordType, Result<DnsResponse, BlastDNSError>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, result) in results {
+                    let key = record_type.to_string();
+                    let value = match result {
+                        Ok(response) => dns_response_to_bytes(response)?,
+                        Err(err) => error_to_bytes(err)?,
+                    };
+                    dict.set_item(key, value)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
     #[pyo3(signature = (hosts, record_type = None))]
     fn resolve_batch(
         &self,

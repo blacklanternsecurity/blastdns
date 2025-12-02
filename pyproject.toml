@@ -18,6 +18,8 @@ dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "maturin>=1.10",
+    "dnspython>=2.7.0",
+    "tabulate>=0.9.0",
 ]
 
 [tool.maturin]

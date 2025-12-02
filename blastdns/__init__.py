@@ -105,6 +105,25 @@ class Client:
         raw = await self._inner.resolve(host, record_type)
         return orjson.loads(raw)
 
+    async def resolve_multi(self, host, record_types):
+        """Resolve multiple record types for a single hostname in parallel.
+
+        `host` is a hostname string. `record_types` is a list of record type strings
+        such as `["A", "AAAA", "MX"]`. At least one record type is required.
+
+        Returns a dict mapping each record type string to its result. For successful
+        resolutions, the value is a dict matching the format from `resolve()`. For
+        failures, the value is `{"error": "error message"}`.
+
+        Example:
+            results = await client.resolve_multi("example.com", ["A", "AAAA", "MX"])
+            print(results["A"])  # A record result
+            print(results["AAAA"])  # AAAA record result
+            print(results["MX"])  # MX record result
+        """
+        raw_dict = await self._inner.resolve_multi(host, record_types)
+        return {key: orjson.loads(value) for key, value in raw_dict.items()}
+
     async def resolve_batch(self, hosts, record_type=None):
         """Resolve multiple hostnames concurrently, yielding results as they complete.
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -148,6 +149,34 @@ impl BlastDNSClient {
         }
 
         Err(BlastDNSError::WorkerDropped)
+    }
+
+    /// Resolve multiple record types for a single hostname in parallel.
+    pub async fn resolve_multi<S: Into<String>>(
+        &self,
+        host: S,
+        record_types: Vec<RecordType>,
+    ) -> Result<HashMap<RecordType, Result<DnsResponse, BlastDNSError>>, BlastDNSError> {
+        if record_types.is_empty() {
+            return Err(BlastDNSError::Configuration(
+                "at least one record type is required".into(),
+            ));
+        }
+
+        let host = host.into();
+        let futures: Vec<_> = record_types
+            .iter()
+            .map(|&record_type| {
+                let host = host.clone();
+                async move {
+                    let result = self.resolve(host, record_type).await;
+                    (record_type, result)
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        Ok(results.into_iter().collect())
     }
 
     /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
@@ -390,5 +419,79 @@ mod tests {
         let mut expected_sorted = expected;
         expected_sorted.sort();
         assert_eq!(seen_sorted, expected_sorted);
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_rejects_empty_record_types() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let client = BlastDNSClient::new(resolvers).expect("client init");
+
+        let result = client.resolve_multi("example.com", vec![]).await;
+        assert!(result.is_err());
+        match result {
+            Err(BlastDNSError::Configuration(msg)) => {
+                assert!(msg.contains("at least one record type"));
+            }
+            _ => panic!("expected Configuration error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_resolves_multiple_types() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 2,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::MX];
+        let results = client
+            .resolve_multi("example.com", record_types.clone())
+            .await
+            .expect("resolve_multi failed");
+
+        // Verify all requested record types are in the result
+        assert_eq!(results.len(), record_types.len());
+        for record_type in record_types {
+            assert!(
+                results.contains_key(&record_type),
+                "missing result for {record_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_handles_mixed_success_failure() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 2,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        // A and AAAA should succeed for example.com, but some exotic types might not have records
+        let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::CAA];
+        let results = client
+            .resolve_multi("example.com", record_types.clone())
+            .await
+            .expect("resolve_multi failed");
+
+        // All record types should be present in results, even if some failed
+        assert_eq!(results.len(), record_types.len());
+
+        // A should succeed
+        if let Some(Ok(response)) = results.get(&RecordType::A) {
+            assert!(
+                !response.answers().is_empty(),
+                "A record should have answers"
+            );
+        } else {
+            panic!("A record query should succeed");
+        }
     }
 }
