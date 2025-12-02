@@ -281,7 +281,7 @@ def generate_hostnames(num_queries: int, pattern: str) -> list[str]:
 async def main():
     parser = argparse.ArgumentParser(description="Benchmark blastdns vs dnspython")
     parser.add_argument("-n", "--num-queries", type=int, default=20_000, help="Number of queries")
-    parser.add_argument("-w", "--num-workers", type=int, default=50, help="Number of concurrent workers")
+    parser.add_argument("-w", "--num-workers", type=int, default=100, help="Number of concurrent workers")
     parser.add_argument("-s", "--nameserver", default="127.0.0.1:5353", help="DNS server (IP:port)")
     parser.add_argument("--hostname", default="{n}.bench.local", help="Hostname pattern ({n} = query number)")
     parser.add_argument("--only", choices=["blastdns-cli", "blastdns-python", "massdns", "dnspython"], help="Run only one benchmark")
