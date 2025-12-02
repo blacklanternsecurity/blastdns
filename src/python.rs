@@ -66,7 +66,7 @@ impl PyBlastDNSClient {
         record_types: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
-        
+
         let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
             .iter()
             .map(|rt| parse_record_type(Some(rt.as_str())))
