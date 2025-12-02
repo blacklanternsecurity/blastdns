@@ -82,7 +82,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
       - name: Start test DNS server
-        run: ./scripts/start-test-dns.sh
+        run: sudo ./scripts/start-test-dns.sh
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -98,7 +98,7 @@ jobs:
       
       - name: Stop test DNS server
         if: always()
-        run: ./scripts/stop-test-dns.sh || true
+        run: sudo ./scripts/stop-test-dns.sh || true
 
   # rust-publish:
   #   needs: rust-tests

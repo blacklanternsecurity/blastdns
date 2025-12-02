@@ -42,7 +42,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
 
       - name: Start test DNS server
-        run: ./scripts/start-test-dns.sh
+        run: sudo ./scripts/start-test-dns.sh
 
       - name: Run benchmark
         run: uv run python scripts/benchmark.py > benchmark_report.md
@@ -60,7 +60,7 @@ jobs:
 
       - name: Stop test DNS server
         if: always()
-        run: ./scripts/stop-test-dns.sh || true
+        run: sudo ./scripts/stop-test-dns.sh || true
 
       - name: Comment benchmark results on PR
         if: github.event_name == 'pull_request'
