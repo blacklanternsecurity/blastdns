@@ -1,5 +1,10 @@
 # BlastDNS
 
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/tests.yml)
+
 An async rust library for DNS lookups. Can be used to perform simple, one-off lookups or bulk lookups in parallel with many resolvers, similar to [`massdns`](https://github.com/blechschmidt/massdns).
 
 ## Features
@@ -183,13 +188,24 @@ let result = client.resolve("example.com", RecordType::A).await?;
 // print the result as serde JSON
 println!("{}", serde_json::to_string_pretty(&result).unwrap());
 
-// bulk lookups stream back as soon as each resolver answers
+// resolve_batch: process many hosts in parallel with bounded concurrency
+// streams results back as they complete
 let wordlist = ["one.example", "two.example", "three.example"];
 let mut stream = client.resolve_batch(wordlist, RecordType::A);
 while let Some((host, outcome)) = stream.next().await {
     match outcome {
         Ok(response) => println!("{}: {} answers", host, response.answers().len()),
         Err(err) => eprintln!("{} failed: {err}", host),
+    }
+}
+
+// resolve_multi: resolve multiple record types for a single host in parallel
+let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::MX];
+let results = client.resolve_multi("example.com", record_types).await?;
+for (record_type, result) in results {
+    match result {
+        Ok(response) => println!("{}: {} answers", record_type, response.answers().len()),
+        Err(err) => eprintln!("{} failed: {err}", record_type),
     }
 }
 ```
@@ -219,14 +235,38 @@ async def main():
     resolvers = ["1.1.1.1:53"]
     client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
 
+    # resolve: lookup a single host
     response = await client.resolve("example.com", "AAAA")
     print(json.dumps(response, indent=2))
+
+    # resolve_batch: process many hosts in parallel with bounded concurrency
+    # streams results back as they complete
+    hosts = ["one.example.com", "two.example.com", "three.example.com"]
+    async for host, response in client.resolve_batch(hosts, "A"):
+        print(f"{host}: {len(response['answers'])} answers")
+
+    # resolve_multi: resolve multiple record types for a single host in parallel
+    record_types = ["A", "AAAA", "MX"]
+    results = await client.resolve_multi("example.com", record_types)
+    for record_type, response in results.items():
+        if "error" in response:
+            print(f"{record_type} failed: {response['error']}")
+        else:
+            print(f"{record_type}: {len(response['answers'])} answers")
 
 
 asyncio.run(main())
 ```
 
-`Client.resolve(host, record_type=None)` defaults to `A` records and returns the same JSON-shaped dictionaries the CLI prints, so you can reuse downstream tooling. `ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
+#### Python API Methods
+
+- **`Client.resolve(host, record_type=None)`**: Lookup a single hostname. Defaults to `A` records. Returns a JSON-shaped dictionary matching the CLI output.
+
+- **`Client.resolve_batch(hosts, record_type=None)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, response)` tuples as results complete. Useful for processing large wordlists efficiently.
+
+- **`Client.resolve_multi(host, record_types)`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a successful response or an error dictionary with an `"error"` key.
+
+`ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
 
 ## Architecture
 
