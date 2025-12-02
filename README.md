@@ -226,33 +226,38 @@ uv run pytest
 To use it in Python, you can use the `Client` class:
 
 ```python
-import json
 import asyncio
-from blastdns import Client, ClientConfig
+from blastdns import Client, ClientConfig, DNSResult, DNSError
 
 
 async def main():
     resolvers = ["1.1.1.1:53"]
     client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
 
-    # resolve: lookup a single host
-    response = await client.resolve("example.com", "AAAA")
-    print(json.dumps(response, indent=2))
+    # resolve: lookup a single host, returns a Pydantic model
+    result = await client.resolve("example.com", "AAAA")
+    print(f"Host: {result.host}")
+    print(f"Response code: {result.response.header.response_code}")
+    for answer in result.response.answers:
+        print(f"  {answer.name_labels}: {answer.rdata}")
 
     # resolve_batch: process many hosts in parallel with bounded concurrency
     # streams results back as they complete
     hosts = ["one.example.com", "two.example.com", "three.example.com"]
-    async for host, response in client.resolve_batch(hosts, "A"):
-        print(f"{host}: {len(response['answers'])} answers")
+    async for host, result in client.resolve_batch(hosts, "A"):
+        if isinstance(result, DNSError):
+            print(f"{host} failed: {result.error}")
+        else:
+            print(f"{host}: {len(result.response.answers)} answers")
 
     # resolve_multi: resolve multiple record types for a single host in parallel
     record_types = ["A", "AAAA", "MX"]
     results = await client.resolve_multi("example.com", record_types)
-    for record_type, response in results.items():
-        if "error" in response:
-            print(f"{record_type} failed: {response['error']}")
+    for record_type, result in results.items():
+        if isinstance(result, DNSError):
+            print(f"{record_type} failed: {result.error}")
         else:
-            print(f"{record_type}: {len(response['answers'])} answers")
+            print(f"{record_type}: {len(result.response.answers)} answers")
 
 
 asyncio.run(main())
@@ -260,11 +265,19 @@ asyncio.run(main())
 
 #### Python API Methods
 
-- **`Client.resolve(host, record_type=None)`**: Lookup a single hostname. Defaults to `A` records. Returns a JSON-shaped dictionary matching the CLI output.
+- **`Client.resolve(host, record_type=None) -> DNSResult`**: Lookup a single hostname. Defaults to `A` records. Returns a Pydantic `DNSResult` model with typed fields for easy access to the response data.
 
-- **`Client.resolve_batch(hosts, record_type=None)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, response)` tuples as results complete. Useful for processing large wordlists efficiently.
+- **`Client.resolve_batch(hosts, record_type=None)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, result)` tuples as results complete. Each result is either a `DNSResult` or `DNSError` Pydantic model. Useful for processing large wordlists efficiently.
 
-- **`Client.resolve_multi(host, record_types)`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a successful response or an error dictionary with an `"error"` key.
+- **`Client.resolve_multi(host, record_types) -> dict[str, DNSResultOrError]`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a `DNSResult` (success) or `DNSError` (failure) Pydantic model.
+
+#### Response Models
+
+All methods return Pydantic V2 models for type safety and IDE autocomplete:
+
+- **`DNSResult`**: Successful DNS response with `host` and `response` fields
+- **`DNSError`**: Failed DNS lookup with an `error` field
+- **`Response`**: DNS message with `header`, `queries`, `answers`, `name_servers`, etc.
 
 `ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
 

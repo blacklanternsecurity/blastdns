@@ -2,8 +2,15 @@ import orjson
 from pydantic import BaseModel, Field
 
 from . import _native  # type: ignore
+from .models import DNSError, DNSResult, DNSResultOrError
 
-__all__ = ["ClientConfig", "Client"]
+__all__ = [
+    "ClientConfig",
+    "Client",
+    "DNSResult",
+    "DNSError",
+    "DNSResultOrError",
+]
 
 
 class ClientConfig(BaseModel):
@@ -33,115 +40,81 @@ class Client:
         config_json = (config or ClientConfig()).model_dump_json()
         self._inner = _native.Client(list(resolvers), config_json)
 
-    async def resolve(self, host, record_type=None):
+    async def resolve(self, host, record_type=None) -> DNSResult:
         """Resolve a hostname to DNS records.
 
-        `record_type` is a string such as `"A"`, `"AAAA"`, `"MX"`, etc. If
-        omitted or `None`, it defaults to `"A"`. The return value is a dict in
-        the same shape as the CLI JSON output. For example:
+        Args:
+            host: Hostname to resolve
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
 
-        {
-            "host": "microsoft.com",
-            "response": {
-                "additionals": [],
-                "answers": [
-                    {
-                        "dns_class": "IN",
-                        "name_labels": "microsoft.com.",
-                        "rdata": {
-                            "A": "13.107.213.41"
-                        },
-                        "ttl": 1968
-                    },
-                    {
-                        "dns_class": "IN",
-                        "name_labels": "microsoft.com.",
-                        "rdata": {
-                            "A": "13.107.246.41"
-                        },
-                        "ttl": 1968
-                    }
-                ],
-                "edns": {
-                    "flags": {
-                        "dnssec_ok": false,
-                        "z": 0
-                    },
-                    "max_payload": 1232,
-                    "options": {
-                        "options": []
-                    },
-                    "rcode_high": 0,
-                    "version": 0
-                },
-                "header": {
-                    "additional_count": 1,
-                    "answer_count": 2,
-                    "authentic_data": false,
-                    "authoritative": false,
-                    "checking_disabled": false,
-                    "id": 62150,
-                    "message_type": "Response",
-                    "name_server_count": 0,
-                    "op_code": "Query",
-                    "query_count": 1,
-                    "recursion_available": true,
-                    "recursion_desired": true,
-                    "response_code": "NoError",
-                    "truncation": false
-                },
-                "name_servers": [],
-                "queries": [
-                    {
-                        "name": "microsoft.com.",
-                        "query_class": "IN",
-                        "query_type": "A"
-                    }
-                ],
-                "signature": []
-            }
-        }
+        Returns:
+            DNSResult: A Pydantic model containing the host and DNS response with
+                      typed fields for header, queries, answers, etc.
+
+        Example:
+            result = await client.resolve("example.com", "A")
+            print(result.host)
+            for answer in result.response.answers:
+                print(answer.rdata)
         """
         raw = await self._inner.resolve(host, record_type)
-        return orjson.loads(raw)
+        response_data = orjson.loads(raw)
+        return DNSResult.model_validate({"host": host, "response": response_data})
 
-    async def resolve_multi(self, host, record_types):
+    async def resolve_multi(
+        self, host, record_types
+    ) -> dict[str, DNSResultOrError]:
         """Resolve multiple record types for a single hostname in parallel.
 
-        `host` is a hostname string. `record_types` is a list of record type strings
-        such as `["A", "AAAA", "MX"]`. At least one record type is required.
+        Args:
+            host: Hostname to resolve
+            record_types: List of record type strings (e.g. ["A", "AAAA", "MX"])
 
-        Returns a dict mapping each record type string to its result. For successful
-        resolutions, the value is a dict matching the format from `resolve()`. For
-        failures, the value is `{"error": "error message"}`.
+        Returns:
+            dict[str, DNSResultOrError]: Dictionary mapping record type to result.
+                                         Successful resolutions return DNSResult,
+                                         failures return DNSError.
 
         Example:
             results = await client.resolve_multi("example.com", ["A", "AAAA", "MX"])
-            print(results["A"])  # A record result
-            print(results["AAAA"])  # AAAA record result
-            print(results["MX"])  # MX record result
+            a_result = results["A"]
+            if isinstance(a_result, DNSResult):
+                print(f"A records: {a_result.response.answers}")
+            else:
+                print(f"Error: {a_result.error}")
         """
         raw_dict = await self._inner.resolve_multi(host, record_types)
-        return {key: orjson.loads(value) for key, value in raw_dict.items()}
+        result = {}
+        for key, value in raw_dict.items():
+            data = orjson.loads(value)
+            if "error" in data:
+                result[key] = DNSError.model_validate(data)
+            else:
+                result[key] = DNSResult.model_validate({"host": host, "response": data})
+        return result
 
     async def resolve_batch(self, hosts, record_type=None):
         """Resolve multiple hostnames concurrently, yielding results as they complete.
 
-        `hosts` is an iterable of hostname strings. `record_type` is a string such
-        as `"A"`, `"AAAA"`, `"MX"`, etc. If omitted or `None`, it defaults to `"A"`.
+        Args:
+            hosts: Iterable of hostname strings
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
 
-        This method is an async generator that yields `(host, result)` tuples as
-        resolutions complete. Results are unordered (faster hosts complete first).
-
-        For successful resolutions, `result` is a dict matching the format from
-        `resolve()`. For failures, `result` is `{"error": "error message"}`.
+        Yields:
+            tuple[str, DNSResultOrError]: (hostname, result) pairs. Successful resolutions
+                                          return DNSResult, failures return DNSError.
+                                          Results are unordered (faster hosts first).
 
         Example:
             async for host, result in client.resolve_batch(["example.com", "google.com"], "A"):
-                if "error" in result:
-                    print(f"{host} failed: {result['error']}")
+                if isinstance(result, DNSError):
+                    print(f"{host} failed: {result.error}")
                 else:
-                    print(f"{host} resolved: {result}")
+                    print(f"{host}: {len(result.response.answers)} answers")
         """
         async for host, raw in self._inner.resolve_batch(hosts, record_type):
-            yield (host, orjson.loads(raw))
+            data = orjson.loads(raw)
+            if "error" in data:
+                yield (host, DNSError.model_validate(data))
+            else:
+                yield (host, DNSResult.model_validate({"host": host, "response": data}))

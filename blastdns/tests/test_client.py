@@ -1,6 +1,6 @@
 import pytest
 
-from blastdns import Client, ClientConfig
+from blastdns import Client, ClientConfig, DNSError, DNSResult
 
 
 def test_client_config_defaults():
@@ -34,9 +34,10 @@ def test_client_config_custom_values():
 async def test_client_resolve_hits_real_resolver():
     client = Client(["127.0.0.1:5353"])
     result = await client.resolve("example.com", "A")
-    assert "answers" in result
+    assert isinstance(result, DNSResult)
+    assert result.host == "example.com"
     assert any(
-        answer.get("name_labels") == "example.com." for answer in result["answers"]
+        answer.name_labels == "example.com." for answer in result.response.answers
     )
 
 
@@ -44,9 +45,9 @@ async def test_client_resolve_hits_real_resolver():
 async def test_client_resolve_ptr():
     client = Client(["127.0.0.1:5353"])
     result = await client.resolve("8.8.8.8.in-addr.arpa", "PTR")
-    assert "answers" in result
+    assert isinstance(result, DNSResult)
     assert any(
-        answer.get("rdata", {}).get("PTR", "") == "dns.google." for answer in result["answers"]
+        answer.rdata.get("PTR", "") == "dns.google." for answer in result.response.answers
     )
 
 
@@ -54,8 +55,8 @@ async def test_client_resolve_ptr():
 async def test_client_resolve_supports_default_record_type():
     client = Client(["127.0.0.1:5353"])
     result = await client.resolve("example.com")
-    assert "queries" in result
-    assert result["queries"][0]["query_type"] == "A"
+    assert isinstance(result, DNSResult)
+    assert result.response.queries[0].query_type == "A"
 
 
 @pytest.mark.asyncio
@@ -68,12 +69,13 @@ async def test_client_resolve_batch_streams_results():
     async for host, result in client.resolve_batch(hosts_list, "A"):
         seen_hosts.append(host)
         # Check for either success or error format
-        if "error" in result:
-            assert isinstance(result["error"], str)
+        if isinstance(result, DNSError):
+            assert isinstance(result.error, str)
         else:
-            assert "queries" in result
-            assert "answers" in result
-            assert result["queries"][0]["query_type"] == "A"
+            assert isinstance(result, DNSResult)
+            assert len(result.response.queries) > 0
+            assert len(result.response.answers) >= 0
+            assert result.response.queries[0].query_type == "A"
 
     assert sorted(seen_hosts) == sorted(hosts_list)
 
@@ -89,8 +91,8 @@ async def test_client_resolve_batch_accepts_generators():
     count = 0
     async for host, result in client.resolve_batch(host_gen(), "A"):
         assert host.startswith("example.")
-        if "error" not in result:
-            assert "queries" in result
+        if isinstance(result, DNSResult):
+            assert len(result.response.queries) > 0
         count += 1
 
     assert count == 3
@@ -109,7 +111,7 @@ async def test_client_resolve_batch_handles_mixed_success_and_failure():
 
     assert len(results) == 2
     # At least one should succeed
-    assert any("answers" in r for r in results.values())
+    assert any(isinstance(r, DNSResult) for r in results.values())
 
 
 @pytest.mark.asyncio
@@ -131,8 +133,10 @@ async def test_client_resolve_multi_resolves_multiple_types():
     assert set(results.keys()) == {"A", "AAAA", "MX"}
     
     # A record should have answers
-    assert "answers" in results["A"]
-    assert len(results["A"]["answers"]) > 0
+    a_result = results["A"]
+    assert isinstance(a_result, (DNSResult, DNSError))
+    if isinstance(a_result, DNSResult):
+        assert len(a_result.response.answers) > 0
 
 
 @pytest.mark.asyncio
@@ -149,10 +153,10 @@ async def test_client_resolve_multi_handles_mixed_success_failure():
     assert "CAA" in results
     
     # A should succeed
-    assert "answers" in results["A"]
+    a_result = results["A"]
+    if isinstance(a_result, DNSResult):
+        assert len(a_result.response.answers) >= 0
     
-    # Individual results can succeed or fail (error key present)
+    # Individual results can succeed or fail
     for record_type, result in results.items():
-        assert isinstance(result, dict)
-        # Each result should have either answers or error
-        assert "queries" in result or "error" in result
+        assert isinstance(result, (DNSResult, DNSError))
