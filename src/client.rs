@@ -1,9 +1,14 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
-use tokio::sync::oneshot;
+use tokio::sync::{OnceCell, oneshot};
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::{
@@ -14,12 +19,23 @@ use crate::{
 };
 
 /// Primary API surface for performing DNS lookups concurrently.
-#[derive(Debug)]
 pub struct BlastDNSClient {
     resolvers: Vec<SocketAddr>,
     work_tx: MAsyncTx<WorkItem>,
+    work_rx: MAsyncRx<WorkItem>,
     config: BlastDNSConfig,
     queue_capacity: usize,
+    workers_spawned: OnceCell<()>,
+}
+
+impl std::fmt::Debug for BlastDNSClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlastDNSClient")
+            .field("resolvers", &self.resolvers)
+            .field("config", &self.config)
+            .field("queue_capacity", &self.queue_capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result item produced by [`BlastDNSClient::resolve_batch`].
@@ -27,12 +43,12 @@ pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
 impl BlastDNSClient {
     /// Build a client using the default configuration.
-    pub async fn new(resolvers: Vec<String>) -> Result<Self, BlastDNSError> {
-        Self::with_config(resolvers, BlastDNSConfig::default()).await
+    pub fn new(resolvers: Vec<String>) -> Result<Self, BlastDNSError> {
+        Self::with_config(resolvers, BlastDNSConfig::default())
     }
 
     /// Build a client with an explicit configuration.
-    pub async fn with_config(
+    pub fn with_config(
         resolvers: Vec<String>,
         config: BlastDNSConfig,
     ) -> Result<Self, BlastDNSError> {
@@ -55,15 +71,23 @@ impl BlastDNSClient {
 
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
-        let client = Self {
+        Ok(Self {
             resolvers: parsed,
             work_tx,
+            work_rx,
             config,
             queue_capacity,
-        };
-        client.spawn_workers(work_rx);
+            workers_spawned: OnceCell::new(),
+        })
+    }
 
-        Ok(client)
+    /// Ensure workers are spawned (called lazily on first use).
+    async fn ensure_workers(&self) {
+        self.workers_spawned
+            .get_or_init(|| async {
+                self.spawn_workers(self.work_rx.clone());
+            })
+            .await;
     }
 
     /// Enqueue a DNS lookup and await the resolver result.
@@ -72,6 +96,8 @@ impl BlastDNSClient {
         host: S,
         record_type: RecordType,
     ) -> Result<DnsResponse, BlastDNSError> {
+        self.ensure_workers().await;
+
         let host = host.into();
         let attempts = self.config.max_retries.saturating_add(1);
 
@@ -125,28 +151,71 @@ impl BlastDNSClient {
         Err(BlastDNSError::WorkerDropped)
     }
 
-    /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
-    pub fn resolve_batch<'a, I, S>(
-        &'a self,
-        hosts: I,
-        record_type: RecordType,
-    ) -> impl stream::Stream<Item = BatchResult> + 'a
-    where
-        I: IntoIterator<Item = S>,
-        I::IntoIter: 'a,
-        S: Into<String>,
-    {
-        let concurrency = self.queue_capacity.max(1);
-        stream::iter(hosts)
-            .map(move |host| {
-                let host_string = host.into();
-                let label = host_string.clone();
+    /// Resolve multiple record types for a single hostname in parallel.
+    pub async fn resolve_multi<S: Into<String>>(
+        &self,
+        host: S,
+        record_types: Vec<RecordType>,
+    ) -> Result<HashMap<RecordType, Result<DnsResponse, BlastDNSError>>, BlastDNSError> {
+        if record_types.is_empty() {
+            return Err(BlastDNSError::Configuration(
+                "at least one record type is required".into(),
+            ));
+        }
+
+        let host = host.into();
+        let futures: Vec<_> = record_types
+            .iter()
+            .map(|&record_type| {
+                let host = host.clone();
                 async move {
-                    let result = self.resolve(host_string, record_type).await;
-                    (label, result)
+                    let result = self.resolve(host, record_type).await;
+                    (record_type, result)
                 }
             })
-            .buffer_unordered(concurrency)
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        Ok(results.into_iter().collect())
+    }
+
+    /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
+    pub fn resolve_batch<I, E>(
+        self: &Arc<Self>,
+        hosts: I,
+        record_type: RecordType,
+    ) -> impl stream::Stream<Item = BatchResult> + Unpin + Send + 'static
+    where
+        I: Iterator<Item = Result<String, E>> + Send + 'static,
+        E: std::error::Error + Send + 'static,
+    {
+        let client = Arc::clone(self);
+        let concurrency = client.queue_capacity.max(1);
+
+        // Convert iterator to stream using spawn_blocking to avoid blocking Tokio
+        let host_stream = BlockingIteratorStream::new(hosts);
+
+        Box::pin(
+            host_stream
+                .filter_map(|result| async move {
+                    match result {
+                        Ok(host) => Some(host),
+                        Err(e) => {
+                            eprintln!("Iterator error: {}", e);
+                            None
+                        }
+                    }
+                })
+                .map(move |host| {
+                    let client = Arc::clone(&client);
+                    let label = host.clone();
+                    async move {
+                        let result = client.resolve(host, record_type).await;
+                        (label, result)
+                    }
+                })
+                .buffer_unordered(concurrency * 2),
+        )
     }
 
     fn spawn_workers(&self, work_rx: MAsyncRx<WorkItem>) {
@@ -156,6 +225,59 @@ impl BlastDNSClient {
             for worker_idx in 0..threads {
                 ResolverWorker::spawn(resolver, work_rx.clone(), self.config.clone(), worker_idx);
             }
+        }
+    }
+}
+
+/// Stream adapter that wraps an iterator and polls it via spawn_blocking
+struct BlockingIteratorStream<I, T> {
+    iterator: Arc<Mutex<I>>,
+    pending: Option<JoinHandle<Option<T>>>,
+}
+
+impl<I, T> BlockingIteratorStream<I, T>
+where
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    fn new(iterator: I) -> Self {
+        Self {
+            iterator: Arc::new(Mutex::new(iterator)),
+            pending: None,
+        }
+    }
+}
+
+impl<I, T> Stream for BlockingIteratorStream<I, T>
+where
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // If no pending task, spawn one
+        if self.pending.is_none() {
+            let iterator = Arc::clone(&self.iterator);
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut iter = iterator.lock().unwrap();
+                iter.next()
+            });
+            self.pending = Some(handle);
+        }
+
+        // Poll the pending task
+        let handle = self.pending.as_mut().unwrap();
+        match Pin::new(handle).poll(cx) {
+            Poll::Ready(Ok(result)) => {
+                self.pending = None;
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_)) => {
+                self.pending = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -174,11 +296,9 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn rejects_empty_resolvers() {
-        let err = BlastDNSClient::new(Vec::new())
-            .await
-            .expect_err("expected failure");
+    #[test]
+    fn rejects_empty_resolvers() {
+        let err = BlastDNSClient::new(Vec::new()).expect_err("expected failure");
         assert!(matches!(err, BlastDNSError::NoResolvers));
     }
 
@@ -275,13 +395,14 @@ mod tests {
             ..Default::default()
         };
 
-        let client = BlastDNSClient::with_config(resolvers, config)
-            .await
-            .expect("client init");
+        let client = Arc::new(BlastDNSClient::with_config(resolvers, config).expect("client init"));
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();
-        let mut stream = client.resolve_batch(inputs, RecordType::A);
+        let mut stream = client.resolve_batch(
+            inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+        );
 
         let mut seen = Vec::new();
         while let Some((host, result)) = stream.next().await {
@@ -298,5 +419,79 @@ mod tests {
         let mut expected_sorted = expected;
         expected_sorted.sort();
         assert_eq!(seen_sorted, expected_sorted);
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_rejects_empty_record_types() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let client = BlastDNSClient::new(resolvers).expect("client init");
+
+        let result = client.resolve_multi("example.com", vec![]).await;
+        assert!(result.is_err());
+        match result {
+            Err(BlastDNSError::Configuration(msg)) => {
+                assert!(msg.contains("at least one record type"));
+            }
+            _ => panic!("expected Configuration error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_resolves_multiple_types() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 2,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::MX];
+        let results = client
+            .resolve_multi("example.com", record_types.clone())
+            .await
+            .expect("resolve_multi failed");
+
+        // Verify all requested record types are in the result
+        assert_eq!(results.len(), record_types.len());
+        for record_type in record_types {
+            assert!(
+                results.contains_key(&record_type),
+                "missing result for {record_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_handles_mixed_success_failure() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 2,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        // A and AAAA should succeed for example.com, but some exotic types might not have records
+        let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::CAA];
+        let results = client
+            .resolve_multi("example.com", record_types.clone())
+            .await
+            .expect("resolve_multi failed");
+
+        // All record types should be present in results, even if some failed
+        assert_eq!(results.len(), record_types.len());
+
+        // A should succeed
+        if let Some(Ok(response)) = results.get(&RecordType::A) {
+            assert!(
+                !response.answers().is_empty(),
+                "A record should have answers"
+            );
+        } else {
+            panic!("A record query should succeed");
+        }
     }
 }

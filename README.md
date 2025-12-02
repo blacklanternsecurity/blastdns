@@ -10,9 +10,20 @@ BlastDNS is simultaneously a:
 - [Rust library](#rust-api)
 - [Python library](#python-api)
 
+## Benchmark
+
+20K DNS lookups against local `dnsmasq`, with 100 workers:
+
+| Library         | Language    | Time   | QPS    | Success Rate | vs dnspython   |
+|-----------------|-------------|--------|--------|--------------|----------------|
+| massdns         | C           | 0.308s | 65,019 | 100%         | 31.52x         |
+| blastdns-cli    | Rust        | 0.336s | 59,548 | 100%         | 28.86x         |
+| blastdns-python | Python+Rust | 1.564s | 12,791 | 100%         | 6.20x          |
+| dnspython       | Python      | 9.695s | 2,063  | 100%         | 1.00x          |
+
 ### CLI
 
-The CLI mass-resolves hosts based on a list of resolvers, outputting results to JSON.
+The CLI mass-resolves hosts using a specified list of resolvers. It outputs to JSON.
 
 ```bash
 # send all results to jq
@@ -20,6 +31,9 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq
 
 # print only the raw IPv4 addresses
 $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answers[].rdata.A'
+
+# load from stdin
+$ cat hosts.txt | blastdns --rdtype A --resolvers resolvers.txt
 ```
 
 #### CLI Help
@@ -28,10 +42,10 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answer
 $ blastdns --help
 BlastDNS - Async DNS spray client
 
-Usage: blastdns [OPTIONS] --resolvers <FILE> <HOSTS_TO_RESOLVE>
+Usage: blastdns [OPTIONS] --resolvers <FILE> [HOSTS_TO_RESOLVE]
 
 Arguments:
-  <HOSTS_TO_RESOLVE>  File containing hostnames to resolve (one per line)
+  [HOSTS_TO_RESOLVE]  File containing hostnames to resolve (one per line). Reads from stdin if not specified
 
 Options:
       --rdtype <RECORD_TYPE>
@@ -45,7 +59,7 @@ Options:
       --retries <RETRIES>
           Retry attempts after a resolver failure [default: 10]
       --purgatory-threshold <PURGATORY_THRESHOLD>
-          Consecutive errors before a worker is put into timeout [default: 5]
+          Consecutive errors before a worker is put into timeout [default: 10]
       --purgatory-sentence-ms <PURGATORY_SENTENCE_MS>
           How many milliseconds a worker stays in timeout [default: 1000]
   -h, --help
@@ -234,16 +248,22 @@ Install `dnsmasq`:
 sudo apt install dnsmasq
 ```
 
-Start a simple DNS server using `dnsmasq`:
+Start the test DNS server:
 
 ```bash
-dnsmasq --no-daemon --no-hosts --no-resolv --port=5353 --server=1.1.1.1
+sudo ./scripts/start-test-dns.sh
 ```
 
 Then run tests with:
 
 ```bash
 cargo test -- --ignored
+```
+
+When done, stop the test DNS server:
+
+```bash
+./scripts/stop-test-dns.sh
 ```
 
 ## Linting

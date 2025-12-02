@@ -1,15 +1,17 @@
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
+use futures::stream::{Stream, StreamExt};
 use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyType};
+use pyo3::types::{PyAnyMethods, PyIterator};
 use pyo3_async_runtimes::tokio::future_into_py;
+use tokio::sync::Mutex as TokioMutex;
 
-use crate::client::BlastDNSClient;
-use crate::config::BlastDNSConfig;
+use crate::client::{BatchResult, BlastDNSClient};
+use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
 use crate::error::BlastDNSError;
 
 #[pyclass(name = "Client")]
@@ -19,27 +21,22 @@ pub struct PyBlastDNSClient {
 
 #[pymethods]
 impl PyBlastDNSClient {
-    #[classmethod]
-    #[pyo3(signature = (resolvers, config = None))]
-    fn create<'py>(
-        _cls: &Bound<'py, PyType>,
-        py: Python<'py>,
-        resolvers: Vec<String>,
-        config: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let config = config
-            .as_ref()
-            .map(config_from_py)
-            .transpose()?
-            .unwrap_or_else(BlastDNSConfig::default);
+    #[new]
+    #[pyo3(signature = (resolvers, config_json = None))]
+    fn new(resolvers: Vec<String>, config_json: Option<String>) -> PyResult<Self> {
+        let config = match config_json {
+            Some(json) => {
+                let wire: BlastDNSConfigWire = serde_json::from_str(&json)
+                    .map_err(|e| PyValueError::new_err(format!("invalid config JSON: {e}")))?;
+                BlastDNSConfig::from(wire)
+            }
+            None => BlastDNSConfig::default(),
+        };
 
-        future_into_py(py, async move {
-            let client = BlastDNSClient::with_config(resolvers, config)
-                .await
-                .map_err(PyErr::from)?;
-            Ok(PyBlastDNSClient {
-                inner: Arc::new(client),
-            })
+        let client = BlastDNSClient::with_config(resolvers, config).map_err(PyErr::from)?;
+
+        Ok(PyBlastDNSClient {
+            inner: Arc::new(client),
         })
     }
 
@@ -58,60 +55,121 @@ impl PyBlastDNSClient {
                 .resolve(host, record_type)
                 .await
                 .map_err(PyErr::from)?;
-            Python::attach(|py| dns_response_to_py(py, response))
+            dns_response_to_bytes(response)
+        })
+    }
+
+    fn resolve_multi<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = client
+                .resolve_multi(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
+            // Convert HashMap<RecordType, Result<DnsResponse, BlastDNSError>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, result) in results {
+                    let key = record_type.to_string();
+                    let value = match result {
+                        Ok(response) => dns_response_to_bytes(response)?,
+                        Err(err) => error_to_bytes(err)?,
+                    };
+                    dict.set_item(key, value)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
+    #[pyo3(signature = (hosts, record_type = None))]
+    fn resolve_batch(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+    ) -> PyResult<PyBatchIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch (it handles spawn_blocking internally)
+        let result_stream = self.inner.resolve_batch(rust_iter, record_type);
+
+        Ok(PyBatchIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
         })
     }
 }
 
-fn config_from_py(obj: &Bound<'_, PyAny>) -> PyResult<BlastDNSConfig> {
-    if let Ok(mapping) = obj.cast::<PyDict>() {
-        return config_from_dict(mapping);
-    }
-
-    if obj.hasattr("model_dump")? {
-        let dumped = obj.call_method0("model_dump")?;
-        let dict = dumped
-            .cast_into::<PyDict>()
-            .map_err(|_| PyTypeError::new_err("model_dump() must return a dict"))?;
-        return config_from_dict(&dict);
-    }
-
-    if obj.hasattr("dict")? {
-        let dumped = obj.call_method0("dict")?;
-        let dict = dumped
-            .cast_into::<PyDict>()
-            .map_err(|_| PyTypeError::new_err("dict() must return a dict"))?;
-        return config_from_dict(&dict);
-    }
-
-    Err(PyTypeError::new_err(
-        "config must be a mapping or expose model_dump()/dict()",
-    ))
+#[pyclass]
+pub struct PyBatchIterator {
+    inner: Arc<TokioMutex<Pin<Box<dyn Stream<Item = BatchResult> + Send>>>>,
 }
 
-fn config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<BlastDNSConfig> {
-    let threads: usize = dict_get(dict, "threads_per_resolver")?;
-    let timeout_ms: u64 = dict_get(dict, "request_timeout_ms")?;
-    let max_retries: usize = dict_get(dict, "max_retries")?;
-    let purgatory_threshold: usize = dict_get(dict, "purgatory_threshold")?;
-    let purgatory_sentence_ms: u64 = dict_get(dict, "purgatory_sentence_ms")?;
+#[pymethods]
+impl PyBatchIterator {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
 
-    Ok(BlastDNSConfig {
-        threads_per_resolver: threads.max(1),
-        request_timeout: Duration::from_millis(timeout_ms.max(1)),
-        max_retries,
-        purgatory_threshold,
-        purgatory_sentence: Duration::from_millis(purgatory_sentence_ms.max(1)),
-    })
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let mut stream = inner.lock().await;
+            match stream.next().await {
+                Some((host, result)) => {
+                    let payload = match result {
+                        Ok(response) => dns_response_to_bytes(response)?,
+                        Err(err) => error_to_bytes(err)?,
+                    };
+                    Ok((host, payload))
+                }
+                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+            }
+        })
+    }
 }
 
-fn dict_get<'py, T>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<T>
-where
-    T: for<'a> FromPyObject<'a, 'py>,
-{
-    match dict.get_item(key)? {
-        Some(value) => value.extract().map_err(Into::into),
-        None => Err(PyRuntimeError::new_err(format!("config missing `{key}`"))),
+struct PythonHostIterator {
+    iterator: Py<PyIterator>,
+}
+
+impl PythonHostIterator {
+    fn new(iterator: Py<PyIterator>) -> Self {
+        Self { iterator }
+    }
+}
+
+impl Iterator for PythonHostIterator {
+    type Item = Result<String, PyErr>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::attach(|py| {
+            let iter = self.iterator.bind(py);
+            iter.into_iter()
+                .next()
+                .map(|result| result.and_then(|item| item.extract()))
+        })
     }
 }
 
@@ -130,17 +188,17 @@ fn parse_record_type(input: Option<&str>) -> PyResult<RecordType> {
     }
 }
 
-fn dns_response_to_py(py: Python<'_>, response: DnsResponse) -> PyResult<Py<PyAny>> {
+fn dns_response_to_bytes(response: DnsResponse) -> PyResult<Vec<u8>> {
     let message = response.into_message();
-    let serialized = serde_json::to_string(&message)
+    let serialized = serde_json::to_vec(&message)
         .map_err(|err| PyValueError::new_err(format!("failed to serialize response: {err}")))?;
-    let json_mod = py
-        .import("json")
-        .map_err(|err| PyRuntimeError::new_err(format!("failed to import json: {err}")))?;
-    let obj = json_mod
-        .call_method1("loads", (serialized,))
-        .map_err(|err| PyRuntimeError::new_err(format!("failed to decode JSON: {err}")))?;
-    Ok(obj.into())
+    Ok(serialized)
+}
+
+fn error_to_bytes(err: BlastDNSError) -> PyResult<Vec<u8>> {
+    let payload = serde_json::json!({ "error": err.to_string() });
+    serde_json::to_vec(&payload)
+        .map_err(|e| PyValueError::new_err(format!("failed to serialize error payload: {e}")))
 }
 
 impl From<BlastDNSError> for PyErr {
@@ -153,4 +211,45 @@ impl From<BlastDNSError> for PyErr {
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::{PyList, PyModule};
+
+    #[test]
+    fn python_iterator_error_handling() {
+        pyo3::append_to_inittab!(_native);
+        Python::initialize();
+
+        Python::attach(|py| {
+            // Normal iteration with StopIteration
+            let list = PyList::new(py, ["a", "b", "c"]).unwrap();
+            let py_iter = list.try_iter().unwrap().unbind();
+            let mut rust_iter = PythonHostIterator::new(py_iter);
+
+            assert!(matches!(rust_iter.next(), Some(Ok(s)) if s == "a"));
+            assert!(matches!(rust_iter.next(), Some(Ok(s)) if s == "b"));
+            assert!(matches!(rust_iter.next(), Some(Ok(s)) if s == "c"));
+            assert!(rust_iter.next().is_none());
+
+            // Iterator yielding non-string returns error
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+            let py_iter = list.try_iter().unwrap().unbind();
+            let mut rust_iter = PythonHostIterator::new(py_iter);
+
+            assert!(matches!(rust_iter.next(), Some(Err(_))));
+
+            // Iterator whose __next__ raises a Python exception returns Err(...)
+            let code = c"class FailingIter:\n    def __iter__(self): return self\n    def __next__(self): raise RuntimeError('failure')";
+            let module = PyModule::from_code(py, code, c"test.py", c"test").unwrap();
+            let cls = module.getattr("FailingIter").unwrap();
+            let failing_iter = cls.call0().unwrap();
+            let py_iter = failing_iter.try_iter().unwrap().unbind();
+            let mut rust_iter = PythonHostIterator::new(py_iter);
+
+            assert!(matches!(rust_iter.next(), Some(Err(_))));
+        });
+    }
 }

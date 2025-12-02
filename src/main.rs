@@ -1,4 +1,11 @@
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, stdin},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use blastdns::{
@@ -14,9 +21,9 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "BlastDNS - Async DNS spray client", long_about = None)]
 struct Args {
-    /// File containing hostnames to resolve (one per line).
+    /// File containing hostnames to resolve (one per line). Reads from stdin if not specified.
     #[arg(value_name = "HOSTS_TO_RESOLVE")]
-    hosts: PathBuf,
+    hosts: Option<String>,
     /// Record type to query (A, AAAA, MX, ...).
     #[arg(long = "rdtype", default_value = "A", value_parser = parse_record_type)]
     record_type: RecordType,
@@ -50,8 +57,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let resolvers = load_resolvers(&args.resolvers)
         .with_context(|| format!("failed to load resolvers from {}", args.resolvers.display()))?;
-    let hosts = load_hosts(&args.hosts)
-        .with_context(|| format!("failed to load hostnames from {}", args.hosts.display()))?;
+    let hosts = load_hosts(args.hosts.clone()).with_context(|| "failed to load hostnames")?;
 
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
     let config = BlastDNSConfig {
@@ -62,8 +68,11 @@ async fn main() -> Result<()> {
         purgatory_sentence: Duration::from_millis(args.purgatory_sentence_ms),
     };
 
-    let client = BlastDNSClient::with_config(resolvers, config).await?;
-    let mut stream = client.resolve_batch(hosts, args.record_type);
+    let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);
+    let mut stream = client.resolve_batch(
+        hosts.map(Ok::<_, std::convert::Infallible>),
+        args.record_type,
+    );
 
     while let Some((host, outcome)) = stream.next().await {
         match outcome {
@@ -105,20 +114,20 @@ fn load_resolvers(path: &PathBuf) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn load_hosts(path: &PathBuf) -> Result<Vec<String>> {
-    let buf = std::fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in buf.lines() {
-        let trimmed = line.split('#').next().unwrap_or("").trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        out.push(trimmed.to_string());
-    }
+fn load_hosts(path: Option<String>) -> Result<impl Iterator<Item = String> + Send> {
+    let reader: Box<dyn BufRead + Send> = match path {
+        None => Box::new(BufReader::new(stdin())),
+        Some(p) => Box::new(BufReader::new(File::open(p)?)),
+    };
 
-    if out.is_empty() {
-        bail!("host list `{}` is empty", path.display());
-    }
-
-    Ok(out)
+    Ok(reader.lines().filter_map(|line| {
+        line.ok().and_then(|l| {
+            let trimmed = l.split('#').next().unwrap_or("").trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }))
 }

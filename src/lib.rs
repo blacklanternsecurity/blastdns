@@ -1,7 +1,8 @@
 mod client;
 mod config;
 mod error;
-#[cfg(feature = "python")]
+// Only compile Python bindings when "python" feature is enabled or running tests
+#[cfg(any(feature = "python", test))]
 mod python;
 mod utils;
 mod worker;
