@@ -9,7 +9,7 @@ description = "Async Python interface on top of the BlastDNS resolver"
 license = "GPL-3.0"
 repository = "https://github.com/blacklanternsecurity/blastdns"
 homepage = "https://github.com/blacklanternsecurity/blastdns"
-authors = ["TheTechromancer <thetechromancer@protonmail.com>"]
+authors = [{name = "TheTechromancer", email = "thetechromancer@protonmail.com"}]
 keywords = ["dns", "async", "resolver", "networking", "osint"]
 categories = ["network-programming", "asynchronous"]
 readme = "README.md"
