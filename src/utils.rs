@@ -71,7 +71,9 @@ pub fn check_ulimits(num_resolvers: usize, threads_per_resolver: usize) -> Resul
         // Add overhead for stdin/stdout/stderr and other system needs.
         let required = (total_workers * 3) + 100;
 
-        if current_limit < required as u64 {
+        // rlim_cur is u64 on most platforms but u32 on armv7, so convert for portability
+        #[allow(clippy::useless_conversion)]
+        if u64::from(current_limit) < required as u64 {
             bail!(
                 "NOFILE limit too low even after raising soft limit: current={}, required={}\n\
                  {} resolvers × {} threads/resolver = {} workers (need ~{} FDs)\n\
