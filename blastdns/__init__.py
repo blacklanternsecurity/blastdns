@@ -124,11 +124,15 @@ class Client:
         raw_dict = await self._inner.resolve_multi(host, record_types)
         return {key: orjson.loads(value) for key, value in raw_dict.items()}
 
-    async def resolve_batch(self, hosts, record_type=None):
+    async def resolve_batch(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
         """Resolve multiple hostnames concurrently, yielding results as they complete.
 
         `hosts` is an iterable of hostname strings. `record_type` is a string such
         as `"A"`, `"AAAA"`, `"MX"`, etc. If omitted or `None`, it defaults to `"A"`.
+        `skip_empty` is a boolean that, when True, filters out successful responses
+        with no answers (errors still pass through).
+        `skip_errors` is a boolean that, when True, filters out error responses
+        (successful responses still pass through).
 
         This method is an async generator that yields `(host, result)` tuples as
         resolutions complete. Results are unordered (faster hosts complete first).
@@ -143,5 +147,5 @@ class Client:
                 else:
                     print(f"{host} resolved: {result}")
         """
-        async for host, raw in self._inner.resolve_batch(hosts, record_type):
+        async for host, raw in self._inner.resolve_batch(hosts, record_type, skip_empty, skip_errors):
             yield (host, orjson.loads(raw))
