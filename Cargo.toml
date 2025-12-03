@@ -2,6 +2,12 @@
 name = "blastdns"
 version = "1.0.0"
 edition = "2024"
+description = "Async DNS lookup library for bulk/parallel DNS resolution"
+license = "GPL-3.0"
+repository = "https://github.com/blacklanternsecurity/blastdns"
+authors = ["TheTechromancer <thetechromancer@protonmail.com>"]
+keywords = ["dns", "async", "resolver", "networking", "osint"]
+categories = ["network-programming", "asynchronous"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
