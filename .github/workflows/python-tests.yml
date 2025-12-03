@@ -61,8 +61,9 @@ jobs:
         if: always()
         run: sudo ./scripts/stop-test-dns.sh || true
 
-  linux:
+  linux-build:
     needs: python-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -97,8 +98,9 @@ jobs:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
 
-  musllinux:
+  musllinux-build:
     needs: python-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -129,8 +131,9 @@ jobs:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
 
-  windows:
+  windows-build:
     needs: python-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -157,8 +160,9 @@ jobs:
           name: wheels-windows-${{ matrix.platform.target }}
           path: dist
 
-  macos:
+  macos-build:
     needs: python-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -184,9 +188,10 @@ jobs:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
 
-  sdist:
+  sdist-build:
     needs: python-tests
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     steps:
       - uses: actions/checkout@v6
       - name: Build sdist
@@ -202,9 +207,14 @@ jobs:
 
   release:
     name: Release
+    needs:
+      - linux-build
+      - musllinux-build
+      - windows-build
+      - macos-build
+      - sdist-build
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: [linux, musllinux, windows, macos, sdist]
     permissions:
       # Use to sign the release artifacts
       id-token: write
