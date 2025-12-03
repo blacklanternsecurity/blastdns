@@ -184,6 +184,8 @@ impl BlastDNSClient {
         self: &Arc<Self>,
         hosts: I,
         record_type: RecordType,
+        skip_empty: bool,
+        skip_errors: bool,
     ) -> impl stream::Stream<Item = BatchResult> + Unpin + Send + 'static
     where
         I: Iterator<Item = Result<String, E>> + Send + 'static,
@@ -214,7 +216,23 @@ impl BlastDNSClient {
                         (label, result)
                     }
                 })
-                .buffer_unordered(concurrency * 2),
+                .buffer_unordered(concurrency * 2)
+                .filter_map(move |(host, result)| async move {
+                    // Filter empty responses if skip_empty is true
+                    if skip_empty {
+                        match &result {
+                            Ok(response) if response.answers().is_empty() => return None,
+                            _ => {}
+                        }
+                    }
+
+                    // Filter errors if skip_errors is true
+                    if skip_errors && result.is_err() {
+                        return None;
+                    }
+
+                    Some((host, result))
+                }),
         )
     }
 
@@ -402,6 +420,8 @@ mod tests {
         let mut stream = client.resolve_batch(
             inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
             RecordType::A,
+            false,
+            false,
         );
 
         let mut seen = Vec::new();
@@ -419,6 +439,185 @@ mod tests {
         let mut expected_sorted = expected;
         expected_sorted.sort();
         assert_eq!(seen_sorted, expected_sorted);
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_skip_empty_filters_empty_responses() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let client = Arc::new(BlastDNSClient::with_config(resolvers, config).expect("client init"));
+
+        // example.com will return A records, garbage subdomain won't
+        let inputs = vec![
+            "example.com".to_string(),
+            "lkgdjasldkjsdgsdgsdfahwejhori.example.com".to_string(),
+        ];
+
+        // First, collect results with skip_empty = false
+        let mut stream_all = client.resolve_batch(
+            inputs
+                .clone()
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+            false,
+            false,
+        );
+
+        let mut all_results = Vec::new();
+        while let Some((host, result)) = stream_all.next().await {
+            all_results.push((host, result));
+        }
+
+        assert_eq!(
+            all_results.len(),
+            2,
+            "should get both results with skip_empty=false"
+        );
+
+        // Find which one has answers and which doesn't
+        let (has_answers, empty_or_error): (Vec<_>, Vec<_>) = all_results.iter().partition(
+            |(_, result)| matches!(result, Ok(response) if !response.answers().is_empty()),
+        );
+
+        assert_eq!(
+            has_answers.len(),
+            1,
+            "should have one result with answers (example.com)"
+        );
+        assert_eq!(
+            empty_or_error.len(),
+            1,
+            "should have one result without answers"
+        );
+
+        // Now test with skip_empty = true
+        let mut stream_filtered = client.resolve_batch(
+            inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+            true,
+            false,
+        );
+
+        let mut filtered_results = Vec::new();
+        while let Some((host, result)) = stream_filtered.next().await {
+            filtered_results.push((host, result));
+        }
+
+        // With skip_empty=true, should only get example.com (the garbage domain's empty response is filtered)
+        assert_eq!(
+            filtered_results.len(),
+            1,
+            "should only get one result with skip_empty=true"
+        );
+        assert_eq!(filtered_results[0].0, "example.com");
+
+        if let Ok(response) = &filtered_results[0].1 {
+            assert!(
+                !response.answers().is_empty(),
+                "filtered result should have answers"
+            );
+        } else {
+            panic!("example.com should return Ok, not Err");
+        }
+
+        // Test that errors still pass through with skip_empty=true
+        let bad_resolver_config = BlastDNSConfig {
+            request_timeout: Duration::from_millis(100),
+            threads_per_resolver: 1,
+            max_retries: 0,
+            ..Default::default()
+        };
+        let bad_client = Arc::new(
+            BlastDNSClient::with_config(vec!["127.0.0.1:5354".to_string()], bad_resolver_config)
+                .expect("client init"),
+        );
+
+        let error_inputs = vec!["example.com".to_string()];
+        let mut error_stream = bad_client.resolve_batch(
+            error_inputs
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+            true,
+            false,
+        );
+
+        let mut error_count = 0;
+        while let Some((_host, result)) = error_stream.next().await {
+            error_count += 1;
+            assert!(
+                result.is_err(),
+                "should get error from non-responsive resolver"
+            );
+        }
+
+        assert_eq!(
+            error_count, 1,
+            "errors should pass through even with skip_empty=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_skip_errors_filters_error_responses() {
+        let bad_resolver_config = BlastDNSConfig {
+            request_timeout: Duration::from_millis(100),
+            threads_per_resolver: 1,
+            max_retries: 0,
+            ..Default::default()
+        };
+        let bad_client = Arc::new(
+            BlastDNSClient::with_config(vec!["127.0.0.1:5354".to_string()], bad_resolver_config)
+                .expect("client init"),
+        );
+
+        let error_inputs = vec!["example.com".to_string()];
+
+        // With skip_errors=false, should get error
+        let mut stream_with_errors = bad_client.resolve_batch(
+            error_inputs
+                .clone()
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+            false,
+            false,
+        );
+
+        let mut error_count = 0;
+        while let Some((_host, result)) = stream_with_errors.next().await {
+            error_count += 1;
+            assert!(
+                result.is_err(),
+                "should get error from non-responsive resolver"
+            );
+        }
+        assert_eq!(error_count, 1, "should get error with skip_errors=false");
+
+        // With skip_errors=true, should get nothing
+        let mut stream_no_errors = bad_client.resolve_batch(
+            error_inputs
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+            false,
+            true,
+        );
+
+        let mut filtered_count = 0;
+        while stream_no_errors.next().await.is_some() {
+            filtered_count += 1;
+        }
+        assert_eq!(
+            filtered_count, 0,
+            "errors should be filtered with skip_errors=true"
+        );
     }
 
     #[tokio::test]
