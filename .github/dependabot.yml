@@ -6,8 +6,7 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
-    branches:
-      - dev
+    target-branch: "dev"
 
   # Monitor Cargo dependencies
   - package-ecosystem: "cargo"
@@ -15,5 +14,4 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
-    branches:
-      - dev
+    target-branch: "dev"
