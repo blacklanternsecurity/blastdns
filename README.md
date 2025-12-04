@@ -1,30 +1,33 @@
 # BlastDNS
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-black.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
+[![Crates.io](https://img.shields.io/crates/v/blastdns.svg?color=orange)](https://crates.io/crates/blastdns)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/tests.yml)
+[![PyPI version](https://img.shields.io/pypi/v/blastdns.svg?color=blue)](https://pypi.org/project/blastdns/)
+[![Rust Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml)
+[![Python Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml)
 
-An async rust library for DNS lookups. Can be used to perform simple, one-off lookups or bulk lookups in parallel with many resolvers, similar to [`massdns`](https://github.com/blechschmidt/massdns).
+[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. It's both highly efficient and reliable, even if you have shitty DNS servers. For details, see [Architecture](#architecture).
 
-## Features
-
-BlastDNS is simultaneously a:
+There are three ways to use it:
 
 - [Rust CLI tool](#cli)
 - [Rust library](#rust-api)
 - [Python library](#python-api)
 
+BlastDNS is the primary DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
+
 ## Benchmark
 
 100K DNS lookups against local `dnsmasq`, with 100 workers:
 
-| Library         | Time    | QPS    | Success  | Failed | vs dnspython |
-|-----------------|---------|--------|----------|--------|--------------|
-| massdns         | 1.687s  | 71,898 | 100,000  | 0      | 28.87x       |
-| blastdns-cli    | 1.732s  | 64,942 | 100,000  | 0      | 26.07x       |
-| blastdns-python | 3.903s  | 25,623 | 100,000  | 0      | 10.29x       |
-| dnspython       | 40.149s | 2,491  | 100,000  | 0      | 1.00x        |
+| Library         | Language | Time    | QPS    | Success  | Failed | vs dnspython |
+|-----------------|----------|---------|--------|----------|--------|--------------|
+| massdns         | C        | 1.687s  | 71,898 | 100,000  | 0      | 28.87x       |
+| blastdns-cli    | Rust     | 1.732s  | 64,942 | 100,000  | 0      | 26.07x       |
+| blastdns-python | Python   | 3.903s  | 25,623 | 100,000  | 0      | 10.29x       |
+| dnspython       | Python   | 40.149s | 2,491  | 100,000  | 0      | 1.00x        |
 
 ### CLI
 
@@ -170,6 +173,25 @@ Valid log levels (from least to most verbose): `error`, `warn`, `info`, `debug`,
 
 ### Rust API
 
+#### Installation
+
+```bash
+# Install CLI tool
+cargo install blastdns
+
+# Add library to your project
+cargo add blastdns
+```
+
+Or add to `Cargo.toml`:
+
+```toml
+[dependencies]
+blastdns = "0.1"
+```
+
+#### Usage
+
 ```rust
 use blastdns::{BlastDNSClient, BlastDNSConfig};
 use futures::StreamExt;
@@ -244,6 +266,21 @@ for (record_type, result) in results {
 
 The `blastdns` Python package is a thin wrapper around the Rust library.
 
+#### Installation
+
+```bash
+# Using pip
+pip install blastdns
+
+# Using uv
+uv add blastdns
+
+# Using poetry
+poetry add blastdns
+```
+
+#### Development Setup
+
 ```bash
 # install python dependencies
 uv sync
@@ -252,6 +289,8 @@ uv run maturin develop
 # run tests
 uv run pytest
 ```
+
+#### Usage
 
 To use it in Python, you can use the `Client` class:
 
@@ -374,7 +413,19 @@ BlastDNS is designed to be faster the more resolvers you give it.
 
 Beneath the hood of the `BlastDNSClient`, each resolver gets its own `ResolverWorker` tasks, with a configurable number of workers per resolver (default: 2, configurable via `BlastDNSConfig.threads_per_resolver`).
 
-When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which contains the request (host + rdtype) and a oneshot channel to hold the result. This `WorkItem` is put into a [crossfire](https://github.com/frostyplanet/crossfire-rs) MPMC queue, to be picked up by the first available `ResolverWorker`. Workers are spawned immediately during client instantiation.
+When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which contains the request (host + rdtype) and a oneshot channel to hold the result. This `WorkItem` is put into a [crossfire](https://github.com/frostyplanet/crossfire-rs) MPMC queue, to be picked up by the first available `ResolverWorker`. Workers are spawned lazily when the first request is made.
+
+### Retry Logic and Fault Tolerance
+
+BlastDNS handles unreliable resolvers through a multi-layered retry system:
+
+**Client-Level Retries**: When a query fails with a retryable error (network timeouts, connection failures), the client automatically retries up to `max_retries` times (default: 10). Each retry creates a fresh `WorkItem` and sends it back to the shared queue, where it can be picked up by **any available worker**—not necessarily the same resolver. This means retries naturally route around problematic resolvers.
+
+**Purgatory System**: Each worker tracks consecutive errors. After hitting `purgatory_threshold` failures (default: 10), the worker enters "purgatory"—it sleeps for `purgatory_sentence` milliseconds (default: 1000ms) before resuming work. This temporarily sidelines struggling resolvers without removing them entirely, allowing the system to self-heal if resolver issues are transient.
+
+**Non-Retryable Errors**: Configuration errors (invalid hostnames) and system errors (queue closed) fail immediately without retry, preventing wasted work on queries that can't succeed.
+
+This architecture ensures maximum accuracy even with a mixed pool of reliable and unreliable DNS servers, as queries naturally migrate toward responsive resolvers while problematic ones throttle themselves.
 
 ## Testing
 
@@ -395,7 +446,11 @@ sudo ./scripts/start-test-dns.sh
 Then run tests with:
 
 ```bash
+# rust tests
 cargo test -- --ignored
+
+# python tests
+uv run pytest
 ```
 
 When done, stop the test DNS server:
