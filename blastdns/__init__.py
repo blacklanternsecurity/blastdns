@@ -93,12 +93,14 @@ class Client:
                 result[key] = DNSResult.model_validate({"host": host, "response": data})
         return result
 
-    async def resolve_batch(self, hosts, record_type=None):
+    async def resolve_batch(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
         """Resolve multiple hostnames concurrently, yielding results as they complete.
 
         Args:
             hosts: Iterable of hostname strings
             record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+            skip_empty: Skip empty responses (default: False)
+            skip_errors: Skip error responses (default: False)
 
         Yields:
             tuple[str, DNSResultOrError]: (hostname, result) pairs. Successful resolutions
@@ -112,7 +114,7 @@ class Client:
                 else:
                     print(f"{host}: {len(result.response.answers)} answers")
         """
-        async for host, raw in self._inner.resolve_batch(hosts, record_type):
+        async for host, raw in self._inner.resolve_batch(hosts, record_type, skip_empty, skip_errors):
             data = orjson.loads(raw)
             if "error" in data:
                 yield (host, DNSError.model_validate(data))

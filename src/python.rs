@@ -95,11 +95,13 @@ impl PyBlastDNSClient {
         })
     }
 
-    #[pyo3(signature = (hosts, record_type = None))]
+    #[pyo3(signature = (hosts, record_type = None, skip_empty = false, skip_errors = false))]
     fn resolve_batch(
         &self,
         hosts: Py<PyAny>,
         record_type: Option<&str>,
+        skip_empty: bool,
+        skip_errors: bool,
     ) -> PyResult<PyBatchIterator> {
         let record_type = parse_record_type(record_type)?;
 
@@ -112,7 +114,9 @@ impl PyBlastDNSClient {
         let rust_iter = PythonHostIterator::new(py_iter);
 
         // Call Rust resolve_batch (it handles spawn_blocking internally)
-        let result_stream = self.inner.resolve_batch(rust_iter, record_type);
+        let result_stream =
+            self.inner
+                .resolve_batch(rust_iter, record_type, skip_empty, skip_errors);
 
         Ok(PyBatchIterator {
             inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),

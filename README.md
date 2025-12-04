@@ -39,6 +39,12 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt | jq '.response.answer
 
 # load from stdin
 $ cat hosts.txt | blastdns --rdtype A --resolvers resolvers.txt
+
+# skip empty responses (e.g., NXDOMAIN with no answers)
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt --skip-empty | jq
+
+# skip error responses (e.g., timeouts, connection failures)
+$ blastdns hosts.txt --rdtype A --resolvers resolvers.txt --skip-errors | jq
 ```
 
 #### CLI Help
@@ -67,6 +73,10 @@ Options:
           Consecutive errors before a worker is put into timeout [default: 10]
       --purgatory-sentence-ms <PURGATORY_SENTENCE_MS>
           How many milliseconds a worker stays in timeout [default: 1000]
+      --skip-empty
+          Don't show responses with no answers
+      --skip-errors
+          Don't show error responses
   -h, --help
           Print help
   -V, --version
@@ -191,7 +201,12 @@ println!("{}", serde_json::to_string_pretty(&result).unwrap());
 // resolve_batch: process many hosts in parallel with bounded concurrency
 // streams results back as they complete
 let wordlist = ["one.example", "two.example", "three.example"];
-let mut stream = client.resolve_batch(wordlist, RecordType::A);
+let mut stream = client.resolve_batch(
+    wordlist.into_iter().map(Ok::<_, std::convert::Infallible>),
+    RecordType::A,
+    false,  // skip_empty: don't filter out empty responses
+    false,  // skip_errors: don't filter out errors
+);
 while let Some((host, outcome)) = stream.next().await {
     match outcome {
         Ok(response) => println!("{}: {} answers", host, response.answers().len()),
@@ -267,7 +282,7 @@ asyncio.run(main())
 
 - **`Client.resolve(host, record_type=None) -> DNSResult`**: Lookup a single hostname. Defaults to `A` records. Returns a Pydantic `DNSResult` model with typed fields for easy access to the response data.
 
-- **`Client.resolve_batch(hosts, record_type=None)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, result)` tuples as results complete. Each result is either a `DNSResult` or `DNSError` Pydantic model. Useful for processing large wordlists efficiently.
+- **`Client.resolve_batch(hosts, record_type=None)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, result)` tuples as results complete. Each result is either a `DNSResult` or `DNSError` Pydantic model. Set `skip_empty=True` to filter out successful responses with no answers. Set `skip_errors=True` to filter out error responses. Useful for processing large lists of hosts.
 
 - **`Client.resolve_multi(host, record_types) -> dict[str, DNSResultOrError]`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a `DNSResult` (success) or `DNSError` (failure) Pydantic model.
 

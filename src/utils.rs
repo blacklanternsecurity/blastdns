@@ -1,7 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::bail;
 
 use crate::error::BlastDNSError;
 
@@ -25,7 +27,10 @@ pub(crate) fn parse_resolver(input: &str) -> Result<SocketAddr, BlastDNSError> {
 
 /// Checks if the system's NOFILE limit is sufficient for the given configuration.
 /// Each worker needs file descriptors for UDP sockets, plus overhead.
-pub fn check_ulimits(num_resolvers: usize, threads_per_resolver: usize) -> Result<()> {
+pub fn check_ulimits(
+    #[cfg_attr(not(unix), allow(unused_variables))] num_resolvers: usize,
+    #[cfg_attr(not(unix), allow(unused_variables))] threads_per_resolver: usize,
+) -> Result<()> {
     #[cfg(unix)]
     {
         let mut rlimit = libc::rlimit {
@@ -71,7 +76,9 @@ pub fn check_ulimits(num_resolvers: usize, threads_per_resolver: usize) -> Resul
         // Add overhead for stdin/stdout/stderr and other system needs.
         let required = (total_workers * 3) + 100;
 
-        if current_limit < required as u64 {
+        // rlim_cur is u64 on most platforms but u32 on armv7, so convert for portability
+        #[allow(clippy::useless_conversion)]
+        if u64::from(current_limit) < required as u64 {
             bail!(
                 "NOFILE limit too low even after raising soft limit: current={}, required={}\n\
                  {} resolvers × {} threads/resolver = {} workers (need ~{} FDs)\n\

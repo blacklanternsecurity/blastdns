@@ -45,6 +45,12 @@ struct Args {
     /// How many milliseconds a worker stays in timeout.
     #[arg(long, default_value_t = DEFAULT_PURGATORY_SENTENCE.as_millis() as u64)]
     purgatory_sentence_ms: u64,
+    /// Don't show responses with no answers.
+    #[arg(long)]
+    skip_empty: bool,
+    /// Don't show error responses.
+    #[arg(long)]
+    skip_errors: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -72,6 +78,8 @@ async fn main() -> Result<()> {
     let mut stream = client.resolve_batch(
         hosts.map(Ok::<_, std::convert::Infallible>),
         args.record_type,
+        args.skip_empty,
+        args.skip_errors,
     );
 
     while let Some((host, outcome)) = stream.next().await {

@@ -4,8 +4,14 @@ build-backend = "maturin"
 
 [project]
 name = "blastdns"
-version = "0.1.0"
+version = "1.1.0"
 description = "Async Python interface on top of the BlastDNS resolver"
+license = "GPL-3.0"
+repository = "https://github.com/blacklanternsecurity/blastdns"
+homepage = "https://github.com/blacklanternsecurity/blastdns"
+authors = [{name = "TheTechromancer", email = "thetechromancer@protonmail.com"}]
+keywords = ["dns", "async", "resolver", "networking", "osint"]
+categories = ["network-programming", "asynchronous"]
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
