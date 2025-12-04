@@ -16,5 +16,6 @@ async def main():
     response = await client.resolve(host, "A")
     print(json.dumps(response, indent=2))
 
+
 if __name__ == "__main__":
     asyncio.run(main())

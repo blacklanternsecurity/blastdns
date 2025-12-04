@@ -36,9 +36,7 @@ async def test_client_resolve_hits_real_resolver():
     result = await client.resolve("example.com", "A")
     assert isinstance(result, DNSResult)
     assert result.host == "example.com"
-    assert any(
-        answer.name_labels == "example.com." for answer in result.response.answers
-    )
+    assert any(answer.name_labels == "example.com." for answer in result.response.answers)
 
 
 @pytest.mark.asyncio
@@ -46,9 +44,7 @@ async def test_client_resolve_ptr():
     client = Client(["127.0.0.1:5353"])
     result = await client.resolve("8.8.8.8.in-addr.arpa", "PTR")
     assert isinstance(result, DNSResult)
-    assert any(
-        answer.rdata.get("PTR", "") == "dns.google." for answer in result.response.answers
-    )
+    assert any(answer.rdata.get("PTR", "") == "dns.google." for answer in result.response.answers)
 
 
 @pytest.mark.asyncio
@@ -117,7 +113,7 @@ async def test_client_resolve_batch_handles_mixed_success_and_failure():
 @pytest.mark.asyncio
 async def test_client_resolve_multi_requires_at_least_one_record_type():
     client = Client(["127.0.0.1:5353"])
-    
+
     with pytest.raises(RuntimeError, match="at least one record type"):
         await client.resolve_multi("example.com", [])
 
@@ -125,13 +121,13 @@ async def test_client_resolve_multi_requires_at_least_one_record_type():
 @pytest.mark.asyncio
 async def test_client_resolve_multi_resolves_multiple_types():
     client = Client(["127.0.0.1:5353"])
-    
+
     results = await client.resolve_multi("example.com", ["A", "AAAA", "MX"])
-    
+
     # Should return a dict with all requested record types
     assert isinstance(results, dict)
     assert set(results.keys()) == {"A", "AAAA", "MX"}
-    
+
     # A record should have answers
     a_result = results["A"]
     assert isinstance(a_result, (DNSResult, DNSError))
@@ -142,21 +138,21 @@ async def test_client_resolve_multi_resolves_multiple_types():
 @pytest.mark.asyncio
 async def test_client_resolve_multi_handles_mixed_success_failure():
     client = Client(["127.0.0.1:5353"])
-    
+
     # Request common types that should succeed and potentially one that might not have records
     results = await client.resolve_multi("example.com", ["A", "AAAA", "CAA"])
-    
+
     # All record types should be present in results
     assert len(results) == 3
     assert "A" in results
     assert "AAAA" in results
     assert "CAA" in results
-    
+
     # A should succeed
     a_result = results["A"]
     if isinstance(a_result, DNSResult):
         assert len(a_result.response.answers) >= 0
-    
+
     # Individual results can succeed or fail
     for record_type, result in results.items():
         assert isinstance(result, (DNSResult, DNSError))
@@ -177,12 +173,12 @@ async def test_client_resolve_batch_skip_empty_filters_empty_responses():
         all_results[host] = result
 
     assert len(all_results) == 2, "should get both results with skip_empty=False"
-    
+
     # example.com should have answers
     example_result = all_results["example.com"]
     assert isinstance(example_result, DNSResult)
     assert len(example_result.response.answers) > 0
-    
+
     # garbage domain should have empty answers (or error)
     garbage_result = all_results["lkgdjasldkjsdgsdgsdfahwejhori.example.com"]
     if isinstance(garbage_result, DNSResult):

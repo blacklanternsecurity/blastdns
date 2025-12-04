@@ -336,14 +336,22 @@ When done, stop the test DNS server:
 
 ## Linting
 
-Run clippy for lints:
+### Rust
 
 ```bash
+# Run clippy for lints
 cargo clippy --all-targets --all-features
+
+# Run rustfmt for formatting
+cargo fmt --all
 ```
 
-Run rustfmt for formatting:
+### Python
 
 ```bash
-cargo fmt --all
+# Run ruff for lints
+uv run ruff check --fix
+
+# Run ruff for formatting
+uv run ruff format
 ```

@@ -61,9 +61,7 @@ class Client:
         response_data = orjson.loads(raw)
         return DNSResult.model_validate({"host": host, "response": response_data})
 
-    async def resolve_multi(
-        self, host, record_types
-    ) -> dict[str, DNSResultOrError]:
+    async def resolve_multi(self, host, record_types) -> dict[str, DNSResultOrError]:
         """Resolve multiple record types for a single hostname in parallel.
 
         Args:

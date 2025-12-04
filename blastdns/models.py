@@ -88,4 +88,3 @@ class DNSError(BaseModel):
 
 
 DNSResultOrError = Union[DNSResult, DNSError]
-
