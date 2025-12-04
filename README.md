@@ -1,19 +1,19 @@
 # BlastDNS
 
 [![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
+[![Crates.io](https://img.shields.io/crates/v/blastdns.svg?color=orange)](https://crates.io/crates/blastdns)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://img.shields.io/pypi/v/blastdns.svg?color=blue)](https://pypi.org/project/blastdns/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/tests.yml)
 
-An async rust library for DNS lookups. Can be used to perform simple, one-off lookups or bulk lookups in parallel with many resolvers, similar to [`massdns`](https://github.com/blechschmidt/massdns).
-
-## Features
-
-BlastDNS is simultaneously a:
+[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver, similar to [massdns](https://github.com/blechschmidt/massdns) but written in Rust. It has three ways to use it:
 
 - [Rust CLI tool](#cli)
 - [Rust library](#rust-api)
 - [Python library](#python-api)
+
+BlastDNS is the primary DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 ## Benchmark
 
