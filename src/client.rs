@@ -41,6 +41,9 @@ impl std::fmt::Debug for BlastDNSClient {
 /// Result item produced by [`BlastDNSClient::resolve_batch`].
 pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
+/// Result item produced by [`BlastDNSClient::resolve_batch_basic`].
+pub type BatchResultBasic = (String, String, Vec<String>);
+
 impl BlastDNSClient {
     /// Build a client using the default configuration.
     pub fn new(resolvers: Vec<String>) -> Result<Self, BlastDNSError> {
@@ -232,6 +235,48 @@ impl BlastDNSClient {
                     }
 
                     Some((host, result))
+                }),
+        )
+    }
+
+    /// Resolve a batch of hostnames with bounded concurrency, returning simplified tuples.
+    ///
+    /// Returns (hostname, record_type, [rdata_strings]) where rdata_strings contain only
+    /// the record data (e.g., "93.184.216.34" for A records, "10 aspmx.l.google.com." for MX).
+    /// Only successful resolutions with non-empty answers are returned.
+    pub fn resolve_batch_basic<I, E>(
+        self: &Arc<Self>,
+        hosts: I,
+        record_type: RecordType,
+    ) -> impl stream::Stream<Item = BatchResultBasic> + Unpin + Send + 'static
+    where
+        I: Iterator<Item = Result<String, E>> + Send + 'static,
+        E: std::error::Error + Send + 'static,
+    {
+        let record_type_string = record_type.to_string();
+
+        Box::pin(
+            self.resolve_batch(hosts, record_type, true, true)
+                .filter_map(move |(host, result)| {
+                    let record_type_str = record_type_string.clone();
+                    async move {
+                        match result {
+                            Ok(response) => {
+                                let answers: Vec<String> = response
+                                    .answers()
+                                    .iter()
+                                    .map(|record| record.data().to_string())
+                                    .collect();
+
+                                if answers.is_empty() {
+                                    None
+                                } else {
+                                    Some((host, record_type_str, answers))
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }
                 }),
         )
     }
@@ -692,5 +737,97 @@ mod tests {
         } else {
             panic!("A record query should succeed");
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_basic_returns_simplified_tuples() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
+
+        let client = Arc::new(BlastDNSClient::with_config(resolvers, config).expect("client init"));
+
+        let inputs = vec!["example.com".to_string(), "example.net".to_string()];
+        let expected = inputs.clone();
+        let mut stream = client.resolve_batch_basic(
+            inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+        );
+
+        let mut seen = Vec::new();
+        while let Some((host, record_type, answers)) = stream.next().await {
+            assert_eq!(record_type, "A", "record type should be A");
+            assert!(
+                answers.len() > 1,
+                "should have multiple answers, got {}",
+                answers.len()
+            );
+
+            // Verify answer format (should be just IP addresses like "93.184.216.34")
+            for answer in &answers {
+                // Should be a valid IP address (contains dots but not full record info)
+                assert!(answer.contains('.'), "A record should contain dots");
+                assert!(
+                    !answer.contains("IN"),
+                    "answer should not contain DNS record metadata"
+                );
+                // Parse as IP to verify it's valid
+                assert!(
+                    answer.parse::<std::net::IpAddr>().is_ok(),
+                    "should be a valid IP address: {}",
+                    answer
+                );
+            }
+
+            seen.push(host);
+        }
+
+        let mut seen_sorted = seen;
+        seen_sorted.sort();
+        let mut expected_sorted = expected;
+        expected_sorted.sort();
+        assert_eq!(seen_sorted, expected_sorted);
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_basic_filters_errors_and_empty() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let client = Arc::new(BlastDNSClient::with_config(resolvers, config).expect("client init"));
+
+        // example.com will return A records, garbage subdomain won't
+        let inputs = vec![
+            "example.com".to_string(),
+            "lkgdjasldkjsdgsdgsdfahwejhori.example.com".to_string(),
+        ];
+
+        let mut stream = client.resolve_batch_basic(
+            inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+        );
+
+        let mut results = Vec::new();
+        while let Some((host, record_type, answers)) = stream.next().await {
+            results.push((host, record_type, answers));
+        }
+
+        // Should only get example.com (garbage domain filtered out)
+        assert_eq!(results.len(), 1, "should only get valid results");
+        assert_eq!(results[0].0, "example.com");
+        assert_eq!(results[0].1, "A");
+        assert!(
+            results[0].2.len() > 1,
+            "should have multiple answers, got {}",
+            results[0].2.len()
+        );
     }
 }

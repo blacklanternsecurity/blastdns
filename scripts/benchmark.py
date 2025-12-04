@@ -13,10 +13,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import dns.asyncresolver
 import dns.message
+import uvloop
 from tabulate import tabulate
 
 from blastdns import Client
@@ -33,11 +33,11 @@ class WorkItem:
 
     hostname: str
     index: int
-    result: Optional[dns.message.Message] = None
-    error: Optional[Exception] = None
+    result = None
+    error = None
 
 
-async def dnspython_worker(worker_id: int, queue: asyncio.Queue, resolver: dns.asyncresolver.Resolver):
+async def dnspython_worker(worker_id, queue, resolver):
     """Worker task that consumes WorkItems from the queue and resolves them."""
     while True:
         item = await queue.get()
@@ -54,7 +54,7 @@ async def dnspython_worker(worker_id: int, queue: asyncio.Queue, resolver: dns.a
         queue.task_done()
 
 
-async def benchmark_dnspython(hostnames: list[str], num_workers: int, nameserver: str):
+async def benchmark_dnspython(hostnames, num_workers, nameserver):
     """Benchmark dnspython with concurrent workers."""
     if ":" in nameserver:
         ns_ip, ns_port = nameserver.rsplit(":", 1)
@@ -99,23 +99,23 @@ async def benchmark_dnspython(hostnames: list[str], num_workers: int, nameserver
 # =============================================================================
 
 
-async def benchmark_blastdns(hostnames: list[str], num_workers: int, nameserver: str):
-    """Benchmark blastdns with resolve_batch."""
+async def benchmark_blastdns(hostnames, num_workers, nameserver):
+    """Benchmark blastdns with resolve_batch_basic."""
     client = Client([nameserver], config=None)
 
     start_time = time.perf_counter()
 
     success_count = 0
-    error_count = 0
-
-    async for host, result in client.resolve_batch(hostnames, "A"):
-        if "error" in result:
-            error_count += 1
-        else:
-            success_count += 1
+    # resolve_batch_basic automatically filters errors and empty responses,
+    # so we count total queries vs what we got back
+    async for host, rdtype, answers in client.resolve_batch_basic(hostnames, "A"):
+        success_count += 1
 
     total_time = time.perf_counter() - start_time
     qps = len(hostnames) / total_time
+
+    # Error count is implicit: total requested minus successful
+    error_count = len(hostnames) - success_count
 
     return total_time, qps, success_count, error_count
 
@@ -125,7 +125,7 @@ async def benchmark_blastdns(hostnames: list[str], num_workers: int, nameserver:
 # =============================================================================
 
 
-def benchmark_blastdns_native(hostnames: list[str], num_workers: int, nameserver: str):
+def benchmark_blastdns_native(hostnames, num_workers, nameserver):
     """Benchmark blastdns CLI binary."""
     # Find the binary
     binary = Path(__file__).parent.parent / "target" / "release" / "blastdns"
@@ -187,7 +187,7 @@ def benchmark_blastdns_native(hostnames: list[str], num_workers: int, nameserver
 # =============================================================================
 
 
-def benchmark_massdns(hostnames: list[str], num_workers: int, nameserver: str):
+def benchmark_massdns(hostnames, num_workers, nameserver):
     """Benchmark MassDNS CLI."""
     import shutil
 
@@ -259,7 +259,7 @@ def benchmark_massdns(hostnames: list[str], num_workers: int, nameserver: str):
 # =============================================================================
 
 
-def print_table(results: dict, baseline: str = "dnspython"):
+def print_table(results, baseline="dnspython"):
     """Print results as a markdown table with performance relative to baseline."""
     baseline_qps = results.get(baseline, (0, 1, 0, 0))[1]
 
@@ -281,7 +281,7 @@ def print_table(results: dict, baseline: str = "dnspython"):
     print(tabulate(rows, headers=headers, tablefmt="github"))
 
 
-def generate_hostnames(num_queries: int, pattern: str) -> list[str]:
+def generate_hostnames(num_queries, pattern):
     """Generate unique hostnames for benchmarking."""
     if "{n}" in pattern:
         return [pattern.format(n=i) for i in range(num_queries)]
@@ -339,4 +339,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Install uvloop as the default event loop for better performance
+    uvloop.install()
     asyncio.run(main())

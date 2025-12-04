@@ -238,3 +238,114 @@ async def test_client_resolve_batch_skip_errors_filters_error_responses():
         filtered_count += 1
 
     assert filtered_count == 0, "errors should be filtered with skip_errors=True"
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_batch_basic_returns_simplified_tuples():
+    import ipaddress
+
+    client = Client(["127.0.0.1:5353"])
+
+    hosts_list = ["example.com", "example.net", "example.org"]
+    seen_hosts = []
+
+    async for host, rdtype, answers in client.resolve_batch_basic(hosts_list, "A"):
+        seen_hosts.append(host)
+        assert rdtype == "A", "record type should be A"
+        assert isinstance(answers, list), "answers should be a list"
+        assert len(answers) > 1, f"should have multiple answers, got {len(answers)}"
+
+        # Verify answers are valid IPv4 addresses
+        for answer in answers:
+            assert isinstance(answer, str), "each answer should be a string"
+            # Should not contain DNS record metadata
+            assert "IN" not in answer, "answer should not contain IN class"
+            assert " " not in answer, "IP address should not contain spaces"
+            # Validate it's a proper IPv4 address
+            try:
+                ip = ipaddress.IPv4Address(answer)
+                assert str(ip) == answer, f"IP address should be normalized: {answer}"
+            except ipaddress.AddressValueError:
+                pytest.fail(f"Invalid IPv4 address: {answer}")
+
+    assert sorted(seen_hosts) == sorted(hosts_list)
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_batch_basic_filters_errors_and_empty():
+    import ipaddress
+
+    client = Client(["127.0.0.1:5353"])
+
+    # example.com will return A records, garbage subdomain won't
+    hosts = ["example.com", "lkgdjasldkjsdgsdgsdfahwejhori.example.com"]
+
+    results = []
+    async for host, rdtype, answers in client.resolve_batch_basic(hosts, "A"):
+        results.append((host, rdtype, answers))
+
+    # Should only get example.com (garbage domain and errors filtered out)
+    assert len(results) == 1, "should only get valid, non-empty results"
+    assert results[0][0] == "example.com"
+    assert results[0][1] == "A"
+    assert len(results[0][2]) > 1, f"should have multiple answers, got {len(results[0][2])}"
+
+    # Validate all answers are valid IPv4 addresses
+    for answer in results[0][2]:
+        try:
+            ipaddress.IPv4Address(answer)
+        except ipaddress.AddressValueError:
+            pytest.fail(f"Invalid IPv4 address: {answer}")
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_batch_basic_with_mx_records():
+    client = Client(["127.0.0.1:5353"])
+
+    # Test with MX records
+    hosts = ["gmail.com"]
+    results = []
+
+    async for host, rdtype, answers in client.resolve_batch_basic(hosts, "MX"):
+        results.append((host, rdtype, answers))
+
+    # Should get results if MX records exist
+    if len(results) > 0:
+        assert results[0][0] == "gmail.com"
+        assert results[0][1] == "MX"
+        # MX answers should be just the rdata (e.g., "10 aspmx.l.google.com.")
+        for answer in results[0][2]:
+            assert isinstance(answer, str), "answer should be a string"
+            # MX rdata format is "preference mailserver"
+            parts = answer.split(None, 1)
+            assert len(parts) == 2, "MX should have preference and server"
+            assert parts[0].isdigit(), "first part should be preference number"
+            assert "." in parts[1], "second part should be mail server domain"
+
+
+@pytest.mark.asyncio
+async def test_client_resolve_batch_basic_accepts_generators():
+    import ipaddress
+
+    client = Client(["127.0.0.1:5353"])
+
+    def host_gen():
+        for domain in ["com", "net", "org"]:
+            yield f"example.{domain}"
+
+    count = 0
+    async for host, rdtype, answers in client.resolve_batch_basic(host_gen(), "A"):
+        assert host.startswith("example."), "host should start with example."
+        assert rdtype == "A", "record type should be A"
+        assert len(answers) > 1, f"should have multiple answers, got {len(answers)}"
+
+        # Validate each answer is a valid IPv4 address
+        for answer in answers:
+            try:
+                ipaddress.IPv4Address(answer)
+            except ipaddress.AddressValueError:
+                pytest.fail(f"Invalid IPv4 address: {answer}")
+
+        count += 1
+
+    assert count == 3, "should process all three hosts"

@@ -17,14 +17,14 @@ BlastDNS is simultaneously a:
 
 ## Benchmark
 
-20K DNS lookups against local `dnsmasq`, with 100 workers:
+100K DNS lookups against local `dnsmasq`, with 100 workers:
 
-| Library         | Language    | Time   | QPS    | Success Rate | vs dnspython   |
-|-----------------|-------------|--------|--------|--------------|----------------|
-| massdns         | C           | 0.308s | 65,019 | 100%         | 31.52x         |
-| blastdns-cli    | Rust        | 0.336s | 59,548 | 100%         | 28.86x         |
-| blastdns-python | Python+Rust | 1.564s | 12,791 | 100%         | 6.20x          |
-| dnspython       | Python      | 9.695s | 2,063  | 100%         | 1.00x          |
+| Library         | Time    | QPS    | Success  | Failed | vs dnspython |
+|-----------------|---------|--------|----------|--------|--------------|
+| massdns         | 1.687s  | 71,898 | 100,000  | 0      | 28.87x       |
+| blastdns-cli    | 1.732s  | 64,942 | 100,000  | 0      | 26.07x       |
+| blastdns-python | 3.903s  | 25,623 | 100,000  | 0      | 10.29x       |
+| dnspython       | 40.149s | 2,491  | 100,000  | 0      | 1.00x        |
 
 ### CLI
 
@@ -214,6 +214,21 @@ while let Some((host, outcome)) = stream.next().await {
     }
 }
 
+// resolve_batch_basic: simplified batch resolution with minimal output
+// returns only (host, record_type, Vec<rdata>) - no full DNS response structures
+// automatically filters out errors and empty responses
+let wordlist = ["one.example", "two.example", "three.example"];
+let mut stream = client.resolve_batch_basic(
+    wordlist.into_iter().map(Ok::<_, std::convert::Infallible>),
+    RecordType::A,
+);
+while let Some((host, record_type, answers)) = stream.next().await {
+    println!("{} ({}):", host, record_type);
+    for answer in answers {
+        println!("  {}", answer);  // e.g., "93.184.216.34" for A records
+    }
+}
+
 // resolve_multi: resolve multiple record types for a single host in parallel
 let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::MX];
 let results = client.resolve_multi("example.com", record_types).await?;
@@ -265,6 +280,15 @@ async def main():
         else:
             print(f"{host}: {len(result.response.answers)} answers")
 
+    # resolve_batch_basic: simplified batch resolution with minimal output
+    # returns only (host, record_type, list[rdata]) - no full DNS response structures
+    # automatically filters out errors and empty responses
+    hosts = ["example.com", "google.com", "github.com"]
+    async for host, rdtype, answers in client.resolve_batch_basic(hosts, "A"):
+        print(f"{host} ({rdtype}):")
+        for answer in answers:
+            print(f"  {answer}")  # e.g., "93.184.216.34" for A records
+
     # resolve_multi: resolve multiple record types for a single host in parallel
     record_types = ["A", "AAAA", "MX"]
     results = await client.resolve_multi("example.com", record_types)
@@ -282,7 +306,9 @@ asyncio.run(main())
 
 - **`Client.resolve(host, record_type=None) -> DNSResult`**: Lookup a single hostname. Defaults to `A` records. Returns a Pydantic `DNSResult` model with typed fields for easy access to the response data.
 
-- **`Client.resolve_batch(hosts, record_type=None)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, result)` tuples as results complete. Each result is either a `DNSResult` or `DNSError` Pydantic model. Set `skip_empty=True` to filter out successful responses with no answers. Set `skip_errors=True` to filter out error responses. Useful for processing large lists of hosts.
+- **`Client.resolve_batch(hosts, record_type=None, skip_empty=False, skip_errors=False)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, result)` tuples as results complete. Each result is either a `DNSResult` or `DNSError` Pydantic model. Set `skip_empty=True` to filter out successful responses with no answers. Set `skip_errors=True` to filter out error responses. Useful for processing large lists of hosts.
+
+- **`Client.resolve_batch_basic(hosts, record_type=None)`**: Simplified batch resolution that returns only the essential data. Takes an iterable of hostnames and streams back `(host, record_type, answers)` tuples where `answers` is a list of rdata strings (e.g., `["93.184.216.34"]` for A records, `["10 aspmx.l.google.com."]` for MX records). Automatically filters out errors and empty responses. Perfect for simple use cases where you just need the IP addresses or other record data without the full DNS response structure.
 
 - **`Client.resolve_multi(host, record_types) -> dict[str, DNSResultOrError]`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a `DNSResult` (success) or `DNSError` (failure) Pydantic model.
 
