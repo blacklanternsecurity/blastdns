@@ -22,5 +22,6 @@ async def main():
     async for host, response in client.resolve_batch(host_gen(), "A"):
         print(json.dumps(response))
 
+
 if __name__ == "__main__":
     asyncio.run(main())

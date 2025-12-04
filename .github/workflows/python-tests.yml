@@ -55,6 +55,11 @@ jobs:
       - name: Install Python dependencies
         run: uv sync
 
+      - name: Lint
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+
       - name: Build Python extension
         run: uv run maturin develop --release
 
