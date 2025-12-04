@@ -17,14 +17,14 @@ BlastDNS is simultaneously a:
 
 ## Benchmark
 
-20K DNS lookups against local `dnsmasq`, with 100 workers:
+100K DNS lookups against local `dnsmasq`, with 100 workers:
 
-| Library         | Language    | Time   | QPS    | Success Rate | vs dnspython   |
-|-----------------|-------------|--------|--------|--------------|----------------|
-| massdns         | C           | 0.308s | 65,019 | 100%         | 31.52x         |
-| blastdns-cli    | Rust        | 0.336s | 59,548 | 100%         | 28.86x         |
-| blastdns-python | Python+Rust | 1.564s | 12,791 | 100%         | 6.20x          |
-| dnspython       | Python      | 9.695s | 2,063  | 100%         | 1.00x          |
+| Library         | Time    | QPS    | Success  | Failed | vs dnspython |
+|-----------------|---------|--------|----------|--------|--------------|
+| massdns         | 1.687s  | 71,898 | 100,000  | 0      | 28.87x       |
+| blastdns-cli    | 1.732s  | 64,942 | 100,000  | 0      | 26.07x       |
+| blastdns-python | 3.903s  | 25,623 | 100,000  | 0      | 10.29x       |
+| dnspython       | 40.149s | 2,491  | 100,000  | 0      | 1.00x        |
 
 ### CLI
 
@@ -214,6 +214,21 @@ while let Some((host, outcome)) = stream.next().await {
     }
 }
 
+// resolve_batch_basic: simplified batch resolution with minimal output
+// returns only (host, record_type, Vec<rdata>) - no full DNS response structures
+// automatically filters out errors and empty responses
+let wordlist = ["one.example", "two.example", "three.example"];
+let mut stream = client.resolve_batch_basic(
+    wordlist.into_iter().map(Ok::<_, std::convert::Infallible>),
+    RecordType::A,
+);
+while let Some((host, record_type, answers)) = stream.next().await {
+    println!("{} ({}):", host, record_type);
+    for answer in answers {
+        println!("  {}", answer);  // e.g., "93.184.216.34" for A records
+    }
+}
+
 // resolve_multi: resolve multiple record types for a single host in parallel
 let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::MX];
 let results = client.resolve_multi("example.com", record_types).await?;
@@ -241,36 +256,47 @@ uv run pytest
 To use it in Python, you can use the `Client` class:
 
 ```python
-import json
 import asyncio
-from blastdns import Client, ClientConfig
+from blastdns import Client, ClientConfig, DNSResult, DNSError
 
 
 async def main():
     resolvers = ["1.1.1.1:53"]
     client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
 
-    # resolve: lookup a single host
-    response = await client.resolve("example.com", "AAAA")
-    print(json.dumps(response, indent=2))
+    # resolve: lookup a single host, returns a Pydantic model
+    result = await client.resolve("example.com", "AAAA")
+    print(f"Host: {result.host}")
+    print(f"Response code: {result.response.header.response_code}")
+    for answer in result.response.answers:
+        print(f"  {answer.name_labels}: {answer.rdata}")
 
     # resolve_batch: process many hosts in parallel with bounded concurrency
     # streams results back as they complete
     hosts = ["one.example.com", "two.example.com", "three.example.com"]
-    async for host, response in client.resolve_batch(hosts, "A"):
-        if "error" in response:
-            print(f"{host} failed: {response['error']}")
+    async for host, result in client.resolve_batch(hosts, "A"):
+        if isinstance(result, DNSError):
+            print(f"{host} failed: {result.error}")
         else:
-            print(f"{host}: {len(response['answers'])} answers")
+            print(f"{host}: {len(result.response.answers)} answers")
+
+    # resolve_batch_basic: simplified batch resolution with minimal output
+    # returns only (host, record_type, list[rdata]) - no full DNS response structures
+    # automatically filters out errors and empty responses
+    hosts = ["example.com", "google.com", "github.com"]
+    async for host, rdtype, answers in client.resolve_batch_basic(hosts, "A"):
+        print(f"{host} ({rdtype}):")
+        for answer in answers:
+            print(f"  {answer}")  # e.g., "93.184.216.34" for A records
 
     # resolve_multi: resolve multiple record types for a single host in parallel
     record_types = ["A", "AAAA", "MX"]
     results = await client.resolve_multi("example.com", record_types)
-    for record_type, response in results.items():
-        if "error" in response:
-            print(f"{record_type} failed: {response['error']}")
+    for record_type, result in results.items():
+        if isinstance(result, DNSError):
+            print(f"{record_type} failed: {result.error}")
         else:
-            print(f"{record_type}: {len(response['answers'])} answers")
+            print(f"{record_type}: {len(result.response.answers)} answers")
 
 
 asyncio.run(main())
@@ -278,11 +304,65 @@ asyncio.run(main())
 
 #### Python API Methods
 
-- **`Client.resolve(host, record_type=None)`**: Lookup a single hostname. Defaults to `A` records. Returns a JSON-shaped dictionary matching the CLI output.
+- **`Client.resolve(host, record_type=None) -> DNSResult`**: Lookup a single hostname. Defaults to `A` records. Returns a Pydantic `DNSResult` model with typed fields for easy access to the response data.
 
-- **`Client.resolve_batch(hosts, record_type=None, skip_empty=False, skip_errors=False)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, response)` tuples as results complete. Set `skip_empty=True` to filter out successful responses with no answers. Set `skip_errors=True` to filter out error responses. Useful for processing large wordlists efficiently.
+- **`Client.resolve_batch(hosts, record_type=None, skip_empty=False, skip_errors=False)`**: Resolve many hosts in parallel. Takes an iterable of hostnames and streams back `(host, result)` tuples as results complete. Each result is either a `DNSResult` or `DNSError` Pydantic model. Set `skip_empty=True` to filter out successful responses with no answers. Set `skip_errors=True` to filter out error responses. Useful for processing large lists of hosts.
 
-- **`Client.resolve_multi(host, record_types)`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a successful response or an error dictionary with an `"error"` key.
+- **`Client.resolve_batch_basic(hosts, record_type=None)`**: Simplified batch resolution that returns only the essential data. Takes an iterable of hostnames and streams back `(host, record_type, answers)` tuples where `answers` is a list of rdata strings (e.g., `["93.184.216.34"]` for A records, `["10 aspmx.l.google.com."]` for MX records). Automatically filters out errors and empty responses. Perfect for simple use cases where you just need the IP addresses or other record data without the full DNS response structure.
+
+- **`Client.resolve_multi(host, record_types) -> dict[str, DNSResultOrError]`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a `DNSResult` (success) or `DNSError` (failure) Pydantic model.
+
+#### MockClient for Testing
+
+`MockClient` provides a drop-in replacement for `Client` that returns fabricated DNS responses without making real network requests. This is useful for testing code that depends on DNS lookups.
+
+```python
+import pytest
+from blastdns import MockClient, DNSResult, DNSError
+
+
+@pytest.fixture
+def mock_client():
+    client = MockClient()
+    client.mock_dns({
+        "example.com": {
+            "A": ["93.184.216.34"],
+            "AAAA": ["2606:2800:220:1:248:1893:25c8:1946"],
+            "MX": ["10 aspmx.l.google.com.", "20 alt1.aspmx.l.google.com."],
+        },
+        "cname.example.com": {
+            "CNAME": ["example.com."]
+        },
+        "_NXDOMAIN": ["notfound.example.com"],  # hosts that return NXDOMAIN errors
+    })
+    return client
+
+
+@pytest.mark.asyncio
+async def test_my_function(mock_client):
+    # MockClient implements the same interface as Client
+    result = await mock_client.resolve("example.com", "A")
+    assert isinstance(result, DNSResult)
+    assert len(result.response.answers) == 1
+
+    # Test error cases
+    result = await mock_client.resolve("notfound.example.com", "A")
+    assert result.response.header.response_code == "NXDomain"
+
+    # Works with all Client methods
+    async for host, rdtype, answers in mock_client.resolve_batch_basic(["example.com"], "A"):
+        print(f"{host}: {answers}")  # ["93.184.216.34"]
+```
+
+`MockClient` supports all the same methods as `Client` (`resolve`, `resolve_batch`, `resolve_batch_basic`, `resolve_multi`) and returns the same Pydantic models.
+
+#### Response Models
+
+All methods return Pydantic V2 models for type safety and IDE autocomplete:
+
+- **`DNSResult`**: Successful DNS response with `host` and `response` fields
+- **`DNSError`**: Failed DNS lookup with an `error` field
+- **`Response`**: DNS message with `header`, `queries`, `answers`, `name_servers`, etc.
 
 `ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
 
@@ -326,14 +406,22 @@ When done, stop the test DNS server:
 
 ## Linting
 
-Run clippy for lints:
+### Rust
 
 ```bash
+# Run clippy for lints
 cargo clippy --all-targets --all-features
+
+# Run rustfmt for formatting
+cargo fmt --all
 ```
 
-Run rustfmt for formatting:
+### Python
 
 ```bash
-cargo fmt --all
+# Run ruff for lints
+uv run ruff check --fix
+
+# Run ruff for formatting
+uv run ruff format
 ```

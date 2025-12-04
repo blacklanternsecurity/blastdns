@@ -10,7 +10,7 @@ use pyo3::types::{PyAnyMethods, PyIterator};
 use pyo3_async_runtimes::tokio::future_into_py;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::client::{BatchResult, BlastDNSClient};
+use crate::client::{BatchResult, BatchResultBasic, BlastDNSClient};
 use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
 use crate::error::BlastDNSError;
 
@@ -122,6 +122,30 @@ impl PyBlastDNSClient {
             inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
         })
     }
+
+    #[pyo3(signature = (hosts, record_type = None))]
+    fn resolve_batch_basic(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+    ) -> PyResult<PyBatchBasicIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch_basic
+        let result_stream = self.inner.resolve_batch_basic(rust_iter, record_type);
+
+        Ok(PyBatchBasicIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
+        })
+    }
 }
 
 #[pyclass]
@@ -148,6 +172,30 @@ impl PyBatchIterator {
                     };
                     Ok((host, payload))
                 }
+                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+            }
+        })
+    }
+}
+
+#[pyclass]
+pub struct PyBatchBasicIterator {
+    inner: Arc<TokioMutex<Pin<Box<dyn Stream<Item = BatchResultBasic> + Send>>>>,
+}
+
+#[pymethods]
+impl PyBatchBasicIterator {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let mut stream = inner.lock().await;
+            match stream.next().await {
+                Some((host, record_type, answers)) => Ok((host, record_type, answers)),
                 None => Err(PyStopAsyncIteration::new_err("end of stream")),
             }
         })
