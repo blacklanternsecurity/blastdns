@@ -183,13 +183,6 @@ cargo install blastdns
 cargo add blastdns
 ```
 
-Or add to `Cargo.toml`:
-
-```toml
-[dependencies]
-blastdns = "0.1"
-```
-
 #### Usage
 
 ```rust
