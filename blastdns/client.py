@@ -7,6 +7,7 @@ from .models import DNSError, DNSResult, DNSResultOrError
 __all__ = [
     "ClientConfig",
     "Client",
+    "MockClient",
 ]
 
 
@@ -139,3 +140,242 @@ class Client:
         """
         async for host, rdtype, answers in self._inner.resolve_batch_basic(hosts, record_type):
             yield (host, rdtype, answers)
+
+
+class MockClient:
+    """Mock DNS client for testing purposes.
+
+    This client mimics the interface of the real Client but returns fabricated
+    responses based on pre-configured mock data. Use `mock_dns()` to configure
+    the responses.
+    """
+
+    def __init__(self, resolvers=None, config=None):
+        """Initialize mock client (resolvers and config are ignored)."""
+        self._mock_data = {}
+        self._nxdomain_hosts = set()
+
+    def mock_dns(self, data):
+        """Configure mock DNS responses.
+
+        Args:
+            data: Dictionary mapping hosts to their DNS records, with optional
+                  "_NXDOMAIN" key for hosts that should return NXDOMAIN errors.
+
+        Example:
+            mock_client.mock_dns({
+                "example.com": {"A": ["93.184.216.34"], "AAAA": ["2606:2800:220:1:248:1893:25c8:1946"]},
+                "bad.dns": {"CNAME": ["baddns.azurewebsites.net."]},
+                "_NXDOMAIN": ["baddns.azurewebsites.net", "notfound.example.com"]
+            })
+        """
+        for key, value in data.items():
+            if key == "_NXDOMAIN":
+                self._nxdomain_hosts.update(value)
+            else:
+                self._mock_data[key] = value
+
+    def _fabricate_response(self, host, record_type, answers_data):
+        """Fabricate a complete DNS response structure."""
+        from .models import Response, Header, Query, Record
+
+        # Ensure host has trailing dot (FQDN format)
+        fqdn = host if host.endswith(".") else f"{host}."
+
+        # Create answer records
+        answers = []
+        for rdata_str in answers_data:
+            # Parse the rdata based on record type
+            if record_type == "A":
+                rdata = {"A": rdata_str}
+            elif record_type == "AAAA":
+                rdata = {"AAAA": rdata_str}
+            elif record_type == "CNAME":
+                rdata = {"CNAME": rdata_str}
+            elif record_type == "MX":
+                # MX records like "10 aspmx.l.google.com."
+                parts = rdata_str.split(None, 1)
+                if len(parts) == 2:
+                    rdata = {"MX": {"preference": int(parts[0]), "exchange": parts[1]}}
+                else:
+                    rdata = {"MX": {"preference": 0, "exchange": rdata_str}}
+            elif record_type == "TXT":
+                rdata = {"TXT": rdata_str}
+            elif record_type == "NS":
+                rdata = {"NS": rdata_str}
+            elif record_type == "PTR":
+                rdata = {"PTR": rdata_str}
+            elif record_type == "SOA":
+                rdata = {"SOA": rdata_str}
+            elif record_type == "SRV":
+                rdata = {"SRV": rdata_str}
+            else:
+                rdata = {record_type: rdata_str}
+
+            answers.append(Record(name_labels=fqdn, ttl=300, dns_class="IN", rdata=rdata))
+
+        # Fabricate header
+        header = Header(
+            id=12345,
+            message_type="Response",
+            op_code="Query",
+            authoritative=False,
+            truncation=False,
+            recursion_desired=True,
+            recursion_available=True,
+            authentic_data=False,
+            checking_disabled=False,
+            response_code="NoError",
+            query_count=1,
+            answer_count=len(answers),
+            name_server_count=0,
+            additional_count=0,
+        )
+
+        # Fabricate query
+        queries = [Query(name=fqdn, query_type=record_type, query_class="IN")]
+
+        return Response(
+            header=header, queries=queries, answers=answers, name_servers=[], additionals=[], signature=[], edns=None
+        )
+
+    def _fabricate_nxdomain_response(self, host, record_type):
+        """Fabricate an NXDOMAIN error response."""
+        from .models import Response, Header, Query
+
+        # Ensure host has trailing dot (FQDN format)
+        fqdn = host if host.endswith(".") else f"{host}."
+
+        header = Header(
+            id=12345,
+            message_type="Response",
+            op_code="Query",
+            authoritative=False,
+            truncation=False,
+            recursion_desired=True,
+            recursion_available=True,
+            authentic_data=False,
+            checking_disabled=False,
+            response_code="NXDomain",
+            query_count=1,
+            answer_count=0,
+            name_server_count=0,
+            additional_count=0,
+        )
+
+        queries = [Query(name=fqdn, query_type=record_type, query_class="IN")]
+
+        return Response(
+            header=header, queries=queries, answers=[], name_servers=[], additionals=[], signature=[], edns=None
+        )
+
+    async def resolve(self, host, record_type=None) -> DNSResult:
+        """Resolve a hostname to DNS records (mocked).
+
+        Args:
+            host: Hostname to resolve
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+
+        Returns:
+            DNSResult: A Pydantic model containing the host and fabricated DNS response.
+        """
+        record_type = record_type or "A"
+
+        # Check if this host should return NXDOMAIN
+        if host in self._nxdomain_hosts:
+            response = self._fabricate_nxdomain_response(host, record_type)
+            return DNSResult(host=host, response=response)
+
+        # Check if we have mock data for this host
+        if host in self._mock_data and record_type in self._mock_data[host]:
+            answers_data = self._mock_data[host][record_type]
+            response = self._fabricate_response(host, record_type, answers_data)
+            return DNSResult(host=host, response=response)
+
+        # No mock data, return empty response
+        response = self._fabricate_response(host, record_type, [])
+        return DNSResult(host=host, response=response)
+
+    async def resolve_multi(self, host, record_types) -> dict[str, DNSResultOrError]:
+        """Resolve multiple record types for a single hostname in parallel (mocked).
+
+        Args:
+            host: Hostname to resolve
+            record_types: List of record type strings (e.g. ["A", "AAAA", "MX"])
+
+        Returns:
+            dict[str, DNSResultOrError]: Dictionary mapping record type to result.
+        """
+        result = {}
+        for record_type in record_types:
+            # Check if this host should return NXDOMAIN
+            if host in self._nxdomain_hosts:
+                result[record_type] = DNSError(error="NXDomain")
+            # Check if we have mock data for this host/type
+            elif host in self._mock_data and record_type in self._mock_data[host]:
+                answers_data = self._mock_data[host][record_type]
+                response = self._fabricate_response(host, record_type, answers_data)
+                result[record_type] = DNSResult(host=host, response=response)
+            else:
+                # No mock data, return empty response
+                response = self._fabricate_response(host, record_type, [])
+                result[record_type] = DNSResult(host=host, response=response)
+
+        return result
+
+    async def resolve_batch(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
+        """Resolve multiple hostnames concurrently (mocked).
+
+        Args:
+            hosts: Iterable of hostname strings
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+            skip_empty: Skip empty responses (default: False)
+            skip_errors: Skip error responses (default: False)
+
+        Yields:
+            tuple[str, DNSResultOrError]: (hostname, result) pairs.
+        """
+        record_type = record_type or "A"
+
+        for host in hosts:
+            # Check if this host should return NXDOMAIN
+            if host in self._nxdomain_hosts:
+                if not skip_errors:
+                    yield (host, DNSError(error="NXDomain"))
+            # Check if we have mock data for this host
+            elif host in self._mock_data and record_type in self._mock_data[host]:
+                answers_data = self._mock_data[host][record_type]
+                response = self._fabricate_response(host, record_type, answers_data)
+                result = DNSResult(host=host, response=response)
+                if not skip_empty or len(response.answers) > 0:
+                    yield (host, result)
+            else:
+                # No mock data, return empty response
+                response = self._fabricate_response(host, record_type, [])
+                result = DNSResult(host=host, response=response)
+                if not skip_empty:
+                    yield (host, result)
+
+    async def resolve_batch_basic(self, hosts, record_type=None):
+        """Resolve multiple hostnames concurrently, yielding simplified tuples (mocked).
+
+        Args:
+            hosts: Iterable of hostname strings
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+
+        Yields:
+            tuple[str, str, list[str]]: (hostname, record_type, rdata) tuples.
+                                        Only successful, non-empty results are returned.
+        """
+        record_type = record_type or "A"
+
+        for host in hosts:
+            # Skip NXDOMAIN hosts
+            if host in self._nxdomain_hosts:
+                continue
+
+            # Check if we have mock data for this host
+            if host in self._mock_data and record_type in self._mock_data[host]:
+                answers_data = self._mock_data[host][record_type]
+                if answers_data:  # Only yield non-empty results
+                    yield (host, record_type, answers_data)
