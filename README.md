@@ -173,6 +173,25 @@ Valid log levels (from least to most verbose): `error`, `warn`, `info`, `debug`,
 
 ### Rust API
 
+#### Installation
+
+```bash
+# Install CLI tool
+cargo install blastdns
+
+# Add library to your project
+cargo add blastdns
+```
+
+Or add to `Cargo.toml`:
+
+```toml
+[dependencies]
+blastdns = "0.1"
+```
+
+#### Usage
+
 ```rust
 use blastdns::{BlastDNSClient, BlastDNSConfig};
 use futures::StreamExt;
@@ -247,6 +266,21 @@ for (record_type, result) in results {
 
 The `blastdns` Python package is a thin wrapper around the Rust library.
 
+#### Installation
+
+```bash
+# Using pip
+pip install blastdns
+
+# Using uv
+uv add blastdns
+
+# Using poetry
+poetry add blastdns
+```
+
+#### Development Setup
+
 ```bash
 # install python dependencies
 uv sync
@@ -255,6 +289,8 @@ uv run maturin develop
 # run tests
 uv run pytest
 ```
+
+#### Usage
 
 To use it in Python, you can use the `Client` class:
 
