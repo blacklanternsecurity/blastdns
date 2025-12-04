@@ -312,6 +312,50 @@ asyncio.run(main())
 
 - **`Client.resolve_multi(host, record_types) -> dict[str, DNSResultOrError]`**: Resolve multiple record types for a single hostname in parallel. Takes a list of record type strings (e.g., `["A", "AAAA", "MX"]`) and returns a dictionary keyed by record type. Each value is either a `DNSResult` (success) or `DNSError` (failure) Pydantic model.
 
+#### MockClient for Testing
+
+`MockClient` provides a drop-in replacement for `Client` that returns fabricated DNS responses without making real network requests. This is useful for testing code that depends on DNS lookups.
+
+```python
+import pytest
+from blastdns import MockClient, DNSResult, DNSError
+
+
+@pytest.fixture
+def mock_client():
+    client = MockClient()
+    client.mock_dns({
+        "example.com": {
+            "A": ["93.184.216.34"],
+            "AAAA": ["2606:2800:220:1:248:1893:25c8:1946"],
+            "MX": ["10 aspmx.l.google.com.", "20 alt1.aspmx.l.google.com."],
+        },
+        "cname.example.com": {
+            "CNAME": ["example.com."]
+        },
+        "_NXDOMAIN": ["notfound.example.com"],  # hosts that return NXDOMAIN errors
+    })
+    return client
+
+
+@pytest.mark.asyncio
+async def test_my_function(mock_client):
+    # MockClient implements the same interface as Client
+    result = await mock_client.resolve("example.com", "A")
+    assert isinstance(result, DNSResult)
+    assert len(result.response.answers) == 1
+
+    # Test error cases
+    result = await mock_client.resolve("notfound.example.com", "A")
+    assert result.response.header.response_code == "NXDomain"
+
+    # Works with all Client methods
+    async for host, rdtype, answers in mock_client.resolve_batch_basic(["example.com"], "A"):
+        print(f"{host}: {answers}")  # ["93.184.216.34"]
+```
+
+`MockClient` supports all the same methods as `Client` (`resolve`, `resolve_batch`, `resolve_batch_basic`, `resolve_multi`) and returns the same Pydantic models.
+
 #### Response Models
 
 All methods return Pydantic V2 models for type safety and IDE autocomplete:
