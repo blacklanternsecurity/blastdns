@@ -189,11 +189,7 @@ impl BlastDNSClient {
                     {
                         let query = Query::query(name, record_type);
                         // Insert records into cache
-                        cache.insert_records(
-                            query,
-                            resp.answers().iter().cloned(),
-                            Instant::now(),
-                        );
+                        cache.insert_records(query, resp.answers().iter().cloned(), Instant::now());
                         debug!(host, %record_type, "cached response");
                     }
                     return Ok(resp);
