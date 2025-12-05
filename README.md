@@ -8,15 +8,13 @@
 [![Rust Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml)
 [![Python Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml)
 
-[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. It's highly efficient and reliable, even with unreliable DNS servers, and includes intelligent caching. For details, see [Architecture](#architecture).
+[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. Features include built-in caching, and high accuracy even with unreliable DNS servers. For details, see [Architecture](#architecture). BlastDNS is the main DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 There are three ways to use it:
 
 - [Rust CLI tool](#cli)
 - [Rust library](#rust-api)
 - [Python library](#python-api)
-
-BlastDNS is the primary DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 ## Benchmark
 
