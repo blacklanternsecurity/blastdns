@@ -8,15 +8,13 @@
 [![Rust Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml)
 [![Python Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml)
 
-[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. It's both highly efficient and reliable, even if you have shoddy DNS servers. For details, see [Architecture](#architecture).
+[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. Features include built-in caching, and high accuracy even with unreliable DNS servers. For details, see [Architecture](#architecture). BlastDNS is the main DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 There are three ways to use it:
 
 - [Rust CLI tool](#cli)
 - [Rust library](#rust-api)
 - [Python library](#python-api)
-
-BlastDNS is the primary DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 ## Benchmark
 
@@ -495,6 +493,20 @@ BlastDNS is built on top of [`hickory-dns`](https://github.com/hickory-dns/hicko
 Beneath the hood of the `BlastDNSClient`, each resolver gets its own `ResolverWorker` tasks, with a configurable number of workers per resolver (default: 2, configurable via `BlastDNSConfig.threads_per_resolver`).
 
 When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which contains the request (host + rdtype) and a oneshot channel to hold the result. This `WorkItem` is put into a [crossfire](https://github.com/frostyplanet/crossfire-rs) MPMC queue, to be picked up by the first available `ResolverWorker`. Workers are spawned lazily when the first request is made.
+
+### Caching
+
+BlastDNS includes an optional TTL-aware cache powered by hickory-dns's `DnsLru` (internally using moka's TinyLFU eviction policy). The cache is enabled by default with a capacity of 10,000 entries and can be configured or disabled entirely:
+
+- Only **positive responses with answers** are cached (no errors, NXDOMAIN, or empty responses)
+- TTLs are respected and decremented on retrieval to reflect elapsed time
+- Cache entries automatically expire based on DNS record TTLs (clamped to configurable min/max bounds)
+- Thread-safe and lock-free for high concurrency
+
+Configure via `BlastDNSConfig`:
+- `cache_capacity`: Number of entries (default: 10000, set to 0 to disable)
+- `cache_min_ttl`: Minimum TTL (default: 10 seconds)
+- `cache_max_ttl`: Maximum TTL (default: 1 day)
 
 ### Retry Logic and Fault Tolerance
 

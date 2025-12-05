@@ -17,6 +17,9 @@ class ClientConfig(BaseModel):
     max_retries: int = Field(default=10, ge=0)
     purgatory_threshold: int = Field(default=10, ge=1)
     purgatory_sentence_ms: int = Field(default=1000, ge=0)
+    cache_capacity: int = Field(default=10000, ge=0)
+    cache_min_ttl_secs: int = Field(default=10, ge=0)
+    cache_max_ttl_secs: int = Field(default=86400, ge=0)
 
 
 class Client:
