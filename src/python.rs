@@ -51,8 +51,27 @@ impl PyBlastDNSClient {
         let record_type = parse_record_type(record_type)?;
 
         future_into_py(py, async move {
-            let response = client
+            let answers = client
                 .resolve(host, record_type)
+                .await
+                .map_err(PyErr::from)?;
+            Ok(answers)
+        })
+    }
+
+    #[pyo3(signature = (host, record_type = None))]
+    fn resolve_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let record_type = parse_record_type(record_type)?;
+
+        future_into_py(py, async move {
+            let response = client
+                .resolve_full(host, record_type)
                 .await
                 .map_err(PyErr::from)?;
             dns_response_to_bytes(response)
@@ -79,6 +98,38 @@ impl PyBlastDNSClient {
                 .await
                 .map_err(PyErr::from)?;
 
+            // Convert HashMap<RecordType, Vec<String>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, answers) in results {
+                    let key = record_type.to_string();
+                    dict.set_item(key, answers)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
+    fn resolve_multi_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = client
+                .resolve_multi_full(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
             // Convert HashMap<RecordType, Result<DnsResponse, BlastDNSError>> to Python dict
             Python::attach(|py| {
                 let dict = pyo3::types::PyDict::new(py);
@@ -95,8 +146,32 @@ impl PyBlastDNSClient {
         })
     }
 
-    #[pyo3(signature = (hosts, record_type = None, skip_empty = false, skip_errors = false))]
+    #[pyo3(signature = (hosts, record_type = None))]
     fn resolve_batch(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+    ) -> PyResult<PyBatchBasicIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch (returns simplified results)
+        let result_stream = self.inner.resolve_batch(rust_iter, record_type);
+
+        Ok(PyBatchBasicIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
+        })
+    }
+
+    #[pyo3(signature = (hosts, record_type = None, skip_empty = false, skip_errors = false))]
+    fn resolve_batch_full(
         &self,
         hosts: Py<PyAny>,
         record_type: Option<&str>,
@@ -113,36 +188,12 @@ impl PyBlastDNSClient {
 
         let rust_iter = PythonHostIterator::new(py_iter);
 
-        // Call Rust resolve_batch (it handles spawn_blocking internally)
+        // Call Rust resolve_batch_full (it handles spawn_blocking internally)
         let result_stream =
             self.inner
-                .resolve_batch(rust_iter, record_type, skip_empty, skip_errors);
+                .resolve_batch_full(rust_iter, record_type, skip_empty, skip_errors);
 
         Ok(PyBatchIterator {
-            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
-        })
-    }
-
-    #[pyo3(signature = (hosts, record_type = None))]
-    fn resolve_batch_basic(
-        &self,
-        hosts: Py<PyAny>,
-        record_type: Option<&str>,
-    ) -> PyResult<PyBatchBasicIterator> {
-        let record_type = parse_record_type(record_type)?;
-
-        // Convert Python iterable to Rust iterator
-        let py_iter = Python::attach(|py| {
-            let bound = hosts.bind(py);
-            bound.try_iter().map(|i| i.unbind())
-        })?;
-
-        let rust_iter = PythonHostIterator::new(py_iter);
-
-        // Call Rust resolve_batch_basic
-        let result_stream = self.inner.resolve_batch_basic(rust_iter, record_type);
-
-        Ok(PyBatchBasicIterator {
             inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
         })
     }

@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     };
 
     let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);
-    let mut stream = client.resolve_batch(
+    let mut stream = client.resolve_batch_full(
         hosts.map(Ok::<_, std::convert::Infallible>),
         args.record_type,
         args.skip_empty,

@@ -38,11 +38,28 @@ class Client:
         config_json = (config or ClientConfig()).model_dump_json()
         self._inner = _native.Client(list(resolvers), config_json)
 
-    async def resolve(self, host, record_type=None) -> DNSResult:
-        """Resolve a hostname to DNS records.
+    async def resolve(self, host, record_type=None) -> list[str]:
+        """Resolve a hostname to DNS records, returning simplified rdata strings.
 
         Args:
-            host: Hostname to resolve
+            host: Hostname to resolve (IP addresses are auto-formatted for PTR queries)
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+
+        Returns:
+            list[str]: List of rdata strings (e.g., ["93.184.216.34"] for A records).
+
+        Example:
+            ips = await client.resolve("example.com", "A")
+            for ip in ips:
+                print(ip)
+        """
+        return await self._inner.resolve(host, record_type)
+
+    async def resolve_full(self, host, record_type=None) -> DNSResult:
+        """Resolve a hostname to DNS records, returning full DNS response.
+
+        Args:
+            host: Hostname to resolve (IP addresses are auto-formatted for PTR queries)
             record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
 
         Returns:
@@ -50,17 +67,36 @@ class Client:
                       typed fields for header, queries, answers, etc.
 
         Example:
-            result = await client.resolve("example.com", "A")
+            result = await client.resolve_full("example.com", "A")
             print(result.host)
             for answer in result.response.answers:
                 print(answer.rdata)
         """
-        raw = await self._inner.resolve(host, record_type)
+        raw = await self._inner.resolve_full(host, record_type)
         response_data = orjson.loads(raw)
         return DNSResult.model_validate({"host": host, "response": response_data})
 
-    async def resolve_multi(self, host, record_types) -> dict[str, DNSResultOrError]:
-        """Resolve multiple record types for a single hostname in parallel.
+    async def resolve_multi(self, host, record_types) -> dict[str, list[str]]:
+        """Resolve multiple record types for a single hostname in parallel, returning simplified results.
+
+        Args:
+            host: Hostname to resolve
+            record_types: List of record type strings (e.g. ["A", "AAAA", "MX"])
+
+        Returns:
+            dict[str, list[str]]: Dictionary mapping record type to list of rdata strings.
+                                  Only successful queries with answers are included.
+
+        Example:
+            results = await client.resolve_multi("example.com", ["A", "AAAA", "MX"])
+            if "A" in results:
+                for ip in results["A"]:
+                    print(ip)
+        """
+        return await self._inner.resolve_multi(host, record_types)
+
+    async def resolve_multi_full(self, host, record_types) -> dict[str, DNSResultOrError]:
+        """Resolve multiple record types for a single hostname in parallel, returning full results.
 
         Args:
             host: Hostname to resolve
@@ -72,14 +108,14 @@ class Client:
                                          failures return DNSError.
 
         Example:
-            results = await client.resolve_multi("example.com", ["A", "AAAA", "MX"])
+            results = await client.resolve_multi_full("example.com", ["A", "AAAA", "MX"])
             a_result = results["A"]
             if isinstance(a_result, DNSResult):
                 print(f"A records: {a_result.response.answers}")
             else:
                 print(f"Error: {a_result.error}")
         """
-        raw_dict = await self._inner.resolve_multi(host, record_types)
+        raw_dict = await self._inner.resolve_multi_full(host, record_types)
         result = {}
         for key, value in raw_dict.items():
             data = orjson.loads(value)
@@ -89,8 +125,27 @@ class Client:
                 result[key] = DNSResult.model_validate({"host": host, "response": data})
         return result
 
-    async def resolve_batch(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
-        """Resolve multiple hostnames concurrently, yielding results as they complete.
+    async def resolve_batch(self, hosts, record_type=None):
+        """Resolve multiple hostnames concurrently, yielding simplified tuples.
+
+        Args:
+            hosts: Iterable of hostname strings
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+
+        Yields:
+            tuple[str, str, list[str]]: (hostname, record_type, rdata) tuples.
+                                        Only successful, non-empty results are returned.
+                                        Results are unordered (faster hosts first).
+
+        Example:
+            async for host, rdtype, answers in client.resolve_batch(["example.com", "google.com"], "A"):
+                print(f"{host} ({rdtype}): {', '.join(answers)}")
+        """
+        async for host, rdtype, answers in self._inner.resolve_batch(hosts, record_type):
+            yield (host, rdtype, answers)
+
+    async def resolve_batch_full(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
+        """Resolve multiple hostnames concurrently, yielding full results as they complete.
 
         Args:
             hosts: Iterable of hostname strings
@@ -104,42 +159,18 @@ class Client:
                                           Results are unordered (faster hosts first).
 
         Example:
-            async for host, result in client.resolve_batch(["example.com", "google.com"], "A"):
+            async for host, result in client.resolve_batch_full(["example.com", "google.com"], "A"):
                 if isinstance(result, DNSError):
                     print(f"{host} failed: {result.error}")
                 else:
                     print(f"{host}: {len(result.response.answers)} answers")
         """
-        async for host, raw in self._inner.resolve_batch(hosts, record_type, skip_empty, skip_errors):
+        async for host, raw in self._inner.resolve_batch_full(hosts, record_type, skip_empty, skip_errors):
             data = orjson.loads(raw)
             if "error" in data:
                 yield (host, DNSError.model_validate(data))
             else:
                 yield (host, DNSResult.model_validate({"host": host, "response": data}))
-
-    async def resolve_batch_basic(self, hosts, record_type=None):
-        """Resolve multiple hostnames concurrently, yielding simplified tuples.
-
-        Args:
-            hosts: Iterable of hostname strings
-            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
-
-        Yields:
-            tuple[str, str, list[str]]: (hostname, record_type, rdata) tuples.
-                                        Only successful, non-empty results are returned.
-                                        The rdata list contains only the actual record data:
-                                        - A records: ["93.184.216.34"]
-                                        - MX records: ["10 aspmx.l.google.com."]
-                                        - CNAME records: ["example.com."]
-
-        Example:
-            async for host, rdtype, answers in client.resolve_batch_basic(["example.com", "google.com"], "MX"):
-                print(f"{host} ({rdtype}):")
-                for answer in answers:
-                    print(f"  {answer}")
-        """
-        async for host, rdtype, answers in self._inner.resolve_batch_basic(hosts, record_type):
-            yield (host, rdtype, answers)
 
 
 class MockClient:
@@ -154,6 +185,27 @@ class MockClient:
         """Initialize mock client (resolvers and config are ignored)."""
         self._mock_data = {}
         self._nxdomain_hosts = set()
+
+    @staticmethod
+    def _format_ptr_query(host: str) -> str:
+        """Format an IP address for PTR lookup."""
+        import ipaddress
+
+        try:
+            ip = ipaddress.ip_address(host)
+            if isinstance(ip, ipaddress.IPv4Address):
+                octets = host.split(".")
+                return f"{octets[3]}.{octets[2]}.{octets[1]}.{octets[0]}.in-addr.arpa"
+            elif isinstance(ip, ipaddress.IPv6Address):
+                # Expand to full form and reverse nibbles
+                expanded = ip.exploded.replace(":", "")
+                nibbles = list(reversed(expanded))
+                return ".".join(nibbles) + ".ip6.arpa"
+        except ValueError:
+            # Not an IP address, return as-is
+            pass
+
+        return host
 
     def mock_dns(self, data):
         """Configure mock DNS responses.
@@ -269,8 +321,35 @@ class MockClient:
             header=header, queries=queries, answers=[], name_servers=[], additionals=[], signature=[], edns=None
         )
 
-    async def resolve(self, host, record_type=None) -> DNSResult:
-        """Resolve a hostname to DNS records (mocked).
+    async def resolve(self, host, record_type=None) -> list[str]:
+        """Resolve a hostname to DNS records (mocked), returning simplified rdata strings.
+
+        Args:
+            host: Hostname to resolve
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+
+        Returns:
+            list[str]: List of rdata strings. Empty list for NXDOMAIN or no data.
+        """
+        record_type = record_type or "A"
+
+        # Auto-format PTR queries if an IP address is provided
+        if record_type == "PTR":
+            host = self._format_ptr_query(host)
+
+        # Check if this host should return NXDOMAIN
+        if host in self._nxdomain_hosts:
+            return []
+
+        # Check if we have mock data for this host
+        if host in self._mock_data and record_type in self._mock_data[host]:
+            return self._mock_data[host][record_type]
+
+        # No mock data, return empty list
+        return []
+
+    async def resolve_full(self, host, record_type=None) -> DNSResult:
+        """Resolve a hostname to DNS records (mocked), returning full DNSResult.
 
         Args:
             host: Hostname to resolve
@@ -280,6 +359,10 @@ class MockClient:
             DNSResult: A Pydantic model containing the host and fabricated DNS response.
         """
         record_type = record_type or "A"
+
+        # Auto-format PTR queries if an IP address is provided
+        if record_type == "PTR":
+            host = self._format_ptr_query(host)
 
         # Check if this host should return NXDOMAIN
         if host in self._nxdomain_hosts:
@@ -296,8 +379,39 @@ class MockClient:
         response = self._fabricate_response(host, record_type, [])
         return DNSResult(host=host, response=response)
 
-    async def resolve_multi(self, host, record_types) -> dict[str, DNSResultOrError]:
-        """Resolve multiple record types for a single hostname in parallel (mocked).
+    async def resolve_multi(self, host, record_types) -> dict[str, list[str]]:
+        """Resolve multiple record types for a single hostname in parallel (mocked), returning simplified results.
+
+        Args:
+            host: Hostname to resolve
+            record_types: List of record type strings (e.g. ["A", "AAAA", "MX"])
+
+        Returns:
+            dict[str, list[str]]: Dictionary mapping record type to list of rdata strings.
+                                  Only successful queries with answers are included.
+        """
+        result = {}
+        for record_type in record_types:
+            query_host = host
+
+            # Auto-format PTR queries if an IP address is provided
+            if record_type == "PTR":
+                query_host = self._format_ptr_query(host)
+
+            # Skip NXDOMAIN hosts
+            if query_host in self._nxdomain_hosts:
+                continue
+
+            # Check if we have mock data for this host/type
+            if query_host in self._mock_data and record_type in self._mock_data[query_host]:
+                answers_data = self._mock_data[query_host][record_type]
+                if answers_data:  # Only include if there are answers
+                    result[record_type] = answers_data
+
+        return result
+
+    async def resolve_multi_full(self, host, record_types) -> dict[str, DNSResultOrError]:
+        """Resolve multiple record types for a single hostname in parallel (mocked), returning full results.
 
         Args:
             host: Hostname to resolve
@@ -308,23 +422,59 @@ class MockClient:
         """
         result = {}
         for record_type in record_types:
+            query_host = host
+
+            # Auto-format PTR queries if an IP address is provided
+            if record_type == "PTR":
+                query_host = self._format_ptr_query(host)
+
             # Check if this host should return NXDOMAIN
-            if host in self._nxdomain_hosts:
+            if query_host in self._nxdomain_hosts:
                 result[record_type] = DNSError(error="NXDomain")
             # Check if we have mock data for this host/type
-            elif host in self._mock_data and record_type in self._mock_data[host]:
-                answers_data = self._mock_data[host][record_type]
-                response = self._fabricate_response(host, record_type, answers_data)
-                result[record_type] = DNSResult(host=host, response=response)
+            elif query_host in self._mock_data and record_type in self._mock_data[query_host]:
+                answers_data = self._mock_data[query_host][record_type]
+                response = self._fabricate_response(query_host, record_type, answers_data)
+                result[record_type] = DNSResult(host=query_host, response=response)
             else:
                 # No mock data, return empty response
-                response = self._fabricate_response(host, record_type, [])
-                result[record_type] = DNSResult(host=host, response=response)
+                response = self._fabricate_response(query_host, record_type, [])
+                result[record_type] = DNSResult(host=query_host, response=response)
 
         return result
 
-    async def resolve_batch(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
-        """Resolve multiple hostnames concurrently (mocked).
+    async def resolve_batch(self, hosts, record_type=None):
+        """Resolve multiple hostnames concurrently (mocked), returning simplified tuples.
+
+        Args:
+            hosts: Iterable of hostname strings
+            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
+
+        Yields:
+            tuple[str, str, list[str]]: (hostname, record_type, rdata) tuples.
+                                        Only successful, non-empty results are returned.
+        """
+        record_type = record_type or "A"
+
+        for host in hosts:
+            query_host = host
+
+            # Auto-format PTR queries if an IP address is provided
+            if record_type == "PTR":
+                query_host = self._format_ptr_query(host)
+
+            # Skip NXDOMAIN hosts
+            if query_host in self._nxdomain_hosts:
+                continue
+
+            # Check if we have mock data for this host
+            if query_host in self._mock_data and record_type in self._mock_data[query_host]:
+                answers_data = self._mock_data[query_host][record_type]
+                if answers_data:  # Only yield non-empty results
+                    yield (host, record_type, answers_data)
+
+    async def resolve_batch_full(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
+        """Resolve multiple hostnames concurrently (mocked), returning full results.
 
         Args:
             hosts: Iterable of hostname strings
@@ -338,44 +488,26 @@ class MockClient:
         record_type = record_type or "A"
 
         for host in hosts:
+            query_host = host
+
+            # Auto-format PTR queries if an IP address is provided
+            if record_type == "PTR":
+                query_host = self._format_ptr_query(host)
+
             # Check if this host should return NXDOMAIN
-            if host in self._nxdomain_hosts:
+            if query_host in self._nxdomain_hosts:
                 if not skip_errors:
                     yield (host, DNSError(error="NXDomain"))
             # Check if we have mock data for this host
-            elif host in self._mock_data and record_type in self._mock_data[host]:
-                answers_data = self._mock_data[host][record_type]
-                response = self._fabricate_response(host, record_type, answers_data)
+            elif query_host in self._mock_data and record_type in self._mock_data[query_host]:
+                answers_data = self._mock_data[query_host][record_type]
+                response = self._fabricate_response(query_host, record_type, answers_data)
                 result = DNSResult(host=host, response=response)
                 if not skip_empty or len(response.answers) > 0:
                     yield (host, result)
             else:
                 # No mock data, return empty response
-                response = self._fabricate_response(host, record_type, [])
+                response = self._fabricate_response(query_host, record_type, [])
                 result = DNSResult(host=host, response=response)
                 if not skip_empty:
                     yield (host, result)
-
-    async def resolve_batch_basic(self, hosts, record_type=None):
-        """Resolve multiple hostnames concurrently, yielding simplified tuples (mocked).
-
-        Args:
-            hosts: Iterable of hostname strings
-            record_type: Record type string ("A", "AAAA", "MX", etc.). Defaults to "A"
-
-        Yields:
-            tuple[str, str, list[str]]: (hostname, record_type, rdata) tuples.
-                                        Only successful, non-empty results are returned.
-        """
-        record_type = record_type or "A"
-
-        for host in hosts:
-            # Skip NXDOMAIN hosts
-            if host in self._nxdomain_hosts:
-                continue
-
-            # Check if we have mock data for this host
-            if host in self._mock_data and record_type in self._mock_data[host]:
-                answers_data = self._mock_data[host][record_type]
-                if answers_data:  # Only yield non-empty results
-                    yield (host, record_type, answers_data)

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -38,11 +38,49 @@ impl std::fmt::Debug for BlastDNSClient {
     }
 }
 
-/// Result item produced by [`BlastDNSClient::resolve_batch`].
+/// Result item produced by [`BlastDNSClient::resolve_batch_full`].
 pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
-/// Result item produced by [`BlastDNSClient::resolve_batch_basic`].
+/// Result item produced by [`BlastDNSClient::resolve_batch`].
 pub type BatchResultBasic = (String, String, Vec<String>);
+
+/// Format an IP address for PTR lookup.
+/// IPv4: "8.8.8.8" -> "8.8.8.8.in-addr.arpa"
+/// IPv6: "2001:4860:4860::8888" -> (expanded, reversed nibbles).ip6.arpa
+fn format_ptr_query(host: &str) -> String {
+    // Try to parse as IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                format!(
+                    "{}.{}.{}.{}.in-addr.arpa",
+                    octets[3], octets[2], octets[1], octets[0]
+                )
+            }
+            IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                let mut nibbles = Vec::new();
+
+                // Convert each segment to nibbles (4 hex digits)
+                for segment in segments.iter() {
+                    nibbles.push((segment >> 12) & 0xF);
+                    nibbles.push((segment >> 8) & 0xF);
+                    nibbles.push((segment >> 4) & 0xF);
+                    nibbles.push(segment & 0xF);
+                }
+
+                // Reverse and join with dots
+                nibbles.reverse();
+                let reversed: Vec<String> = nibbles.iter().map(|n| format!("{:x}", n)).collect();
+                format!("{}.ip6.arpa", reversed.join("."))
+            }
+        }
+    } else {
+        // Not an IP address, return as-is
+        host.to_string()
+    }
+}
 
 impl BlastDNSClient {
     /// Build a client using the default configuration.
@@ -93,15 +131,37 @@ impl BlastDNSClient {
             .await;
     }
 
-    /// Enqueue a DNS lookup and await the resolver result.
+    /// Enqueue a DNS lookup and return only the record data strings.
+    /// Returns a vector of rdata strings (e.g., ["93.184.216.34"] for A records).
     pub async fn resolve<S: Into<String>>(
+        &self,
+        host: S,
+        record_type: RecordType,
+    ) -> Result<Vec<String>, BlastDNSError> {
+        let response = self.resolve_full(host, record_type).await?;
+        let answers: Vec<String> = response
+            .answers()
+            .iter()
+            .map(|record| record.data().to_string())
+            .collect();
+        Ok(answers)
+    }
+
+    /// Enqueue a DNS lookup and await the full resolver result.
+    pub async fn resolve_full<S: Into<String>>(
         &self,
         host: S,
         record_type: RecordType,
     ) -> Result<DnsResponse, BlastDNSError> {
         self.ensure_workers().await;
 
-        let host = host.into();
+        let mut host = host.into();
+
+        // Auto-format PTR queries if an IP address is provided
+        if record_type == RecordType::PTR {
+            host = format_ptr_query(&host);
+        }
+
         let attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..attempts {
@@ -154,8 +214,32 @@ impl BlastDNSClient {
         Err(BlastDNSError::WorkerDropped)
     }
 
-    /// Resolve multiple record types for a single hostname in parallel.
+    /// Resolve multiple record types for a single hostname in parallel, returning only successful rdata strings.
+    /// Returns a HashMap of RecordType to Vec<String> with only successful resolutions.
     pub async fn resolve_multi<S: Into<String>>(
+        &self,
+        host: S,
+        record_types: Vec<RecordType>,
+    ) -> Result<HashMap<RecordType, Vec<String>>, BlastDNSError> {
+        let full_results = self.resolve_multi_full(host, record_types).await?;
+        let simplified: HashMap<RecordType, Vec<String>> = full_results
+            .into_iter()
+            .filter_map(|(record_type, result)| {
+                result.ok().map(|response| {
+                    let answers: Vec<String> = response
+                        .answers()
+                        .iter()
+                        .map(|record| record.data().to_string())
+                        .collect();
+                    (record_type, answers)
+                })
+            })
+            .collect();
+        Ok(simplified)
+    }
+
+    /// Resolve multiple record types for a single hostname in parallel, returning full responses.
+    pub async fn resolve_multi_full<S: Into<String>>(
         &self,
         host: S,
         record_types: Vec<RecordType>,
@@ -172,7 +256,7 @@ impl BlastDNSClient {
             .map(|&record_type| {
                 let host = host.clone();
                 async move {
-                    let result = self.resolve(host, record_type).await;
+                    let result = self.resolve_full(host, record_type).await;
                     (record_type, result)
                 }
             })
@@ -182,8 +266,50 @@ impl BlastDNSClient {
         Ok(results.into_iter().collect())
     }
 
-    /// Resolve a batch of hostnames with bounded concurrency and stream the results as they complete.
+    /// Resolve a batch of hostnames with bounded concurrency, returning simplified tuples.
+    ///
+    /// Returns (hostname, record_type, [rdata_strings]) where rdata_strings contain only
+    /// the record data (e.g., "93.184.216.34" for A records, "10 aspmx.l.google.com." for MX).
+    /// Only successful resolutions with non-empty answers are returned.
     pub fn resolve_batch<I, E>(
+        self: &Arc<Self>,
+        hosts: I,
+        record_type: RecordType,
+    ) -> impl stream::Stream<Item = BatchResultBasic> + Unpin + Send + 'static
+    where
+        I: Iterator<Item = Result<String, E>> + Send + 'static,
+        E: std::error::Error + Send + 'static,
+    {
+        let record_type_string = record_type.to_string();
+
+        Box::pin(
+            self.resolve_batch_full(hosts, record_type, true, true)
+                .filter_map(move |(host, result)| {
+                    let record_type_str = record_type_string.clone();
+                    async move {
+                        match result {
+                            Ok(response) => {
+                                let answers: Vec<String> = response
+                                    .answers()
+                                    .iter()
+                                    .map(|record| record.data().to_string())
+                                    .collect();
+
+                                if answers.is_empty() {
+                                    None
+                                } else {
+                                    Some((host, record_type_str, answers))
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                }),
+        )
+    }
+
+    /// Resolve a batch of hostnames with bounded concurrency and stream the full results as they complete.
+    pub fn resolve_batch_full<I, E>(
         self: &Arc<Self>,
         hosts: I,
         record_type: RecordType,
@@ -215,7 +341,7 @@ impl BlastDNSClient {
                     let client = Arc::clone(&client);
                     let label = host.clone();
                     async move {
-                        let result = client.resolve(host, record_type).await;
+                        let result = client.resolve_full(host, record_type).await;
                         (label, result)
                     }
                 })
@@ -235,48 +361,6 @@ impl BlastDNSClient {
                     }
 
                     Some((host, result))
-                }),
-        )
-    }
-
-    /// Resolve a batch of hostnames with bounded concurrency, returning simplified tuples.
-    ///
-    /// Returns (hostname, record_type, [rdata_strings]) where rdata_strings contain only
-    /// the record data (e.g., "93.184.216.34" for A records, "10 aspmx.l.google.com." for MX).
-    /// Only successful resolutions with non-empty answers are returned.
-    pub fn resolve_batch_basic<I, E>(
-        self: &Arc<Self>,
-        hosts: I,
-        record_type: RecordType,
-    ) -> impl stream::Stream<Item = BatchResultBasic> + Unpin + Send + 'static
-    where
-        I: Iterator<Item = Result<String, E>> + Send + 'static,
-        E: std::error::Error + Send + 'static,
-    {
-        let record_type_string = record_type.to_string();
-
-        Box::pin(
-            self.resolve_batch(hosts, record_type, true, true)
-                .filter_map(move |(host, result)| {
-                    let record_type_str = record_type_string.clone();
-                    async move {
-                        match result {
-                            Ok(response) => {
-                                let answers: Vec<String> = response
-                                    .answers()
-                                    .iter()
-                                    .map(|record| record.data().to_string())
-                                    .collect();
-
-                                if answers.is_empty() {
-                                    None
-                                } else {
-                                    Some((host, record_type_str, answers))
-                                }
-                            }
-                            Err(_) => None,
-                        }
-                    }
                 }),
         )
     }
@@ -450,7 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_batch_streams_results() {
+    async fn resolve_batch_full_streams_results() {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
@@ -462,7 +546,7 @@ mod tests {
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();
-        let mut stream = client.resolve_batch(
+        let mut stream = client.resolve_batch_full(
             inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
             RecordType::A,
             false,
@@ -487,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_batch_skip_empty_filters_empty_responses() {
+    async fn resolve_batch_full_skip_empty_filters_empty_responses() {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
@@ -505,7 +589,7 @@ mod tests {
         ];
 
         // First, collect results with skip_empty = false
-        let mut stream_all = client.resolve_batch(
+        let mut stream_all = client.resolve_batch_full(
             inputs
                 .clone()
                 .into_iter()
@@ -543,7 +627,7 @@ mod tests {
         );
 
         // Now test with skip_empty = true
-        let mut stream_filtered = client.resolve_batch(
+        let mut stream_filtered = client.resolve_batch_full(
             inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
             RecordType::A,
             true,
@@ -585,7 +669,7 @@ mod tests {
         );
 
         let error_inputs = vec!["example.com".to_string()];
-        let mut error_stream = bad_client.resolve_batch(
+        let mut error_stream = bad_client.resolve_batch_full(
             error_inputs
                 .into_iter()
                 .map(Ok::<_, std::convert::Infallible>),
@@ -610,7 +694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_batch_skip_errors_filters_error_responses() {
+    async fn resolve_batch_full_skip_errors_filters_error_responses() {
         let bad_resolver_config = BlastDNSConfig {
             request_timeout: Duration::from_millis(100),
             threads_per_resolver: 1,
@@ -625,7 +709,7 @@ mod tests {
         let error_inputs = vec!["example.com".to_string()];
 
         // With skip_errors=false, should get error
-        let mut stream_with_errors = bad_client.resolve_batch(
+        let mut stream_with_errors = bad_client.resolve_batch_full(
             error_inputs
                 .clone()
                 .into_iter()
@@ -646,7 +730,7 @@ mod tests {
         assert_eq!(error_count, 1, "should get error with skip_errors=false");
 
         // With skip_errors=true, should get nothing
-        let mut stream_no_errors = bad_client.resolve_batch(
+        let mut stream_no_errors = bad_client.resolve_batch_full(
             error_inputs
                 .into_iter()
                 .map(Ok::<_, std::convert::Infallible>),
@@ -666,11 +750,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_multi_rejects_empty_record_types() {
+    async fn resolve_multi_full_rejects_empty_record_types() {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let client = BlastDNSClient::new(resolvers).expect("client init");
 
-        let result = client.resolve_multi("example.com", vec![]).await;
+        let result = client.resolve_multi_full("example.com", vec![]).await;
         assert!(result.is_err());
         match result {
             Err(BlastDNSError::Configuration(msg)) => {
@@ -681,7 +765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_multi_resolves_multiple_types() {
+    async fn resolve_multi_full_resolves_multiple_types() {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
@@ -693,9 +777,9 @@ mod tests {
 
         let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::MX];
         let results = client
-            .resolve_multi("example.com", record_types.clone())
+            .resolve_multi_full("example.com", record_types.clone())
             .await
-            .expect("resolve_multi failed");
+            .expect("resolve_multi_full failed");
 
         // Verify all requested record types are in the result
         assert_eq!(results.len(), record_types.len());
@@ -708,7 +792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_multi_handles_mixed_success_failure() {
+    async fn resolve_multi_full_handles_mixed_success_failure() {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
@@ -721,9 +805,9 @@ mod tests {
         // A and AAAA should succeed for example.com, but some exotic types might not have records
         let record_types = vec![RecordType::A, RecordType::AAAA, RecordType::CAA];
         let results = client
-            .resolve_multi("example.com", record_types.clone())
+            .resolve_multi_full("example.com", record_types.clone())
             .await
-            .expect("resolve_multi failed");
+            .expect("resolve_multi_full failed");
 
         // All record types should be present in results, even if some failed
         assert_eq!(results.len(), record_types.len());
@@ -740,7 +824,134 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_batch_basic_returns_simplified_tuples() {
+    async fn resolve_returns_answer_strings() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        let answers = client
+            .resolve("example.com", RecordType::A)
+            .await
+            .expect("resolve failed");
+
+        assert!(
+            answers.len() > 1,
+            "should have multiple answers, got {}",
+            answers.len()
+        );
+
+        // Verify answer format (should be just IP addresses)
+        for answer in &answers {
+            assert!(
+                answer.parse::<std::net::IpAddr>().is_ok(),
+                "should be a valid IP address: {}",
+                answer
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_filters_successful_queries() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 2,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        let record_types = vec![RecordType::A, RecordType::AAAA];
+        let results = client
+            .resolve_multi("example.com", record_types.clone())
+            .await
+            .expect("resolve_multi failed");
+
+        // Should have results for A and AAAA (both should succeed for example.com)
+        assert!(
+            !results.is_empty(),
+            "should have at least one successful result"
+        );
+
+        // Verify A record if present
+        if let Some(answers) = results.get(&RecordType::A) {
+            assert!(
+                answers.len() > 1,
+                "A record should have multiple answers, got {}",
+                answers.len()
+            );
+            // Verify format
+            for answer in answers {
+                assert!(
+                    answer.parse::<std::net::IpAddr>().is_ok(),
+                    "should be a valid IP address: {}",
+                    answer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn format_ptr_query_handles_ipv4() {
+        assert_eq!(format_ptr_query("8.8.8.8"), "8.8.8.8.in-addr.arpa");
+        assert_eq!(format_ptr_query("192.168.1.1"), "1.1.168.192.in-addr.arpa");
+    }
+
+    #[test]
+    fn format_ptr_query_handles_ipv6() {
+        // Short form
+        assert_eq!(
+            format_ptr_query("::1"),
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
+        );
+
+        // Full form
+        assert_eq!(
+            format_ptr_query("2001:4860:4860::8888"),
+            "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"
+        );
+    }
+
+    #[test]
+    fn format_ptr_query_leaves_formatted_queries_unchanged() {
+        assert_eq!(
+            format_ptr_query("8.8.8.8.in-addr.arpa"),
+            "8.8.8.8.in-addr.arpa"
+        );
+        assert_eq!(format_ptr_query("example.com"), "example.com");
+    }
+
+    #[tokio::test]
+    async fn resolve_auto_formats_ptr_with_ipv4() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        // Pass raw IP address for PTR query
+        let answers = client
+            .resolve("8.8.8.8", RecordType::PTR)
+            .await
+            .expect("resolve failed");
+
+        assert!(!answers.is_empty(), "should have PTR answers");
+        // PTR results should be domain names
+        for answer in &answers {
+            assert!(answer.contains('.'), "PTR should return domain names");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_batch_streams_simplified_tuples() {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
@@ -752,7 +963,7 @@ mod tests {
 
         let inputs = vec!["example.com".to_string(), "example.net".to_string()];
         let expected = inputs.clone();
-        let mut stream = client.resolve_batch_basic(
+        let mut stream = client.resolve_batch(
             inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
             RecordType::A,
         );
@@ -766,15 +977,8 @@ mod tests {
                 answers.len()
             );
 
-            // Verify answer format (should be just IP addresses like "93.184.216.34")
+            // Verify answer format
             for answer in &answers {
-                // Should be a valid IP address (contains dots but not full record info)
-                assert!(answer.contains('.'), "A record should contain dots");
-                assert!(
-                    !answer.contains("IN"),
-                    "answer should not contain DNS record metadata"
-                );
-                // Parse as IP to verify it's valid
                 assert!(
                     answer.parse::<std::net::IpAddr>().is_ok(),
                     "should be a valid IP address: {}",
@@ -790,44 +994,5 @@ mod tests {
         let mut expected_sorted = expected;
         expected_sorted.sort();
         assert_eq!(seen_sorted, expected_sorted);
-    }
-
-    #[tokio::test]
-    async fn resolve_batch_basic_filters_errors_and_empty() {
-        let resolvers = vec!["127.0.0.1:5353".to_string()];
-        let config = BlastDNSConfig {
-            request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
-            max_retries: 0,
-            ..Default::default()
-        };
-
-        let client = Arc::new(BlastDNSClient::with_config(resolvers, config).expect("client init"));
-
-        // example.com will return A records, garbage subdomain won't
-        let inputs = vec![
-            "example.com".to_string(),
-            "lkgdjasldkjsdgsdgsdfahwejhori.example.com".to_string(),
-        ];
-
-        let mut stream = client.resolve_batch_basic(
-            inputs.into_iter().map(Ok::<_, std::convert::Infallible>),
-            RecordType::A,
-        );
-
-        let mut results = Vec::new();
-        while let Some((host, record_type, answers)) = stream.next().await {
-            results.push((host, record_type, answers));
-        }
-
-        // Should only get example.com (garbage domain filtered out)
-        assert_eq!(results.len(), 1, "should only get valid results");
-        assert_eq!(results[0].0, "example.com");
-        assert_eq!(results[0].1, "A");
-        assert!(
-            results[0].2.len() > 1,
-            "should have multiple answers, got {}",
-            results[0].2.len()
-        );
     }
 }
