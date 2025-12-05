@@ -141,8 +141,9 @@ class Client:
             async for host, rdtype, answers in client.resolve_batch(["example.com", "google.com"], "A"):
                 print(f"{host} ({rdtype}): {', '.join(answers)}")
         """
-        async for host, rdtype, answers in self._inner.resolve_batch(hosts, record_type):
-            yield (host, rdtype, answers)
+        async for batch in self._inner.resolve_batch(hosts, record_type):
+            for host, rdtype, answers in batch:
+                yield (host, rdtype, answers)
 
     async def resolve_batch_full(self, hosts, record_type=None, skip_empty=False, skip_errors=False):
         """Resolve multiple hostnames concurrently, yielding full results as they complete.
@@ -165,12 +166,13 @@ class Client:
                 else:
                     print(f"{host}: {len(result.response.answers)} answers")
         """
-        async for host, raw in self._inner.resolve_batch_full(hosts, record_type, skip_empty, skip_errors):
-            data = orjson.loads(raw)
-            if "error" in data:
-                yield (host, DNSError.model_validate(data))
-            else:
-                yield (host, DNSResult.model_validate({"host": host, "response": data}))
+        async for batch in self._inner.resolve_batch_full(hosts, record_type, skip_empty, skip_errors):
+            for host, raw in batch:
+                data = orjson.loads(raw)
+                if "error" in data:
+                    yield (host, DNSError.model_validate(data))
+                else:
+                    yield (host, DNSResult.model_validate({"host": host, "response": data}))
 
 
 class MockClient(Client):

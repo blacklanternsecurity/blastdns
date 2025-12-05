@@ -219,15 +219,32 @@ impl PyBatchIterator {
 
         future_into_py(py, async move {
             let mut stream = inner.lock().await;
-            match stream.next().await {
-                Some((host, result)) => {
-                    let payload = match result {
-                        Ok(response) => dns_response_to_bytes(response)?,
-                        Err(err) => error_to_bytes(err)?,
-                    };
-                    Ok((host, payload))
+            let mut batch = Vec::new();
+            
+            let batch_timeout = tokio::time::Duration::from_millis(100);
+            let deadline = tokio::time::Instant::now() + batch_timeout;
+            
+            // Collect up to 100 results or until 100ms timeout
+            for _ in 0..100 {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                
+                match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(Some((host, result))) => {
+                        let payload = match result {
+                            Ok(response) => dns_response_to_bytes(response)?,
+                            Err(err) => error_to_bytes(err)?,
+                        };
+                        batch.push((host, payload));
+                    }
+                    Ok(None) => break,  // Stream ended
+                    Err(_) => break,    // Timeout - release what we have
                 }
-                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+            }
+            
+            if batch.is_empty() {
+                Err(PyStopAsyncIteration::new_err("end of stream"))
+            } else {
+                Ok(batch)
             }
         })
     }
@@ -249,9 +266,28 @@ impl PyBatchBasicIterator {
 
         future_into_py(py, async move {
             let mut stream = inner.lock().await;
-            match stream.next().await {
-                Some((host, record_type, answers)) => Ok((host, record_type, answers)),
-                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+            let mut batch = Vec::new();
+            
+            let batch_timeout = tokio::time::Duration::from_millis(100);
+            let deadline = tokio::time::Instant::now() + batch_timeout;
+            
+            // Collect up to 100 results or until 100ms timeout
+            for _ in 0..100 {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                
+                match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(Some((host, record_type, answers))) => {
+                        batch.push((host, record_type, answers));
+                    }
+                    Ok(None) => break,  // Stream ended
+                    Err(_) => break,    // Timeout - release what we have
+                }
+            }
+            
+            if batch.is_empty() {
+                Err(PyStopAsyncIteration::new_err("end of stream"))
+            } else {
+                Ok(batch)
             }
         })
     }
