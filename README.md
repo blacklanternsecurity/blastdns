@@ -22,12 +22,12 @@ BlastDNS is the primary DNS library used by [BBOT](https://github.com/blacklante
 
 100K DNS lookups against local `dnsmasq`, with 100 workers:
 
-| Library         | Language | Time    | QPS    | Success  | Failed | vs dnspython |
-|-----------------|----------|---------|--------|----------|--------|--------------|
-| massdns         | C        | 1.687s  | 71,898 | 100,000  | 0      | 28.87x       |
-| blastdns-cli    | Rust     | 1.732s  | 64,942 | 100,000  | 0      | 26.07x       |
-| blastdns-python | Python   | 3.903s  | 25,623 | 100,000  | 0      | 10.29x       |
-| dnspython       | Python   | 40.149s | 2,491  | 100,000  | 0      | 1.00x        |
+| Library         | Language | Time    | QPS    | Success | Failed | vs dnspython |
+|-----------------|----------|---------|--------|---------|--------|--------------|
+| massdns         | C        | 1.412s  | 70,811 | 100,000 | 0      | 29.41x       |
+| blastdns-cli    | Rust     | 1.692s  | 59,114 | 100,000 | 0      | 24.55x       |
+| blastdns-python | Python   | 2.560s  | 39,068 | 100,000 | 0      | 16.23x       |
+| dnspython       | Python   | 41.531s | 2,408  | 100,000 | 0      | 1.00x        |
 
 ### CLI
 
