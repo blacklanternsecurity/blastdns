@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use blastdns::{
     BlastDNSClient, BlastDNSConfig, DEFAULT_MAX_RETRIES, DEFAULT_PURGATORY_SENTENCE,
     DEFAULT_PURGATORY_THRESHOLD, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
+    DnsResolver,
 };
 use clap::Parser;
 use futures::StreamExt;
@@ -51,6 +52,9 @@ struct Args {
     /// Don't show error responses.
     #[arg(long)]
     skip_errors: bool,
+    /// Output brief format (hostname, record type, answers only).
+    #[arg(long)]
+    brief: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -75,23 +79,40 @@ async fn main() -> Result<()> {
     };
 
     let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);
-    let mut stream = client.resolve_batch_full(
-        hosts.map(Ok::<_, std::convert::Infallible>),
-        args.record_type,
-        args.skip_empty,
-        args.skip_errors,
-    );
 
-    while let Some((host, outcome)) = stream.next().await {
-        match outcome {
-            Ok(response) => {
-                let message = response.into_message();
-                let payload = json!({ "host": host, "response": message });
-                println!("{}", to_string(&payload)?);
-            }
-            Err(err) => {
-                let payload = json!({ "host": host, "error": err.to_string() });
-                println!("{}", to_string(&payload)?);
+    if args.brief {
+        let mut stream = client.resolve_batch(
+            hosts.map(Ok::<_, std::convert::Infallible>),
+            args.record_type,
+        );
+
+        while let Some((host, record_type, answers)) = stream.next().await {
+            let payload = json!({
+                "host": host,
+                "record_type": record_type,
+                "answers": answers,
+            });
+            println!("{}", to_string(&payload)?);
+        }
+    } else {
+        let mut stream = client.resolve_batch_full(
+            hosts.map(Ok::<_, std::convert::Infallible>),
+            args.record_type,
+            args.skip_empty,
+            args.skip_errors,
+        );
+
+        while let Some((host, outcome)) = stream.next().await {
+            match outcome {
+                Ok(response) => {
+                    let message = response.into_message();
+                    let payload = json!({ "host": host, "response": message });
+                    println!("{}", to_string(&payload)?);
+                }
+                Err(err) => {
+                    let payload = json!({ "host": host, "error": err.to_string() });
+                    println!("{}", to_string(&payload)?);
+                }
             }
         }
     }

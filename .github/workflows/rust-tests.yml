@@ -50,13 +50,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.x'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
 
-      - name: Run streaming test
-        run: python tests/test-streaming.py
+      - name: Run CLI tests
+        run: uv run pytest tests/cli_tests.py -v
 
   rust-publish:
     needs: rust-tests

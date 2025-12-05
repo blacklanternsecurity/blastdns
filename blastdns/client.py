@@ -197,16 +197,13 @@ class MockClient(Client):
 
         Args:
             data: Dictionary mapping hosts to their DNS records, with optional
-                  "_NXDOMAIN" key for hosts that should return NXDOMAIN errors.
+                  "_NXDOMAIN" key for hosts that should return NXDOMAIN.
 
         Example:
             mock_client.mock_dns({
                 "example.com": {"A": ["93.184.216.34"], "AAAA": ["2606:2800:220:1:248:1893:25c8:1946"]},
                 "bad.dns": {"CNAME": ["baddns.azurewebsites.net."]},
-                "_NXDOMAIN": ["baddns.azurewebsites.net", "notfound.example.com"]
+                "_NXDOMAIN": ["notfound.example.com", "baddns.azurewebsites.net"]
             })
         """
-        import json
-
-        json_str = json.dumps(data)
-        self._inner.mock_dns(json_str)
+        self._inner.mock_dns(data)

@@ -80,6 +80,8 @@ Options:
           Don't show responses with no answers
       --skip-errors
           Don't show error responses
+      --brief
+          Output brief format (hostname, record type, answers only)
   -h, --help
           Print help
   -V, --version
@@ -271,6 +273,45 @@ for (record_type, result) in results {
 }
 ```
 
+#### MockBlastDNSClient for Testing
+
+`MockBlastDNSClient` implements the `DnsResolver` trait and provides a drop-in replacement that returns fabricated DNS responses without making real network requests.
+
+```rust
+use blastdns::{MockBlastDNSClient, DnsResolver};
+use hickory_client::proto::rr::RecordType;
+use std::collections::HashMap;
+
+// Create a mock client
+let mut mock_client = MockBlastDNSClient::new();
+
+// Configure mock responses
+let responses = HashMap::from([
+    (
+        "example.com".to_string(),
+        HashMap::from([
+            ("A".to_string(), vec!["93.184.216.34".to_string()]),
+            ("AAAA".to_string(), vec!["2606:2800:220:1:248:1893:25c8:1946".to_string()]),
+        ]),
+    ),
+]);
+
+// Hosts that should return NXDOMAIN
+let nxdomains = vec!["notfound.example.com".to_string()];
+
+mock_client.mock_dns(responses, nxdomains);
+
+// Use like any DnsResolver
+let answers = mock_client.resolve("example.com".to_string(), RecordType::A).await?;
+assert_eq!(answers, vec!["93.184.216.34"]);
+
+// NXDOMAIN hosts return empty responses
+let answers = mock_client.resolve("notfound.example.com".to_string(), RecordType::A).await?;
+assert_eq!(answers.len(), 0);
+```
+
+`MockBlastDNSClient` supports all `DnsResolver` methods including `resolve`, `resolve_full`, `resolve_batch`, `resolve_batch_full`, `resolve_multi`, and `resolve_multi_full`.
+
 ### Python API
 
 The `blastdns` Python package is a thin wrapper around the Rust library.
@@ -378,15 +419,16 @@ asyncio.run(main())
 
 #### MockClient for Testing
 
-`MockClient` provides a drop-in replacement for `Client` that returns fabricated DNS responses without making real network requests. This is useful for testing code that depends on DNS lookups.
+`MockClient` provides a drop-in replacement for `Client` that returns fabricated DNS responses without making real network requests. It implements the same interface as `Client` and is useful for testing code that depends on DNS lookups.
 
 ```python
 import pytest
-from blastdns import MockClient, DNSResult, DNSError
+from blastdns import MockClient, DNSResult
 
 
 @pytest.fixture
 def mock_client():
+    """Create a mock client with pre-configured test data."""
     client = MockClient()
     client.mock_dns({
         "example.com": {
@@ -397,33 +439,42 @@ def mock_client():
         "cname.example.com": {
             "CNAME": ["example.com."]
         },
-        "_NXDOMAIN": ["notfound.example.com"],  # hosts that return NXDOMAIN errors
+        "_NXDOMAIN": ["notfound.example.com"],  # hosts that return NXDOMAIN
     })
     return client
 
 
 @pytest.mark.asyncio
 async def test_my_function(mock_client):
-    # MockClient implements the same interface as Client
     # resolve() returns simple rdata strings
     answers = await mock_client.resolve("example.com", "A")
     assert answers == ["93.184.216.34"]
 
-    # resolve_full() returns full DNS response
+    # resolve_full() returns full DNS response structure
     result = await mock_client.resolve_full("example.com", "A")
     assert isinstance(result, DNSResult)
     assert len(result.response.answers) == 1
 
-    # Test error cases
-    result = await mock_client.resolve_full("notfound.example.com", "A")
-    assert result.response.header.response_code == "NXDomain"
+    # NXDOMAIN hosts return empty responses (not errors)
+    answers = await mock_client.resolve("notfound.example.com", "A")
+    assert len(answers) == 0
 
-    # Works with all Client methods
+    # resolve_batch() works with all mocked hosts
     async for host, rdtype, answers in mock_client.resolve_batch(["example.com"], "A"):
         print(f"{host}: {answers}")  # ["93.184.216.34"]
+
+    # resolve_multi() resolves multiple record types in parallel
+    results = await mock_client.resolve_multi("example.com", ["A", "AAAA", "MX"])
+    assert len(results) == 3
+    assert results["MX"] == ["10 aspmx.l.google.com.", "20 alt1.aspmx.l.google.com."]
 ```
 
-`MockClient` supports all the same methods as `Client` (`resolve`, `resolve_full`, `resolve_batch`, `resolve_batch_full`, `resolve_multi`, `resolve_multi_full`) and returns the same data structures.
+**Key Features:**
+- Supports all `Client` methods: `resolve`, `resolve_full`, `resolve_batch`, `resolve_batch_full`, `resolve_multi`, `resolve_multi_full`
+- Returns the same data structures as `Client` for drop-in compatibility
+- NXDOMAIN hosts (specified in `_NXDOMAIN` list) return empty responses, not errors
+- Unmocked hosts also return empty responses
+- Auto-formats PTR queries (IP addresses → reverse DNS format) just like the real client
 
 #### Response Models
 
@@ -459,7 +510,23 @@ This architecture ensures maximum accuracy even with a mixed pool of reliable an
 
 ## Testing
 
-To run the full test suite including integration tests, you'll need a local DNS server running on `127.0.0.1:5353` and `[::1]:5353`.
+BlastDNS has two types of tests:
+
+### Unit Tests (No DNS Server Required)
+
+Unit tests use `MockBlastDNSClient` (Rust) or `MockClient` (Python) and run without any external dependencies:
+
+```bash
+# Rust unit tests
+cargo test
+
+# Python unit tests
+uv run pytest
+```
+
+### Integration Tests (Require DNS Server)
+
+Integration tests verify real DNS resolution against a local `dnsmasq` server running on `127.0.0.1:5353` and `[::1]:5353`.
 
 Install `dnsmasq`:
 
@@ -473,14 +540,14 @@ Start the test DNS server:
 sudo ./scripts/start-test-dns.sh
 ```
 
-Then run tests with:
+Run integration tests:
 
 ```bash
-# rust tests
+# Rust integration tests (marked with #[ignore])
 cargo test -- --ignored
 
-# python tests
-uv run pytest
+# Python integration tests with real DNS
+uv run pytest -k "not mock"
 ```
 
 When done, stop the test DNS server:

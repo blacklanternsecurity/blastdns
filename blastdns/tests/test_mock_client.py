@@ -1,7 +1,7 @@
 import pytest
 
 from blastdns.client import Client, MockClient
-from blastdns.models import DNSResult, DNSError
+from blastdns.models import DNSResult
 
 
 @pytest.fixture
@@ -86,29 +86,48 @@ async def test_resolve_batch(mock_client):
 
 @pytest.mark.asyncio
 async def test_resolve_batch_full(mock_client):
-    """Test resolve_batch_full with multiple hosts and filtering options."""
+    """Test resolve_batch_full with multiple hosts."""
     # Basic batch resolution with full results
     results = [r async for r in mock_client.resolve_batch_full(["example.com", "notfound.example.com"], "A")]
     host_map = {host: result for host, result in results}
     assert isinstance(host_map["example.com"], DNSResult)
-    assert isinstance(host_map["notfound.example.com"], DNSError)
+    # NXDOMAIN returns empty response, not error (matches real client behavior)
+    assert isinstance(host_map["notfound.example.com"], DNSResult)
+    assert len(host_map["notfound.example.com"].response.answers) == 0
 
-    # Test skip_empty
-    results = [
-        r
-        async for r in mock_client.resolve_batch_full(
-            ["example.com", "unknown.example.com", "cname.example.com"], "CNAME", skip_empty=True
-        )
-    ]
-    assert len(results) == 1
-    assert results[0][0] == "cname.example.com"
 
-    # Test skip_errors
-    results = [
-        r async for r in mock_client.resolve_batch_full(["example.com", "notfound.example.com"], "A", skip_errors=True)
-    ]
-    assert len(results) == 1
-    assert results[0][0] == "example.com"
+@pytest.mark.asyncio
+async def test_resolve_batch_full_skip_empty_filters_empty_responses(mock_client):
+    """Test that skip_empty filters out empty responses (like NXDOMAIN)."""
+    hosts = ["example.com", "notfound.example.com"]
+
+    # With skip_empty=False, should get both results
+    all_results = {}
+    async for host, result in mock_client.resolve_batch_full(hosts, "A", skip_empty=False):
+        all_results[host] = result
+
+    assert len(all_results) == 2, "should get both results with skip_empty=False"
+
+    # example.com should have answers
+    example_result = all_results["example.com"]
+    assert isinstance(example_result, DNSResult)
+    assert len(example_result.response.answers) > 0
+
+    # notfound.example.com should have empty answers (NXDOMAIN)
+    notfound_result = all_results["notfound.example.com"]
+    assert isinstance(notfound_result, DNSResult)
+    assert len(notfound_result.response.answers) == 0, "NXDOMAIN should have no answers"
+
+    # With skip_empty=True, should only get example.com
+    filtered_results = {}
+    async for host, result in mock_client.resolve_batch_full(hosts, "A", skip_empty=True):
+        filtered_results[host] = result
+
+    assert len(filtered_results) == 1, "should only get one result with skip_empty=True"
+    assert "example.com" in filtered_results
+    example_filtered = filtered_results["example.com"]
+    assert isinstance(example_filtered, DNSResult)
+    assert len(example_filtered.response.answers) > 0
 
 
 @pytest.mark.asyncio
