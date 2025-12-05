@@ -50,13 +50,21 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.x'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
 
-      - name: Run streaming test
-        run: python tests/test-streaming.py
+      - name: Install dnsmasq
+        run: sudo apt-get update && sudo apt-get install -y dnsmasq
+
+      - name: Start test DNS server
+        run: sudo ./scripts/start-test-dns.sh
+
+      - name: Run CLI tests
+        run: uv run pytest tests/cli_tests.py -v
+
+      - name: Stop test DNS server
+        if: always()
+        run: sudo ./scripts/stop-test-dns.sh || true
 
   rust-publish:
     needs: rust-tests
