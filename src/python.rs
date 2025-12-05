@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::client::{BatchResult, BatchResultBasic, BlastDNSClient};
 use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
 use crate::error::BlastDNSError;
+use crate::mock::MockBlastDNSClient;
 
 #[pyclass(name = "Client")]
 pub struct PyBlastDNSClient {
@@ -310,9 +311,137 @@ impl From<BlastDNSError> for PyErr {
     }
 }
 
+#[pyclass(name = "MockClient")]
+pub struct PyMockBlastDNSClient {
+    inner: MockBlastDNSClient,
+}
+
+#[pymethods]
+impl PyMockBlastDNSClient {
+    #[new]
+    fn new() -> Self {
+        PyMockBlastDNSClient {
+            inner: MockBlastDNSClient::new(),
+        }
+    }
+
+    fn mock_dns(&mut self, json_str: String) -> PyResult<()> {
+        self.inner
+            .mock_dns_json(&json_str)
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    #[pyo3(signature = (host, record_type = None))]
+    fn resolve<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let record_type = parse_record_type(record_type)?;
+
+        future_into_py(py, async move {
+            let answers = inner
+                .resolve(host, record_type)
+                .await
+                .map_err(PyErr::from)?;
+            Ok(answers)
+        })
+    }
+
+    #[pyo3(signature = (host, record_type = None))]
+    fn resolve_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let record_type = parse_record_type(record_type)?;
+
+        future_into_py(py, async move {
+            let response = inner
+                .resolve_full(host, record_type)
+                .await
+                .map_err(PyErr::from)?;
+            dns_response_to_bytes(response)
+        })
+    }
+
+    fn resolve_multi<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = inner
+                .resolve_multi(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
+            // Convert HashMap<RecordType, Vec<String>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, answers) in results {
+                    let key = record_type.to_string();
+                    dict.set_item(key, answers)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
+    fn resolve_multi_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = inner
+                .resolve_multi_full(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
+            // Convert HashMap<RecordType, Result<DnsResponse, BlastDNSError>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, result) in results {
+                    let key = record_type.to_string();
+                    let value = match result {
+                        Ok(response) => dns_response_to_bytes(response)?,
+                        Err(err) => error_to_bytes(err)?,
+                    };
+                    dict.set_item(key, value)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+}
+
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
+    m.add_class::<PyMockBlastDNSClient>()?;
     Ok(())
 }
 

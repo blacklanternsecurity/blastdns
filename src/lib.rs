@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod error;
+mod mock;
 // Only compile Python bindings when "python" feature is enabled or running tests
 #[cfg(any(feature = "python", test))]
 mod python;
@@ -13,4 +14,5 @@ pub use config::{
     DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
 };
 pub use error::BlastDNSError;
+pub use mock::MockBlastDNSClient;
 pub use utils::check_ulimits;

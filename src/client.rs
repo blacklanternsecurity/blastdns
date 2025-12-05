@@ -47,7 +47,7 @@ pub type BatchResultBasic = (String, String, Vec<String>);
 /// Format an IP address for PTR lookup.
 /// IPv4: "8.8.8.8" -> "8.8.8.8.in-addr.arpa"
 /// IPv6: "2001:4860:4860::8888" -> (expanded, reversed nibbles).ip6.arpa
-fn format_ptr_query(host: &str) -> String {
+pub fn format_ptr_query(host: &str) -> String {
     // Try to parse as IP address
     if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
