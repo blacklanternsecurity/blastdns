@@ -3,7 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use futures::stream::{Stream, StreamExt};
-use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
+use hickory_client::proto::rr::RecordType;
+use hickory_client::proto::xfer::DnsResponse;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyIterator};
@@ -13,6 +14,8 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::client::{BatchResult, BatchResultBasic, BlastDNSClient};
 use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
 use crate::error::BlastDNSError;
+use crate::mock::MockBlastDNSClient;
+use crate::resolver::DnsResolver;
 
 #[pyclass(name = "Client")]
 pub struct PyBlastDNSClient {
@@ -51,8 +54,27 @@ impl PyBlastDNSClient {
         let record_type = parse_record_type(record_type)?;
 
         future_into_py(py, async move {
-            let response = client
+            let answers = client
                 .resolve(host, record_type)
+                .await
+                .map_err(PyErr::from)?;
+            Ok(answers)
+        })
+    }
+
+    #[pyo3(signature = (host, record_type = None))]
+    fn resolve_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let record_type = parse_record_type(record_type)?;
+
+        future_into_py(py, async move {
+            let response = client
+                .resolve_full(host, record_type)
                 .await
                 .map_err(PyErr::from)?;
             dns_response_to_bytes(response)
@@ -79,6 +101,38 @@ impl PyBlastDNSClient {
                 .await
                 .map_err(PyErr::from)?;
 
+            // Convert HashMap<RecordType, Vec<String>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, answers) in results {
+                    let key = record_type.to_string();
+                    dict.set_item(key, answers)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
+    fn resolve_multi_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = client
+                .resolve_multi_full(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
             // Convert HashMap<RecordType, Result<DnsResponse, BlastDNSError>> to Python dict
             Python::attach(|py| {
                 let dict = pyo3::types::PyDict::new(py);
@@ -95,8 +149,32 @@ impl PyBlastDNSClient {
         })
     }
 
-    #[pyo3(signature = (hosts, record_type = None, skip_empty = false, skip_errors = false))]
+    #[pyo3(signature = (hosts, record_type = None))]
     fn resolve_batch(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+    ) -> PyResult<PyBatchBasicIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch (returns simplified results)
+        let result_stream = self.inner.clone().resolve_batch(rust_iter, record_type);
+
+        Ok(PyBatchBasicIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
+        })
+    }
+
+    #[pyo3(signature = (hosts, record_type = None, skip_empty = false, skip_errors = false))]
+    fn resolve_batch_full(
         &self,
         hosts: Py<PyAny>,
         record_type: Option<&str>,
@@ -113,36 +191,13 @@ impl PyBlastDNSClient {
 
         let rust_iter = PythonHostIterator::new(py_iter);
 
-        // Call Rust resolve_batch (it handles spawn_blocking internally)
+        // Call Rust resolve_batch_full (it handles spawn_blocking internally)
         let result_stream =
             self.inner
-                .resolve_batch(rust_iter, record_type, skip_empty, skip_errors);
+                .clone()
+                .resolve_batch_full(rust_iter, record_type, skip_empty, skip_errors);
 
         Ok(PyBatchIterator {
-            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
-        })
-    }
-
-    #[pyo3(signature = (hosts, record_type = None))]
-    fn resolve_batch_basic(
-        &self,
-        hosts: Py<PyAny>,
-        record_type: Option<&str>,
-    ) -> PyResult<PyBatchBasicIterator> {
-        let record_type = parse_record_type(record_type)?;
-
-        // Convert Python iterable to Rust iterator
-        let py_iter = Python::attach(|py| {
-            let bound = hosts.bind(py);
-            bound.try_iter().map(|i| i.unbind())
-        })?;
-
-        let rust_iter = PythonHostIterator::new(py_iter);
-
-        // Call Rust resolve_batch_basic
-        let result_stream = self.inner.resolve_batch_basic(rust_iter, record_type);
-
-        Ok(PyBatchBasicIterator {
             inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
         })
     }
@@ -259,9 +314,213 @@ impl From<BlastDNSError> for PyErr {
     }
 }
 
+#[pyclass(name = "MockClient")]
+pub struct PyMockBlastDNSClient {
+    inner: Arc<MockBlastDNSClient>,
+}
+
+#[pymethods]
+impl PyMockBlastDNSClient {
+    #[new]
+    fn new() -> Self {
+        PyMockBlastDNSClient {
+            inner: Arc::new(MockBlastDNSClient::new()),
+        }
+    }
+
+    fn mock_dns(&mut self, data: Bound<'_, PyAny>) -> PyResult<()> {
+        use std::collections::HashMap;
+
+        let client = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            PyRuntimeError::new_err("Cannot modify mock client with outstanding references")
+        })?;
+
+        let dict = data
+            .cast::<pyo3::types::PyDict>()
+            .map_err(|_| PyValueError::new_err("expected dict"))?;
+
+        let mut responses: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut nxdomains: Vec<String> = Vec::new();
+
+        for (key, value) in dict.iter() {
+            let key_str: String = key.extract()?;
+
+            if key_str == "_NXDOMAIN" {
+                nxdomains = value.extract()?;
+            } else {
+                let host_records: HashMap<String, Vec<String>> = value.extract()?;
+                responses.insert(key_str, host_records);
+            }
+        }
+
+        client.mock_dns(responses, nxdomains);
+        Ok(())
+    }
+
+    #[pyo3(signature = (host, record_type = None))]
+    fn resolve<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let record_type = parse_record_type(record_type)?;
+
+        future_into_py(py, async move {
+            let answers = inner
+                .resolve(host, record_type)
+                .await
+                .map_err(PyErr::from)?;
+            Ok(answers)
+        })
+    }
+
+    #[pyo3(signature = (host, record_type = None))]
+    fn resolve_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let record_type = parse_record_type(record_type)?;
+
+        future_into_py(py, async move {
+            let response = inner
+                .resolve_full(host, record_type)
+                .await
+                .map_err(PyErr::from)?;
+            dns_response_to_bytes(response)
+        })
+    }
+
+    fn resolve_multi<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = inner
+                .resolve_multi(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
+            // Convert HashMap<RecordType, Vec<String>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, answers) in results {
+                    let key = record_type.to_string();
+                    dict.set_item(key, answers)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
+    fn resolve_multi_full<'py>(
+        &self,
+        py: Python<'py>,
+        host: String,
+        record_types: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+
+        let parsed_types: Result<Vec<RecordType>, PyErr> = record_types
+            .iter()
+            .map(|rt| parse_record_type(Some(rt.as_str())))
+            .collect();
+        let parsed_types = parsed_types?;
+
+        future_into_py(py, async move {
+            let results = inner
+                .resolve_multi_full(host, parsed_types.clone())
+                .await
+                .map_err(PyErr::from)?;
+
+            // Convert HashMap<RecordType, Result<DnsResponse, BlastDNSError>> to Python dict
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (record_type, result) in results {
+                    let key = record_type.to_string();
+                    let value = match result {
+                        Ok(response) => dns_response_to_bytes(response)?,
+                        Err(err) => error_to_bytes(err)?,
+                    };
+                    dict.set_item(key, value)?;
+                }
+                Ok(dict.unbind())
+            })
+        })
+    }
+
+    #[pyo3(signature = (hosts, record_type = None))]
+    fn resolve_batch(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+    ) -> PyResult<PyBatchBasicIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch (returns simplified results)
+        let result_stream = self.inner.clone().resolve_batch(rust_iter, record_type);
+
+        Ok(PyBatchBasicIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
+        })
+    }
+
+    #[pyo3(signature = (hosts, record_type = None, skip_empty = false, skip_errors = false))]
+    fn resolve_batch_full(
+        &self,
+        hosts: Py<PyAny>,
+        record_type: Option<&str>,
+        skip_empty: bool,
+        skip_errors: bool,
+    ) -> PyResult<PyBatchIterator> {
+        let record_type = parse_record_type(record_type)?;
+
+        // Convert Python iterable to Rust iterator
+        let py_iter = Python::attach(|py| {
+            let bound = hosts.bind(py);
+            bound.try_iter().map(|i| i.unbind())
+        })?;
+
+        let rust_iter = PythonHostIterator::new(py_iter);
+
+        // Call Rust resolve_batch_full (it handles spawn_blocking internally)
+        let result_stream =
+            self.inner
+                .clone()
+                .resolve_batch_full(rust_iter, record_type, skip_empty, skip_errors);
+
+        Ok(PyBatchIterator {
+            inner: Arc::new(TokioMutex::new(Box::pin(result_stream))),
+        })
+    }
+}
+
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
+    m.add_class::<PyMockBlastDNSClient>()?;
     Ok(())
 }
 

@@ -103,3 +103,76 @@ pub fn check_ulimits(
 
     Ok(())
 }
+
+/// Format an IP address for PTR lookup.
+/// IPv4: "8.8.8.8" -> "8.8.8.8.in-addr.arpa"
+/// IPv6: "2001:4860:4860::8888" -> (expanded, reversed nibbles).ip6.arpa
+pub fn format_ptr_query(host: &str) -> String {
+    // Try to parse as IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                format!(
+                    "{}.{}.{}.{}.in-addr.arpa",
+                    octets[3], octets[2], octets[1], octets[0]
+                )
+            }
+            IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                let mut nibbles = Vec::new();
+
+                // Convert each segment to nibbles (4 hex digits)
+                for segment in segments.iter() {
+                    nibbles.push((segment >> 12) & 0xF);
+                    nibbles.push((segment >> 8) & 0xF);
+                    nibbles.push((segment >> 4) & 0xF);
+                    nibbles.push(segment & 0xF);
+                }
+
+                // Reverse and join with dots
+                nibbles.reverse();
+                let reversed: Vec<String> = nibbles.iter().map(|n| format!("{:x}", n)).collect();
+                format!("{}.ip6.arpa", reversed.join("."))
+            }
+        }
+    } else {
+        // Not an IP address, return as-is
+        host.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_ptr_query_handles_ipv4() {
+        assert_eq!(format_ptr_query("8.8.8.8"), "8.8.8.8.in-addr.arpa");
+        assert_eq!(format_ptr_query("192.168.1.1"), "1.1.168.192.in-addr.arpa");
+    }
+
+    #[test]
+    fn format_ptr_query_handles_ipv6() {
+        // Short form
+        assert_eq!(
+            format_ptr_query("::1"),
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
+        );
+
+        // Full form
+        assert_eq!(
+            format_ptr_query("2001:4860:4860::8888"),
+            "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"
+        );
+    }
+
+    #[test]
+    fn format_ptr_query_leaves_formatted_queries_unchanged() {
+        assert_eq!(
+            format_ptr_query("8.8.8.8.in-addr.arpa"),
+            "8.8.8.8.in-addr.arpa"
+        );
+        assert_eq!(format_ptr_query("example.com"), "example.com");
+    }
+}
