@@ -76,6 +76,9 @@ async fn main() -> Result<()> {
         max_retries: args.retries,
         purgatory_threshold: args.purgatory_threshold,
         purgatory_sentence: Duration::from_millis(args.purgatory_sentence_ms),
+        cache_capacity: 0, // Disable caching by default for CLI
+        cache_min_ttl: Duration::from_secs(10),
+        cache_max_ttl: Duration::from_secs(86400),
     };
 
     let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);
