@@ -209,21 +209,10 @@ async def test_client_resolve_multi_filters_successful_queries():
     # Request common types that should succeed and potentially one that might not have records
     results = await client.resolve_multi("example.com", ["A", "AAAA", "CAA"])
 
-    # Only successful record types with answers should be present in results
-    assert isinstance(results, dict)
-    # A should definitely succeed
-    assert "A" in results
-    assert isinstance(results["A"], list)
-    assert len(results["A"]) > 0
+    assert set(results) == {"A", "AAAA"}
 
-    # AAAA should also succeed for example.com
-    assert "AAAA" in results
-    assert len(results["AAAA"]) > 0
-
-    # All returned values should be lists of strings
-    for record_type, answers in results.items():
-        assert isinstance(answers, list)
-        assert all(isinstance(answer, str) for answer in answers)
+    assert results["A"] and all(isinstance(answer, str) for answer in results["A"]), "A should have answers"
+    assert results["AAAA"] and all(isinstance(answer, str) for answer in results["AAAA"]), "AAAA should have answers"
 
 
 @pytest.mark.asyncio
