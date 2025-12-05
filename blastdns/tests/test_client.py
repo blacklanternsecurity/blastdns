@@ -291,18 +291,20 @@ async def test_client_resolve_batch_with_mx_records():
     async for host, rdtype, answers in client.resolve_batch(hosts, "MX"):
         results.append((host, rdtype, answers))
 
-    # Should get results if MX records exist
-    if len(results) > 0:
-        assert results[0][0] == "gmail.com"
-        assert results[0][1] == "MX"
-        # MX answers should be just the rdata (e.g., "10 aspmx.l.google.com.")
-        for answer in results[0][2]:
-            assert isinstance(answer, str), "answer should be a string"
-            # MX rdata format is "preference mailserver"
-            parts = answer.split(None, 1)
-            assert len(parts) == 2, "MX should have preference and server"
-            assert parts[0].isdigit(), "first part should be preference number"
-            assert "." in parts[1], "second part should be mail server domain"
+    # Should get MX results for gmail.com
+    assert len(results) == 1, "should get exactly one result for gmail.com"
+    assert results[0][0] == "gmail.com"
+    assert results[0][1] == "MX"
+    assert len(results[0][2]) > 0, "gmail.com should have MX records"
+
+    # MX answers should be just the rdata (e.g., "10 aspmx.l.google.com.")
+    for answer in results[0][2]:
+        assert isinstance(answer, str), "answer should be a string"
+        # MX rdata format is "preference mailserver"
+        parts = answer.split(None, 1)
+        assert len(parts) == 2, "MX should have preference and server"
+        assert parts[0].isdigit(), "first part should be preference number"
+        assert "." in parts[1], "second part should be mail server domain"
 
 
 @pytest.mark.asyncio

@@ -781,13 +781,21 @@ mod tests {
             .await
             .expect("resolve_multi_full failed");
 
-        // Verify all requested record types are in the result
+        // Verify all requested record types are in the result and succeeded
         assert_eq!(results.len(), record_types.len());
-        for record_type in record_types {
-            assert!(
-                results.contains_key(&record_type),
-                "missing result for {record_type}"
-            );
+        for record_type in &record_types {
+            let result = results
+                .get(record_type)
+                .unwrap_or_else(|| panic!("missing result for {record_type}"));
+            match result {
+                Ok(response) => {
+                    assert!(
+                        !response.answers().is_empty(),
+                        "{record_type} query should have answers"
+                    );
+                }
+                Err(e) => panic!("{record_type} query should succeed, got error: {e:?}"),
+            }
         }
     }
 
@@ -813,13 +821,31 @@ mod tests {
         assert_eq!(results.len(), record_types.len());
 
         // A should succeed
-        if let Some(Ok(response)) = results.get(&RecordType::A) {
-            assert!(
-                !response.answers().is_empty(),
-                "A record should have answers"
-            );
-        } else {
-            panic!("A record query should succeed");
+        let a_result = results
+            .get(&RecordType::A)
+            .expect("A record must be present in results");
+        match a_result {
+            Ok(response) => {
+                assert!(
+                    !response.answers().is_empty(),
+                    "A record should have answers"
+                );
+            }
+            Err(e) => panic!("A record query should succeed, got error: {e:?}"),
+        }
+
+        // AAAA should also succeed
+        let aaaa_result = results
+            .get(&RecordType::AAAA)
+            .expect("AAAA record must be present in results");
+        match aaaa_result {
+            Ok(response) => {
+                assert!(
+                    !response.answers().is_empty(),
+                    "AAAA record should have answers"
+                );
+            }
+            Err(e) => panic!("AAAA record query should succeed, got error: {e:?}"),
         }
     }
 
@@ -873,26 +899,46 @@ mod tests {
             .expect("resolve_multi failed");
 
         // Should have results for A and AAAA (both should succeed for example.com)
-        assert!(
-            !results.is_empty(),
-            "should have at least one successful result"
+        assert_eq!(
+            results.len(),
+            2,
+            "should have exactly 2 record types (A and AAAA)"
         );
 
-        // Verify A record if present
-        if let Some(answers) = results.get(&RecordType::A) {
+        // Verify A record is present
+        let a_answers = results
+            .get(&RecordType::A)
+            .expect("A record must be present in results");
+        assert!(
+            a_answers.len() > 1,
+            "A record should have multiple answers, got {}",
+            a_answers.len()
+        );
+        // Verify A record format
+        for answer in a_answers {
             assert!(
-                answers.len() > 1,
-                "A record should have multiple answers, got {}",
-                answers.len()
+                answer.parse::<std::net::IpAddr>().is_ok(),
+                "should be a valid IP address: {}",
+                answer
             );
-            // Verify format
-            for answer in answers {
-                assert!(
-                    answer.parse::<std::net::IpAddr>().is_ok(),
-                    "should be a valid IP address: {}",
-                    answer
-                );
-            }
+        }
+
+        // Verify AAAA record is present
+        let aaaa_answers = results
+            .get(&RecordType::AAAA)
+            .expect("AAAA record must be present in results");
+        assert!(
+            aaaa_answers.len() > 1,
+            "AAAA record should have multiple answers, got {}",
+            aaaa_answers.len()
+        );
+        // Verify AAAA record format
+        for answer in aaaa_answers {
+            assert!(
+                answer.parse::<std::net::IpAddr>().is_ok(),
+                "should be a valid IPv6 address: {}",
+                answer
+            );
         }
     }
 

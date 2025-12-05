@@ -100,15 +100,15 @@ async def benchmark_dnspython(hostnames, num_workers, nameserver):
 
 
 async def benchmark_blastdns(hostnames, num_workers, nameserver):
-    """Benchmark blastdns with resolve_batch_basic."""
+    """Benchmark blastdns with resolve_batch."""
     client = Client([nameserver], config=None)
 
     start_time = time.perf_counter()
 
     success_count = 0
-    # resolve_batch_basic automatically filters errors and empty responses,
+    # resolve_batch automatically filters errors and empty responses,
     # so we count total queries vs what we got back
-    async for host, rdtype, answers in client.resolve_batch_basic(hostnames, "A"):
+    async for host, rdtype, answers in client.resolve_batch(hostnames, "A"):
         success_count += 1
 
     total_time = time.perf_counter() - start_time
