@@ -1,14 +1,12 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
 use hickory_client::proto::{op::Query, rr::RecordType, xfer::DnsResponse};
-use hickory_resolver::dns_lru::{DnsLru, TtlConfig};
 use tokio::sync::{OnceCell, oneshot};
 use tracing::debug;
 
 use crate::{
+    cache::SimpleCache,
     config::BlastDNSConfig,
     error::BlastDNSError,
     resolver::DnsResolver,
@@ -25,7 +23,7 @@ pub struct BlastDNSClient {
     config: BlastDNSConfig,
     queue_capacity: usize,
     workers_spawned: OnceCell<()>,
-    cache: Option<Arc<DnsLru>>,
+    cache: Option<Arc<SimpleCache>>,
 }
 
 impl std::fmt::Debug for BlastDNSClient {
@@ -76,20 +74,13 @@ impl BlastDNSClient {
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
         // Initialize cache if capacity > 0
-        let cache = if config.cache_capacity > 0 {
-            let ttl_config = TtlConfig::new(
-                Some(config.cache_min_ttl),
-                None, // We don't cache negative responses
-                Some(config.cache_max_ttl),
-                None,
-            );
-            Some(Arc::new(DnsLru::new(
-                config.cache_capacity as usize,
-                ttl_config,
-            )))
-        } else {
-            None
-        };
+        let cache = (config.cache_capacity > 0).then(|| {
+            Arc::new(SimpleCache::new(
+                config.cache_capacity,
+                config.cache_min_ttl,
+                config.cache_max_ttl,
+            ))
+        });
 
         Ok(Self {
             resolvers: parsed,
@@ -130,20 +121,9 @@ impl BlastDNSClient {
             if let Ok(name) = host.parse() {
                 let query = Query::query(name, record_type);
 
-                if let Some(Ok(lookup)) = cache.get(&query, Instant::now()) {
-                    // Convert Lookup back to DnsResponse
-                    // Lookup contains records, we need to build a response
-                    let mut message = hickory_client::proto::op::Message::new();
-                    message.set_id(0);
-                    message.add_query(query.clone());
-                    for record in lookup.records() {
-                        message.add_answer(record.clone());
-                    }
-
-                    if let Ok(response) = DnsResponse::from_message(message) {
-                        debug!(host, %record_type, "cache hit");
-                        return Ok(response);
-                    }
+                if let Some(response) = cache.get(&query, Instant::now()) {
+                    debug!(host, %record_type, "cache hit");
+                    return Ok(response.as_ref().clone());
                 }
             }
         }
@@ -188,8 +168,7 @@ impl BlastDNSClient {
                         && let Ok(name) = host.parse()
                     {
                         let query = Query::query(name, record_type);
-                        // Insert records into cache
-                        cache.insert_records(query, resp.answers().iter().cloned(), Instant::now());
+                        cache.insert(query, resp.clone(), Instant::now());
                         debug!(host, %record_type, "cached response");
                     }
                     return Ok(resp);
@@ -248,7 +227,8 @@ mod tests {
 
     use crossfire::mpmc;
     use futures::StreamExt;
-    use hickory_client::proto::rr::RecordType;
+    use hickory_client::proto::op::Query;
+    use hickory_client::proto::rr::{Name, RecordType};
     use tokio::sync::oneshot;
 
     use crate::utils::parse_resolver;
@@ -903,10 +883,23 @@ mod tests {
 
         let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
 
+        let host = "example.com".to_string();
+        let name: Name = host.parse().unwrap();
+        let query = Query::query(name.clone(), RecordType::A);
+        let cache = client
+            .cache
+            .as_ref()
+            .expect("cache should be present")
+            .clone();
+        assert!(
+            !cache.contains(&query, Instant::now()),
+            "cache should start empty"
+        );
+
         // First request - should hit DNS
         let start = std::time::Instant::now();
         let first_result = client
-            .resolve_full("example.com".to_string(), RecordType::A)
+            .resolve_full(host.clone(), RecordType::A)
             .await
             .expect("first resolve failed");
         let first_duration = start.elapsed();
@@ -926,12 +919,14 @@ mod tests {
             "should have cached answers"
         );
 
-        // Cache hit should be faster
+        // Cache should contain the entry after the first request and still on the second.
+        assert!(
+            cache.contains(&query, Instant::now()),
+            "cache should hold entry"
+        );
         assert!(
             second_duration < first_duration,
-            "cached lookup should be faster: first={:?}, second={:?}",
-            first_duration,
-            second_duration
+            "cached lookup should be faster"
         );
     }
 

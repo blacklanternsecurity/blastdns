@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::stream::{Stream, StreamExt};
 use hickory_client::proto::rr::RecordType;
@@ -10,6 +11,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyIterator};
 use pyo3_async_runtimes::tokio::future_into_py;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time::Instant;
 
 use crate::client::{BatchResult, BatchResultBasic, BlastDNSClient};
 use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
@@ -219,15 +221,32 @@ impl PyBatchIterator {
 
         future_into_py(py, async move {
             let mut stream = inner.lock().await;
-            match stream.next().await {
-                Some((host, result)) => {
-                    let payload = match result {
-                        Ok(response) => dns_response_to_bytes(response)?,
-                        Err(err) => error_to_bytes(err)?,
-                    };
-                    Ok((host, payload))
+            let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+            let start = Instant::now();
+            let timeout = Duration::from_millis(200);
+
+            loop {
+                // Check if we should send the batch
+                if batch.len() >= 1000 || (!batch.is_empty() && start.elapsed() >= timeout) {
+                    return Ok(batch);
                 }
-                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+
+                match stream.next().await {
+                    Some((host, result)) => {
+                        let payload = match result {
+                            Ok(response) => dns_response_to_bytes(response)?,
+                            Err(err) => error_to_bytes(err)?,
+                        };
+                        batch.push((host, payload));
+                    }
+                    None => {
+                        if batch.is_empty() {
+                            return Err(PyStopAsyncIteration::new_err("end of stream"));
+                        } else {
+                            return Ok(batch);
+                        }
+                    }
+                }
             }
         })
     }
@@ -249,9 +268,28 @@ impl PyBatchBasicIterator {
 
         future_into_py(py, async move {
             let mut stream = inner.lock().await;
-            match stream.next().await {
-                Some((host, record_type, answers)) => Ok((host, record_type, answers)),
-                None => Err(PyStopAsyncIteration::new_err("end of stream")),
+            let mut batch: Vec<(String, String, Vec<String>)> = Vec::new();
+            let start = Instant::now();
+            let timeout = Duration::from_millis(200);
+
+            loop {
+                // Check if we should send the batch
+                if batch.len() >= 1000 || (!batch.is_empty() && start.elapsed() >= timeout) {
+                    return Ok(batch);
+                }
+
+                match stream.next().await {
+                    Some((host, record_type, answers)) => {
+                        batch.push((host, record_type, answers));
+                    }
+                    None => {
+                        if batch.is_empty() {
+                            return Err(PyStopAsyncIteration::new_err("end of stream"));
+                        } else {
+                            return Ok(batch);
+                        }
+                    }
+                }
             }
         })
     }

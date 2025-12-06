@@ -9,7 +9,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use blastdns::{
-    BlastDNSClient, BlastDNSConfig, DEFAULT_MAX_RETRIES, DEFAULT_PURGATORY_SENTENCE,
+    BlastDNSClient, BlastDNSConfig, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_MAX_TTL,
+    DEFAULT_CACHE_MIN_TTL, DEFAULT_MAX_RETRIES, DEFAULT_PURGATORY_SENTENCE,
     DEFAULT_PURGATORY_THRESHOLD, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
     DnsResolver,
 };
@@ -20,7 +21,7 @@ use serde_json::{json, to_string};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "BlastDNS - Async DNS spray client", long_about = None)]
+#[command(author, version, about = "BlastDNS - Ultra-fast DNS Resolver written in Rust", long_about = None)]
 struct Args {
     /// File containing hostnames to resolve (one per line). Reads from stdin if not specified.
     #[arg(value_name = "HOSTS_TO_RESOLVE")]
@@ -55,6 +56,9 @@ struct Args {
     /// Output brief format (hostname, record type, answers only).
     #[arg(long)]
     brief: bool,
+    /// DNS cache capacity (0 = disabled).
+    #[arg(long, default_value_t = DEFAULT_CACHE_CAPACITY)]
+    cache_capacity: usize,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -76,9 +80,9 @@ async fn main() -> Result<()> {
         max_retries: args.retries,
         purgatory_threshold: args.purgatory_threshold,
         purgatory_sentence: Duration::from_millis(args.purgatory_sentence_ms),
-        cache_capacity: 0, // Disable caching by default for CLI
-        cache_min_ttl: Duration::from_secs(10),
-        cache_max_ttl: Duration::from_secs(86400),
+        cache_capacity: args.cache_capacity,
+        cache_min_ttl: DEFAULT_CACHE_MIN_TTL,
+        cache_max_ttl: DEFAULT_CACHE_MAX_TTL,
     };
 
     let client = Arc::new(BlastDNSClient::with_config(resolvers, config)?);

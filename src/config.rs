@@ -12,10 +12,10 @@ pub const DEFAULT_MAX_RETRIES: usize = 10;
 pub const DEFAULT_PURGATORY_THRESHOLD: usize = 10;
 /// Default purgatory sentence duration.
 pub const DEFAULT_PURGATORY_SENTENCE: Duration = Duration::from_millis(1000);
-/// Default cache capacity (number of entries). 0 = disabled.
-pub const DEFAULT_CACHE_CAPACITY: u64 = 10000;
+/// Default cache capacity (0 = disabled).
+pub const DEFAULT_CACHE_CAPACITY: usize = 10000;
 /// Default minimum TTL for cached entries.
-pub const DEFAULT_CACHE_MIN_TTL: Duration = Duration::from_secs(10);
+pub const DEFAULT_CACHE_MIN_TTL: Duration = Duration::from_secs(10); // 10 minutes
 /// Default maximum TTL for cached entries.
 pub const DEFAULT_CACHE_MAX_TTL: Duration = Duration::from_secs(86400); // 1 day
 
@@ -32,8 +32,8 @@ pub struct BlastDNSConfig {
     pub purgatory_threshold: usize,
     /// How long a worker must rest after hitting the threshold.
     pub purgatory_sentence: Duration,
-    /// Maximum number of DNS responses to cache. Set to 0 to disable caching.
-    pub cache_capacity: u64,
+    /// Maximum number of entries in the DNS cache (0 = disabled).
+    pub cache_capacity: usize,
     /// Minimum TTL for cached entries.
     pub cache_min_ttl: Duration,
     /// Maximum TTL for cached entries.
@@ -48,7 +48,7 @@ pub struct BlastDNSConfigWire {
     pub max_retries: usize,
     pub purgatory_threshold: usize,
     pub purgatory_sentence_ms: u64,
-    pub cache_capacity: u64,
+    pub cache_capacity: usize,
     pub cache_min_ttl_secs: u64,
     pub cache_max_ttl_secs: u64,
 }

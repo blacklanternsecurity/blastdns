@@ -20,12 +20,12 @@ There are three ways to use it:
 
 100K DNS lookups against local `dnsmasq`, with 100 workers:
 
-| Library         | Language | Time    | QPS    | Success  | Failed | vs dnspython |
-|-----------------|----------|---------|--------|----------|--------|--------------|
-| massdns         | C        | 1.687s  | 71,898 | 100,000  | 0      | 28.87x       |
-| blastdns-cli    | Rust     | 1.732s  | 64,942 | 100,000  | 0      | 26.07x       |
-| blastdns-python | Python   | 3.903s  | 25,623 | 100,000  | 0      | 10.29x       |
-| dnspython       | Python   | 40.149s | 2,491  | 100,000  | 0      | 1.00x        |
+| Library         | Language | Time    | QPS    | Success | Failed | vs dnspython |
+|-----------------|----------|---------|--------|---------|--------|--------------|
+| massdns         | C        | 1.370s  | 72,998 | 100,000 | 0      | 28.63x       |
+| blastdns-cli    | Rust     | 1.654s  | 60,470 | 100,000 | 0      | 23.72x       |
+| blastdns-python | Python   | 2.485s  | 40,249 | 100,000 | 0      | 15.79x       |
+| dnspython       | Python   | 39.223s | 2,550  | 100,000 | 0      | 1.00x        |
 
 ### CLI
 
@@ -52,7 +52,7 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt --skip-errors | jq
 
 ```
 $ blastdns --help
-BlastDNS - Async DNS spray client
+BlastDNS - Ultra-fast DNS Resolver written in Rust
 
 Usage: blastdns [OPTIONS] --resolvers <FILE> [HOSTS_TO_RESOLVE]
 
@@ -80,6 +80,8 @@ Options:
           Don't show error responses
       --brief
           Output brief format (hostname, record type, answers only)
+      --cache-capacity <CACHE_CAPACITY>
+          DNS cache capacity (0 = disabled) [default: 10000]
   -h, --help
           Print help
   -V, --version

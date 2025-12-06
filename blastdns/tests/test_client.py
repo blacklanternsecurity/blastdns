@@ -12,8 +12,8 @@ def test_client_config_defaults():
         "purgatory_threshold": 10,
         "purgatory_sentence_ms": 1000,
         "cache_capacity": 10000,
-        "cache_max_ttl_secs": 86400,
         "cache_min_ttl_secs": 10,
+        "cache_max_ttl_secs": 86400,
     }
 
 
