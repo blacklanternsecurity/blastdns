@@ -12,6 +12,12 @@ pub const DEFAULT_MAX_RETRIES: usize = 10;
 pub const DEFAULT_PURGATORY_THRESHOLD: usize = 10;
 /// Default purgatory sentence duration.
 pub const DEFAULT_PURGATORY_SENTENCE: Duration = Duration::from_millis(1000);
+/// Default cache capacity (0 = disabled).
+pub const DEFAULT_CACHE_CAPACITY: usize = 10000;
+/// Default minimum TTL for cached entries.
+pub const DEFAULT_CACHE_MIN_TTL: Duration = Duration::from_secs(600); // 10 minutes
+/// Default maximum TTL for cached entries.
+pub const DEFAULT_CACHE_MAX_TTL: Duration = Duration::from_secs(86400); // 1 day
 
 /// Configuration knobs for [`BlastDNSClient`].
 #[derive(Clone, Debug)]
@@ -26,6 +32,12 @@ pub struct BlastDNSConfig {
     pub purgatory_threshold: usize,
     /// How long a worker must rest after hitting the threshold.
     pub purgatory_sentence: Duration,
+    /// Maximum number of entries in the DNS cache (0 = disabled).
+    pub cache_capacity: usize,
+    /// Minimum TTL for cached entries.
+    pub cache_min_ttl: Duration,
+    /// Maximum TTL for cached entries.
+    pub cache_max_ttl: Duration,
 }
 
 /// JSON-serializable config shape used at the Python FFI boundary.
@@ -36,6 +48,9 @@ pub struct BlastDNSConfigWire {
     pub max_retries: usize,
     pub purgatory_threshold: usize,
     pub purgatory_sentence_ms: u64,
+    pub cache_capacity: usize,
+    pub cache_min_ttl_secs: u64,
+    pub cache_max_ttl_secs: u64,
 }
 
 impl From<BlastDNSConfigWire> for BlastDNSConfig {
@@ -46,6 +61,9 @@ impl From<BlastDNSConfigWire> for BlastDNSConfig {
             max_retries: w.max_retries,
             purgatory_threshold: w.purgatory_threshold,
             purgatory_sentence: Duration::from_millis(w.purgatory_sentence_ms.max(1)),
+            cache_capacity: w.cache_capacity,
+            cache_min_ttl: Duration::from_secs(w.cache_min_ttl_secs),
+            cache_max_ttl: Duration::from_secs(w.cache_max_ttl_secs),
         }
     }
 }
@@ -58,6 +76,9 @@ impl Default for BlastDNSConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             purgatory_threshold: DEFAULT_PURGATORY_THRESHOLD,
             purgatory_sentence: DEFAULT_PURGATORY_SENTENCE,
+            cache_capacity: DEFAULT_CACHE_CAPACITY,
+            cache_min_ttl: DEFAULT_CACHE_MIN_TTL,
+            cache_max_ttl: DEFAULT_CACHE_MAX_TTL,
         }
     }
 }
