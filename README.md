@@ -498,12 +498,12 @@ When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which c
 
 ### Caching
 
-BlastDNS includes an optional TTL-aware cache powered by hickory-dns's `DnsLru` (internally using moka's TinyLFU eviction policy). The cache is enabled by default with a capacity of 10,000 entries and can be configured or disabled entirely:
+BlastDNS includes an optional TTL-aware cache using an LRU eviction policy. The cache is enabled by default with a capacity of 10,000 entries and can be configured or disabled entirely:
 
 - Only **positive responses with answers** are cached (no errors, NXDOMAIN, or empty responses)
-- TTLs are respected and decremented on retrieval to reflect elapsed time
 - Cache entries automatically expire based on DNS record TTLs (clamped to configurable min/max bounds)
-- Thread-safe and lock-free for high concurrency
+- Expired entries are removed on access
+- Thread-safe with minimal lock contention
 
 Configure via `BlastDNSConfig`:
 - `cache_capacity`: Number of entries (default: 10000, set to 0 to disable)
