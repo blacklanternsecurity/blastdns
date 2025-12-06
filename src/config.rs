@@ -15,7 +15,7 @@ pub const DEFAULT_PURGATORY_SENTENCE: Duration = Duration::from_millis(1000);
 /// Default cache capacity (0 = disabled).
 pub const DEFAULT_CACHE_CAPACITY: usize = 10000;
 /// Default minimum TTL for cached entries.
-pub const DEFAULT_CACHE_MIN_TTL: Duration = Duration::from_secs(600); // 10 minutes
+pub const DEFAULT_CACHE_MIN_TTL: Duration = Duration::from_secs(10); // 10 minutes
 /// Default maximum TTL for cached entries.
 pub const DEFAULT_CACHE_MAX_TTL: Duration = Duration::from_secs(86400); // 1 day
 

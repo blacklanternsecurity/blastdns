@@ -32,6 +32,7 @@ impl std::fmt::Debug for BlastDNSClient {
             .field("resolvers", &self.resolvers)
             .field("config", &self.config)
             .field("queue_capacity", &self.queue_capacity)
+            .field("cache_enabled", &self.cache.is_some())
             .finish_non_exhaustive()
     }
 }
