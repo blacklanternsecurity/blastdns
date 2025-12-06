@@ -1,11 +1,12 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
-use hickory_client::proto::{rr::RecordType, xfer::DnsResponse};
+use hickory_client::proto::{op::Query, rr::RecordType, xfer::DnsResponse};
 use tokio::sync::{OnceCell, oneshot};
 use tracing::debug;
 
 use crate::{
+    cache::SimpleCache,
     config::BlastDNSConfig,
     error::BlastDNSError,
     resolver::DnsResolver,
@@ -22,6 +23,7 @@ pub struct BlastDNSClient {
     config: BlastDNSConfig,
     queue_capacity: usize,
     workers_spawned: OnceCell<()>,
+    cache: Option<Arc<SimpleCache>>,
 }
 
 impl std::fmt::Debug for BlastDNSClient {
@@ -30,6 +32,7 @@ impl std::fmt::Debug for BlastDNSClient {
             .field("resolvers", &self.resolvers)
             .field("config", &self.config)
             .field("queue_capacity", &self.queue_capacity)
+            .field("cache_enabled", &self.cache.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -70,6 +73,15 @@ impl BlastDNSClient {
 
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
+        // Initialize cache if capacity > 0
+        let cache = (config.cache_capacity > 0).then(|| {
+            Arc::new(SimpleCache::new(
+                config.cache_capacity,
+                config.cache_min_ttl,
+                config.cache_max_ttl,
+            ))
+        });
+
         Ok(Self {
             resolvers: parsed,
             work_tx,
@@ -77,6 +89,7 @@ impl BlastDNSClient {
             config,
             queue_capacity,
             workers_spawned: OnceCell::new(),
+            cache,
         })
     }
 
@@ -100,6 +113,19 @@ impl BlastDNSClient {
         // Auto-format PTR queries if an IP address is provided
         if record_type == RecordType::PTR {
             host = format_ptr_query(&host);
+        }
+
+        // Check cache first
+        if let Some(cache) = &self.cache {
+            // Try to parse hostname into a Name
+            if let Ok(name) = host.parse() {
+                let query = Query::query(name, record_type);
+
+                if let Some(response) = cache.get(&query, Instant::now()) {
+                    debug!(host, %record_type, "cache hit");
+                    return Ok(response.as_ref().clone());
+                }
+            }
         }
 
         let attempts = self.config.max_retries.saturating_add(1);
@@ -135,7 +161,18 @@ impl BlastDNSClient {
             };
 
             match response {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    // Cache successful responses with answers
+                    if let Some(cache) = &self.cache
+                        && !resp.answers().is_empty()
+                        && let Ok(name) = host.parse()
+                    {
+                        let query = Query::query(name, record_type);
+                        cache.insert(query, resp.clone(), Instant::now());
+                        debug!(host, %record_type, "cached response");
+                    }
+                    return Ok(resp);
+                }
                 Err(err) => {
                     debug!(
                         attempt = attempt + 1,
@@ -190,7 +227,8 @@ mod tests {
 
     use crossfire::mpmc;
     use futures::StreamExt;
-    use hickory_client::proto::rr::RecordType;
+    use hickory_client::proto::op::Query;
+    use hickory_client::proto::rr::{Name, RecordType};
     use tokio::sync::oneshot;
 
     use crate::utils::parse_resolver;
@@ -830,6 +868,92 @@ mod tests {
             mock_answers.len(),
             0,
             "mock client should return empty list for NXDOMAIN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stores_and_retrieves_responses() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            cache_capacity: 100,
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        let host = "example.com".to_string();
+        let name: Name = host.parse().unwrap();
+        let query = Query::query(name.clone(), RecordType::A);
+        let cache = client
+            .cache
+            .as_ref()
+            .expect("cache should be present")
+            .clone();
+        assert!(
+            !cache.contains(&query, Instant::now()),
+            "cache should start empty"
+        );
+
+        // First request - should hit DNS
+        let start = std::time::Instant::now();
+        let first_result = client
+            .resolve_full(host.clone(), RecordType::A)
+            .await
+            .expect("first resolve failed");
+        let first_duration = start.elapsed();
+
+        assert!(!first_result.answers().is_empty(), "should have answers");
+
+        // Second request - should hit cache (much faster)
+        let start = std::time::Instant::now();
+        let second_result = client
+            .resolve_full("example.com".to_string(), RecordType::A)
+            .await
+            .expect("second resolve failed");
+        let second_duration = start.elapsed();
+
+        assert!(
+            !second_result.answers().is_empty(),
+            "should have cached answers"
+        );
+
+        // Cache should contain the entry after the first request and still on the second.
+        assert!(
+            cache.contains(&query, Instant::now()),
+            "cache should hold entry"
+        );
+        assert!(
+            second_duration < first_duration,
+            "cached lookup should be faster"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_disabled_when_capacity_zero() {
+        let resolvers = vec!["127.0.0.1:5353".to_string()];
+        let config = BlastDNSConfig {
+            request_timeout: Duration::from_secs(2),
+            threads_per_resolver: 1,
+            cache_capacity: 0, // Disable cache
+            ..Default::default()
+        };
+
+        let client = BlastDNSClient::with_config(resolvers, config).expect("client init");
+
+        // Verify cache is None
+        assert!(client.cache.is_none(), "cache should be disabled");
+
+        // Should still work without cache
+        let result = client
+            .resolve_full("example.com".to_string(), RecordType::A)
+            .await
+            .expect("resolve failed");
+
+        assert!(
+            !result.answers().is_empty(),
+            "should have answers without cache"
         );
     }
 }
