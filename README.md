@@ -187,13 +187,21 @@ cargo add blastdns
 
 #### Usage
 
+BlastDNS can either use system resolvers (detected automatically from OS configuration) or custom resolvers:
+
 ```rust
 use blastdns::{BlastDNSClient, BlastDNSConfig};
 use futures::StreamExt;
 use hickory_client::proto::rr::RecordType;
 use std::time::Duration;
 
-// read DNS resolvers from a file (one per line -> vector of strings)
+// Option 1: Use system DNS resolvers (default)
+let client = BlastDNSClient::new(vec![]).await?;
+
+// Check what resolvers are being used
+println!("Using resolvers: {:?}", client.resolvers());
+
+// Option 2: Read DNS resolvers from a file (one per line -> vector of strings)
 let resolvers = std::fs::read_to_string("resolvers.txt")
     .expect("Failed to read resolvers file")
     .lines()
@@ -273,6 +281,20 @@ for (record_type, result) in results {
 }
 ```
 
+#### System Resolvers
+
+You can retrieve the system's configured DNS resolvers programmatically:
+
+```rust
+use blastdns::get_system_resolvers;
+
+// Get system resolver IPs (works on Unix, Windows, macOS, Android)
+let resolver_ips = get_system_resolvers()?;
+for ip in resolver_ips {
+    println!("System resolver: {}", ip);
+}
+```
+
 #### MockBlastDNSClient for Testing
 
 `MockBlastDNSClient` implements the `DnsResolver` trait and provides a drop-in replacement that returns fabricated DNS responses without making real network requests.
@@ -346,11 +368,22 @@ To use it in Python, you can use the `Client` class:
 
 ```python
 import asyncio
-from blastdns import Client, ClientConfig, DNSResult, DNSError
+from blastdns import Client, ClientConfig, DNSResult, DNSError, get_system_resolvers
 
 
 async def main():
-    resolvers = ["1.1.1.1:53"]
+    # Option 1: Use system resolvers (pass empty list)
+    client = Client([], ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
+    
+    # Check what resolvers are being used
+    print(f"Using resolvers: {client.resolvers}")
+    
+    # Option 2: Manually get system resolvers
+    system_resolvers = get_system_resolvers()
+    print(f"System resolvers: {system_resolvers}")
+    
+    # Option 3: Use custom resolvers
+    resolvers = ["1.1.1.1:53", "8.8.8.8:53"]
     client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
 
     # resolve: lookup a single host, returns only rdata strings
@@ -404,6 +437,10 @@ asyncio.run(main())
 ```
 
 #### Python API Methods
+
+- **`Client.resolvers`** (property): Get the list of resolver addresses being used by this client. Returns a list of strings (e.g., `["8.8.8.8:53", "1.1.1.1:53"]`).
+
+- **`get_system_resolvers() -> list[str]`**: Get system DNS resolver IP addresses from OS configuration. Works on Unix, Windows, macOS, and Android. Returns a list of IP addresses without ports (e.g., `["8.8.8.8", "1.1.1.1"]`). Useful for inspecting what resolvers the OS is configured to use.
 
 - **`Client.resolve(host, record_type=None) -> list[str]`**: Lookup a single hostname, returning only rdata strings. Defaults to `A` records. Returns a list of strings (e.g., `["93.184.216.34"]` for A records). Perfect for simple use cases where you just need the record data without the full DNS response structure.
 
@@ -502,7 +539,8 @@ BlastDNS includes an optional TTL-aware cache using an LRU eviction policy. The 
 
 - Only **positive responses with answers** are cached (no errors, NXDOMAIN, or empty responses)
 - Cache entries automatically expire based on DNS record TTLs (clamped to configurable min/max bounds)
-- Expired entries are removed on access
+- Expired entries are removed when accessed; unaccessed expired entries remain until evicted by LRU policy
+- Cache has a hard capacity limit (prevents unbounded growth even with expired entries)
 - Thread-safe with minimal lock contention
 
 Configure via `BlastDNSConfig`:

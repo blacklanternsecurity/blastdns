@@ -18,6 +18,7 @@ use crate::config::{BlastDNSConfig, BlastDNSConfigWire};
 use crate::error::BlastDNSError;
 use crate::mock::MockBlastDNSClient;
 use crate::resolver::DnsResolver;
+use crate::utils::get_system_resolvers;
 
 #[pyclass(name = "Client")]
 pub struct PyBlastDNSClient {
@@ -43,6 +44,12 @@ impl PyBlastDNSClient {
         Ok(PyBlastDNSClient {
             inner: Arc::new(client),
         })
+    }
+
+    /// Get the list of resolvers being used by this client.
+    #[getter]
+    fn resolvers(&self) -> Vec<String> {
+        self.inner.resolvers()
     }
 
     #[pyo3(signature = (host, record_type = None))]
@@ -555,10 +562,21 @@ impl PyMockBlastDNSClient {
     }
 }
 
+/// Get system DNS resolver IP addresses from OS configuration.
+/// Works on Unix, Windows, macOS, and Android.
+#[pyfunction]
+fn get_system_resolvers_py() -> PyResult<Vec<String>> {
+    let resolver_ips = get_system_resolvers()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to get system resolvers: {}", e)))?;
+
+    Ok(resolver_ips.iter().map(|ip| ip.to_string()).collect())
+}
+
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
     m.add_class::<PyMockBlastDNSClient>()?;
+    m.add_function(wrap_pyfunction!(get_system_resolvers_py, m)?)?;
     Ok(())
 }
 

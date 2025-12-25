@@ -1,6 +1,27 @@
 import pytest
 
-from blastdns import Client, ClientConfig, DNSError, DNSResult
+from blastdns import Client, ClientConfig, DNSError, DNSResult, get_system_resolvers
+
+
+def test_get_system_resolvers():
+    """Test that get_system_resolvers returns valid IP addresses."""
+    resolvers = get_system_resolvers()
+
+    assert isinstance(resolvers, list), "should return a list"
+    assert len(resolvers) > 0, "should have at least one system resolver"
+
+    # Validate each resolver is a valid IP address
+    import ipaddress
+
+    for resolver in resolvers:
+        assert isinstance(resolver, str), f"resolver should be string, got {type(resolver)}"
+        # Should be just IP, no port
+        assert ":" not in resolver, f"resolver should not have port: {resolver}"
+        # Should be valid IP
+        try:
+            ipaddress.ip_address(resolver)
+        except ValueError:
+            pytest.fail(f"Invalid IP address: {resolver}")
 
 
 def test_client_config_defaults():
