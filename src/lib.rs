@@ -19,4 +19,4 @@ pub use config::{
 pub use error::BlastDNSError;
 pub use mock::MockBlastDNSClient;
 pub use resolver::DnsResolver;
-pub use utils::check_ulimits;
+pub use utils::{check_ulimits, get_system_resolvers};
