@@ -10,7 +10,7 @@ use crate::{
     config::BlastDNSConfig,
     error::BlastDNSError,
     resolver::DnsResolver,
-    utils::{check_ulimits, format_ptr_query, parse_resolver},
+    utils::{check_ulimits, format_ptr_query, get_system_resolvers, parse_resolver},
     worker::{QuerySpec, ResolverWorker, WorkItem},
 };
 
@@ -45,18 +45,27 @@ pub type BatchResultBasic = (String, String, Vec<String>);
 
 impl BlastDNSClient {
     /// Build a client using the default configuration.
+    /// If resolvers is empty, system resolvers will be used.
     pub fn new(resolvers: Vec<String>) -> Result<Self, BlastDNSError> {
         Self::with_config(resolvers, BlastDNSConfig::default())
     }
 
     /// Build a client with an explicit configuration.
+    /// If resolvers is empty, system resolvers will be used.
     pub fn with_config(
         resolvers: Vec<String>,
         config: BlastDNSConfig,
     ) -> Result<Self, BlastDNSError> {
-        if resolvers.is_empty() {
-            return Err(BlastDNSError::NoResolvers);
-        }
+        let resolvers = if resolvers.is_empty() {
+            // Get system resolvers and format them as strings
+            let system_ips = get_system_resolvers()?;
+            system_ips
+                .into_iter()
+                .map(|ip| format!("{}:53", ip))
+                .collect()
+        } else {
+            resolvers
+        };
 
         let parsed: Vec<SocketAddr> = resolvers
             .into_iter()
@@ -91,6 +100,11 @@ impl BlastDNSClient {
             workers_spawned: OnceCell::new(),
             cache,
         })
+    }
+
+    /// Get the list of resolvers being used by this client.
+    pub fn resolvers(&self) -> Vec<String> {
+        self.resolvers.iter().map(|addr| addr.to_string()).collect()
     }
 
     /// Ensure workers are spawned (called lazily on first use).
@@ -236,9 +250,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_empty_resolvers() {
-        let err = BlastDNSClient::new(Vec::new()).expect_err("expected failure");
-        assert!(matches!(err, BlastDNSError::NoResolvers));
+    fn empty_resolvers_uses_system() {
+        // This test verifies that empty resolvers fall back to system resolvers
+        // We don't test the actual behavior as it requires system DNS config
+        let result = BlastDNSClient::new(Vec::new());
+        // Should succeed if system resolvers are available, fail otherwise
+        // The exact behavior depends on the system, so we just verify it doesn't panic
+        match result {
+            Ok(_) => {
+                // System resolvers found
+            }
+            Err(BlastDNSError::Configuration(_)) => {
+                // Expected if no system resolvers configured
+            }
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
     }
 
     #[test]

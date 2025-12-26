@@ -8,7 +8,24 @@ __all__ = [
     "ClientConfig",
     "Client",
     "MockClient",
+    "get_system_resolvers",
 ]
+
+
+def get_system_resolvers() -> list[str]:
+    """Get system DNS resolver IP addresses from OS configuration.
+
+    Works on Unix, Windows, macOS, and Android.
+
+    Returns:
+        list[str]: List of system resolver IP addresses (e.g., ["8.8.8.8", "1.1.1.1"])
+
+    Example:
+        resolvers = get_system_resolvers()
+        for ip in resolvers:
+            print(f"System resolver: {ip}")
+    """
+    return _native.get_system_resolvers_py()
 
 
 class ClientConfig(BaseModel):
@@ -40,6 +57,19 @@ class Client:
             )
         config_json = (config or ClientConfig()).model_dump_json()
         self._inner = _native.Client(list(resolvers), config_json)
+
+    @property
+    def resolvers(self) -> list[str]:
+        """Get the list of resolvers being used by this client.
+
+        Returns:
+            list[str]: List of resolver addresses (e.g., ["8.8.8.8:53", "1.1.1.1:53"])
+
+        Example:
+            client = Client(["8.8.8.8"])
+            print(client.resolvers)  # ["8.8.8.8:53"]
+        """
+        return self._inner.resolvers
 
     async def resolve(self, host, record_type=None) -> list[str]:
         """Resolve a hostname to DNS records, returning simplified rdata strings.

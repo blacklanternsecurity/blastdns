@@ -4,6 +4,7 @@ use std::str::FromStr;
 use anyhow::Result;
 #[cfg(unix)]
 use anyhow::bail;
+use hickory_resolver::system_conf;
 
 use crate::error::BlastDNSError;
 
@@ -102,6 +103,32 @@ pub fn check_ulimits(
     }
 
     Ok(())
+}
+
+/// Get system DNS resolver IP addresses from OS configuration.
+/// Works on Unix, Windows, macOS, and Android.
+pub fn get_system_resolvers() -> Result<Vec<IpAddr>, BlastDNSError> {
+    use std::collections::HashSet;
+
+    let (config, _options) = system_conf::read_system_conf().map_err(|e| {
+        BlastDNSError::Configuration(format!("Failed to read system DNS configuration: {}", e))
+    })?;
+
+    let resolver_ips: Vec<IpAddr> = config
+        .name_servers()
+        .iter()
+        .map(|ns| ns.socket_addr.ip())
+        .collect::<HashSet<_>>() // Deduplicate
+        .into_iter()
+        .collect();
+
+    if resolver_ips.is_empty() {
+        return Err(BlastDNSError::Configuration(
+            "No system resolvers found".to_string(),
+        ));
+    }
+
+    Ok(resolver_ips)
 }
 
 /// Format an IP address for PTR lookup.

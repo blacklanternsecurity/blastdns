@@ -1,4 +1,4 @@
-from .client import Client, ClientConfig, MockClient
+from .client import Client, ClientConfig, MockClient, get_system_resolvers
 from .models import DNSError, DNSResult, DNSResultOrError
 
 __all__ = [
@@ -8,4 +8,5 @@ __all__ = [
     "DNSResult",
     "DNSError",
     "DNSResultOrError",
+    "get_system_resolvers",
 ]
