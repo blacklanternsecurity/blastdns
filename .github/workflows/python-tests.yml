@@ -176,7 +176,7 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-latest-intel
+          - runner: macos-15-intel
             target: x86_64
           - runner: macos-latest
             target: aarch64
