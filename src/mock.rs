@@ -5,6 +5,7 @@ use hickory_client::proto::op::{Header, Message, MessageType, OpCode, Query, Res
 use hickory_client::proto::rr::rdata::{CNAME, MX, NS, PTR, TXT};
 use hickory_client::proto::rr::{Name, RData, Record, RecordType};
 use hickory_client::proto::xfer::DnsResponse;
+use regex::Regex;
 
 use crate::error::BlastDNSError;
 use crate::resolver::DnsResolver;
@@ -14,7 +15,9 @@ use crate::utils::format_ptr_query;
 #[derive(Clone, Debug)]
 pub struct MockBlastDNSClient {
     mock_data: HashMap<String, HashMap<RecordType, Vec<String>>>,
+    regex_patterns: Vec<(Regex, HashMap<RecordType, Vec<String>>)>,
     nxdomain_hosts: HashSet<String>,
+    nxdomain_patterns: Vec<Regex>,
 }
 
 impl MockBlastDNSClient {
@@ -22,12 +25,20 @@ impl MockBlastDNSClient {
     pub fn new() -> Self {
         Self {
             mock_data: HashMap::new(),
+            regex_patterns: Vec::new(),
             nxdomain_hosts: HashSet::new(),
+            nxdomain_patterns: Vec::new(),
         }
     }
 
     /// Configure mock DNS responses.
     /// Takes responses (hostname -> record type -> answers) and a list of NXDOMAIN hosts.
+    ///
+    /// Hostnames prefixed with "regex:" will be treated as regex patterns.
+    /// Examples:
+    /// - "example.com" - exact match
+    /// - "regex:.*\.example\.com" - matches any subdomain of example.com
+    /// - "regex:test-\d+" - matches test-1, test-2, etc.
     pub fn mock_dns(
         &mut self,
         responses: HashMap<String, HashMap<String, Vec<String>>>,
@@ -36,24 +47,48 @@ impl MockBlastDNSClient {
         self.clear();
 
         for (host, records) in responses {
-            for (record_type_str, answers) in records {
-                if let Ok(record_type) = RecordType::from_str(&record_type_str) {
-                    self.mock_data
-                        .entry(host.clone())
-                        .or_default()
-                        .insert(record_type, answers);
+            if let Some(pattern) = host.strip_prefix("regex:") {
+                // Regex pattern
+                if let Ok(regex) = Regex::new(pattern) {
+                    let mut record_map = HashMap::new();
+                    for (record_type_str, answers) in records {
+                        if let Ok(record_type) = RecordType::from_str(&record_type_str) {
+                            record_map.insert(record_type, answers);
+                        }
+                    }
+                    self.regex_patterns.push((regex, record_map));
+                }
+            } else {
+                // Exact match
+                for (record_type_str, answers) in records {
+                    if let Ok(record_type) = RecordType::from_str(&record_type_str) {
+                        self.mock_data
+                            .entry(host.clone())
+                            .or_default()
+                            .insert(record_type, answers);
+                    }
                 }
             }
         }
 
         for host in nxdomains {
-            self.nxdomain_hosts.insert(host);
+            if let Some(pattern) = host.strip_prefix("regex:") {
+                // Regex pattern for NXDOMAIN
+                if let Ok(regex) = Regex::new(pattern) {
+                    self.nxdomain_patterns.push(regex);
+                }
+            } else {
+                // Exact match for NXDOMAIN
+                self.nxdomain_hosts.insert(host);
+            }
         }
     }
 
     fn clear(&mut self) {
         self.mock_data.clear();
+        self.regex_patterns.clear();
         self.nxdomain_hosts.clear();
+        self.nxdomain_patterns.clear();
     }
 
     /// Resolve a hostname (mocked), returning full DNS response.
@@ -63,16 +98,32 @@ impl MockBlastDNSClient {
         host: String,
         record_type: RecordType,
     ) -> Result<DnsResponse, BlastDNSError> {
-        // Check if this host should return NXDOMAIN - return empty response (not error)
+        // Check if this host should return NXDOMAIN (exact match)
         if self.nxdomain_hosts.contains(&host) {
             return self.fabricate_response(&host, record_type, &[]);
         }
 
-        // Check if we have mock data for this host
+        // Check if this host matches any NXDOMAIN regex pattern
+        for pattern in &self.nxdomain_patterns {
+            if pattern.is_match(&host) {
+                return self.fabricate_response(&host, record_type, &[]);
+            }
+        }
+
+        // Check if we have exact match mock data for this host
         if let Some(host_data) = self.mock_data.get(&host)
             && let Some(answers_data) = host_data.get(&record_type)
         {
             return self.fabricate_response(&host, record_type, answers_data);
+        }
+
+        // Check if host matches any regex pattern
+        for (pattern, record_map) in &self.regex_patterns {
+            if pattern.is_match(&host)
+                && let Some(answers_data) = record_map.get(&record_type)
+            {
+                return self.fabricate_response(&host, record_type, answers_data);
+            }
         }
 
         // No mock data, return empty response
@@ -527,5 +578,141 @@ mod tests {
         assert_eq!(response.answers().len(), 0);
         assert_eq!(response.response_code().to_string(), "No Error");
         assert_eq!(response.queries().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_regex_wildcard_subdomain() {
+        let mut client = MockBlastDNSClient::new();
+
+        let responses = HashMap::from([(
+            "regex:.*\\.example\\.com".to_string(),
+            HashMap::from([("A".to_string(), vec!["192.168.1.1".to_string()])]),
+        )]);
+
+        client.mock_dns(responses, vec![]);
+
+        // Should match any subdomain
+        let result = client
+            .resolve("api.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["192.168.1.1"]);
+
+        let result = client
+            .resolve("cdn.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["192.168.1.1"]);
+
+        let result = client
+            .resolve("sub.domain.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["192.168.1.1"]);
+
+        // Should not match the base domain
+        let result = client
+            .resolve("example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_regex_numeric_pattern() {
+        let mut client = MockBlastDNSClient::new();
+
+        let responses = HashMap::from([(
+            "regex:^server-\\d+\\.test\\.com$".to_string(),
+            HashMap::from([("A".to_string(), vec!["10.0.0.1".to_string()])]),
+        )]);
+
+        client.mock_dns(responses, vec![]);
+
+        // Should match numbered servers
+        let result = client
+            .resolve("server-1.test.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["10.0.0.1"]);
+
+        let result = client
+            .resolve("server-42.test.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["10.0.0.1"]);
+
+        // Should not match non-numeric
+        let result = client
+            .resolve("server-abc.test.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_regex_nxdomain_pattern() {
+        let mut client = MockBlastDNSClient::new();
+
+        let responses = HashMap::from([(
+            "good.example.com".to_string(),
+            HashMap::from([("A".to_string(), vec!["1.2.3.4".to_string()])]),
+        )]);
+
+        let nxdomains = vec!["regex:^bad-.*\\.example\\.com$".to_string()];
+
+        client.mock_dns(responses, nxdomains);
+
+        // Should return NXDOMAIN for matching pattern
+        let result = client
+            .resolve("bad-host.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+
+        let result = client
+            .resolve("bad-server.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+
+        // Should return normal result for non-matching
+        let result = client
+            .resolve("good.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["1.2.3.4"]);
+    }
+
+    #[tokio::test]
+    async fn test_regex_exact_match_priority() {
+        let mut client = MockBlastDNSClient::new();
+
+        let responses = HashMap::from([
+            (
+                "specific.example.com".to_string(),
+                HashMap::from([("A".to_string(), vec!["10.0.0.1".to_string()])]),
+            ),
+            (
+                "regex:.*\\.example\\.com".to_string(),
+                HashMap::from([("A".to_string(), vec!["192.168.1.1".to_string()])]),
+            ),
+        ]);
+
+        client.mock_dns(responses, vec![]);
+
+        // Exact match should take priority
+        let result = client
+            .resolve("specific.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["10.0.0.1"]);
+
+        // Regex should match others
+        let result = client
+            .resolve("other.example.com".to_string(), RecordType::A)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["192.168.1.1"]);
     }
 }
