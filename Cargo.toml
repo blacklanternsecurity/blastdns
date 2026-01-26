@@ -19,7 +19,7 @@ python = ["dep:pyo3", "dep:pyo3-async-runtimes", "pyo3/extension-module"]
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
-crossfire = "2.1.7"
+crossfire = "3.0.2"
 futures = "0.3.31"
 hickory-client = { version = "0.25.2", features = ["serde"] }
 hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config"] }
