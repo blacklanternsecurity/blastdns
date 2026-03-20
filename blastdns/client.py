@@ -227,6 +227,11 @@ class MockClient(Client):
         # Skip parent __init__, directly set _inner to mock client
         self._inner = _native.MockClient()
 
+    @property
+    def resolvers(self) -> list[str]:
+        """Mock client has no real resolvers."""
+        return ["mock:53"]
+
     def mock_dns(self, data):
         """Configure mock DNS responses.
 
