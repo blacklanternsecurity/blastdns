@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use hickory_client::proto::op::{Header, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_client::proto::rr::rdata::{CNAME, MX, NS, PTR, TXT};
+use hickory_client::proto::rr::rdata::{CNAME, MX, NS, NULL, PTR, TXT};
 use hickory_client::proto::rr::{Name, RData, Record, RecordType};
 use hickory_client::proto::xfer::DnsResponse;
 use regex::Regex;
@@ -100,13 +100,13 @@ impl MockBlastDNSClient {
     ) -> Result<DnsResponse, BlastDNSError> {
         // Check if this host should return NXDOMAIN (exact match)
         if self.nxdomain_hosts.contains(&host) {
-            return self.fabricate_response(&host, record_type, &[]);
+            return self.fabricate_nxdomain_response(&host, record_type);
         }
 
         // Check if this host matches any NXDOMAIN regex pattern
         for pattern in &self.nxdomain_patterns {
             if pattern.is_match(&host) {
-                return self.fabricate_response(&host, record_type, &[]);
+                return self.fabricate_nxdomain_response(&host, record_type);
             }
         }
 
@@ -130,11 +130,29 @@ impl MockBlastDNSClient {
         self.fabricate_response(&host, record_type, &[])
     }
 
+    fn fabricate_nxdomain_response(
+        &self,
+        host: &str,
+        record_type: RecordType,
+    ) -> Result<DnsResponse, BlastDNSError> {
+        self.fabricate_response_with_code(host, record_type, &[], ResponseCode::NXDomain)
+    }
+
     fn fabricate_response(
         &self,
         host: &str,
         record_type: RecordType,
         answers_data: &[String],
+    ) -> Result<DnsResponse, BlastDNSError> {
+        self.fabricate_response_with_code(host, record_type, answers_data, ResponseCode::NoError)
+    }
+
+    fn fabricate_response_with_code(
+        &self,
+        host: &str,
+        record_type: RecordType,
+        answers_data: &[String],
+        response_code: ResponseCode,
     ) -> Result<DnsResponse, BlastDNSError> {
         // Ensure host has trailing dot (FQDN format)
         let fqdn = if host.ends_with('.') {
@@ -166,7 +184,7 @@ impl MockBlastDNSClient {
         header.set_recursion_available(true);
         header.set_authentic_data(false);
         header.set_checking_disabled(false);
-        header.set_response_code(ResponseCode::NoError);
+        header.set_response_code(response_code);
 
         // Fabricate query
         let query = Query::query(name, record_type);
@@ -222,7 +240,16 @@ impl MockBlastDNSClient {
                     RData::MX(MX::new(0, exchange))
                 }
             }
-            RecordType::TXT => RData::TXT(TXT::new(vec![rdata_str.to_string()])),
+            RecordType::TXT => {
+                // DNS TXT strings are limited to 255 bytes each.
+                // Split long strings into 255-byte chunks.
+                let bytes = rdata_str.as_bytes();
+                let mut chunks = Vec::new();
+                for chunk in bytes.chunks(255) {
+                    chunks.push(String::from_utf8_lossy(chunk).to_string());
+                }
+                RData::TXT(TXT::new(chunks))
+            }
             RecordType::NS => {
                 let name = Name::from_str(rdata_str)
                     .map_err(|e| BlastDNSError::Configuration(format!("invalid NS: {e}")))?;
@@ -241,9 +268,14 @@ impl MockBlastDNSClient {
                 // For simplicity, parse as minimal SRV or return None
                 return Ok(None);
             }
-            _ => {
-                // Unsupported record type
-                return Ok(None);
+            other => {
+                // For unsupported record types, store the raw string as NULL data
+                // This allows the mock to pass through arbitrary record data
+                let raw_bytes = rdata_str.as_bytes().to_vec();
+                RData::Unknown {
+                    code: other,
+                    rdata: NULL::with(raw_bytes),
+                }
             }
         };
 
