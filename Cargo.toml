@@ -38,4 +38,4 @@ pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runti
 [dev-dependencies]
 pyo3 = { version = "0.27", features = ["auto-initialize"] }
 pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
-rand = "0.8"
+rand = "0.9"
