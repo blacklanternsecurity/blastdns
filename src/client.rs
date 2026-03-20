@@ -836,7 +836,7 @@ mod tests {
     async fn nxdomain_behavior_matches_mock() {
         use crate::mock::MockBlastDNSClient;
         use crate::resolver::DnsResolver;
-        use rand::{Rng, distributions::Alphanumeric};
+        use rand::{Rng, distr::Alphanumeric};
 
         // Create real client
         let resolvers = vec!["8.8.8.8:53".to_string()];
@@ -849,7 +849,7 @@ mod tests {
         let real_client = BlastDNSClient::with_config(resolvers, config).expect("client init");
 
         // Generate random 32-character domain name
-        let random_subdomain: String = rand::thread_rng()
+        let random_subdomain: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(32)
             .map(char::from)
