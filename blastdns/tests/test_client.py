@@ -1,6 +1,6 @@
 import pytest
 
-from blastdns import Client, ClientConfig, DNSError, DNSResult, get_system_resolvers
+from blastdns import Client, ClientConfig, ConfigurationError, DNSError, DNSResult, get_system_resolvers
 
 
 def test_get_system_resolvers():
@@ -204,7 +204,7 @@ async def test_client_resolve_batch_filters_errors_and_empty():
 async def test_client_resolve_multi_requires_at_least_one_record_type():
     client = Client(["127.0.0.1:5353"])
 
-    with pytest.raises(RuntimeError, match="at least one record type"):
+    with pytest.raises(ConfigurationError, match="at least one record type"):
         await client.resolve_multi_full("example.com", [])
 
 
