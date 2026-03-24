@@ -506,12 +506,66 @@ async def test_my_function(mock_client):
     assert results["MX"] == ["10 aspmx.l.google.com.", "20 alt1.aspmx.l.google.com."]
 ```
 
+**Regex Patterns:**
+
+Hostnames prefixed with `regex:` are treated as regex patterns, enabling wildcard and dynamic matching:
+
+```python
+client = MockClient()
+client.mock_dns({
+    # Exact match
+    "specific.example.com": {"A": ["10.0.0.1"]},
+    # Regex: match any subdomain of example.com
+    "regex:.*\\.example\\.com": {"A": ["192.168.1.1"]},
+    # Regex: match numbered servers
+    "regex:^server-\\d+\\.test\\.com$": {"A": ["10.0.0.1"]},
+    # Regex patterns work for NXDOMAIN too
+    "_NXDOMAIN": ["regex:^bad-.*\\.example\\.com$"],
+})
+```
+
+Exact matches take priority over regex patterns. When multiple regex patterns match, the first match wins.
+
 **Key Features:**
 - Supports all `Client` methods: `resolve`, `resolve_full`, `resolve_batch`, `resolve_batch_full`, `resolve_multi`, `resolve_multi_full`
 - Returns the same data structures as `Client` for drop-in compatibility
-- NXDOMAIN hosts (specified in `_NXDOMAIN` list) return empty responses, not errors
-- Unmocked hosts also return empty responses
+- NXDOMAIN hosts (specified in `_NXDOMAIN` list) return responses with `NXDomain` response code
+- Unmocked hosts return empty responses
 - Auto-formats PTR queries (IP addresses → reverse DNS format) just like the real client
+- `regex:` prefixed hostnames for wildcard/pattern matching
+
+#### Exceptions
+
+All errors raised by blastdns are subclasses of `BlastDNSError`:
+
+```
+BlastDNSError
+├── ConfigurationError    # invalid resolver address, invalid hostname, bad config
+│   └── NoResolversError  # no resolvers provided or detected
+└── ResolverError         # resolver failed (timeout, connection failure, etc.)
+```
+
+```python
+from blastdns import Client, BlastDNSError, ConfigurationError, NoResolversError, ResolverError
+
+# Catch broadly
+try:
+    client = Client(["not-an-ip"])
+except BlastDNSError as e:
+    print(f"blastdns error: {e}")
+
+# Catch narrowly
+try:
+    client = Client(["not-an-ip"])
+except ConfigurationError as e:
+    print(f"bad config: {e}")
+
+# Catch resolver failures during queries
+try:
+    result = await client.resolve_full("example.com", "A")
+except ResolverError as e:
+    print(f"resolver failed: {e}")
+```
 
 #### Response Models
 

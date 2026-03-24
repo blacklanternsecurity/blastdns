@@ -8,8 +8,9 @@ use hickory_client::proto::rr::RecordType;
 use hickory_client::proto::xfer::DnsResponse;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyIterator};
+use pyo3::types::{PyAnyMethods, PyIterator, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::sync::OnceLock;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant;
 
@@ -353,9 +354,62 @@ fn error_to_bytes(err: BlastDNSError) -> PyResult<Vec<u8>> {
         .map_err(|e| PyValueError::new_err(format!("failed to serialize error payload: {e}")))
 }
 
+// Python exception classes imported from blastdns.exceptions
+static PY_CONFIGURATION_ERROR: OnceLock<Py<PyAny>> = OnceLock::new();
+static PY_NO_RESOLVERS_ERROR: OnceLock<Py<PyAny>> = OnceLock::new();
+static PY_RESOLVER_ERROR: OnceLock<Py<PyAny>> = OnceLock::new();
+
+fn init_exception_types(py: Python<'_>) -> PyResult<()> {
+    let module = py.import("blastdns.exceptions")?;
+    PY_CONFIGURATION_ERROR.get_or_init(|| module.getattr("ConfigurationError").unwrap().unbind());
+    PY_NO_RESOLVERS_ERROR.get_or_init(|| module.getattr("NoResolversError").unwrap().unbind());
+    PY_RESOLVER_ERROR.get_or_init(|| module.getattr("ResolverError").unwrap().unbind());
+    Ok(())
+}
+
+fn make_pyerr(py: Python<'_>, exc_type: &Py<PyAny>, msg: String) -> Option<PyErr> {
+    exc_type
+        .bind(py)
+        .clone()
+        .cast_exact::<PyType>()
+        .ok()
+        .map(|t| PyErr::from_type(t.clone(), (msg,)))
+}
+
+fn blastdns_error_to_pyerr(err: BlastDNSError) -> PyErr {
+    Python::attach(|py| {
+        // Try to initialize exception types if not already done
+        let _ = init_exception_types(py);
+
+        let msg = err.to_string();
+        let result = match &err {
+            BlastDNSError::NoResolvers => PY_NO_RESOLVERS_ERROR
+                .get()
+                .and_then(|t| make_pyerr(py, t, msg.clone())),
+            BlastDNSError::InvalidResolver { .. }
+            | BlastDNSError::InvalidHostname { .. }
+            | BlastDNSError::Configuration(_) => PY_CONFIGURATION_ERROR
+                .get()
+                .and_then(|t| make_pyerr(py, t, msg.clone())),
+            BlastDNSError::ResolverRequestFailed { .. }
+            | BlastDNSError::ResolverSetupFailed { .. }
+            | BlastDNSError::WorkerDropped
+            | BlastDNSError::QueueClosed => PY_RESOLVER_ERROR
+                .get()
+                .and_then(|t| make_pyerr(py, t, msg.clone())),
+        };
+        result.unwrap_or_else(|| {
+            // If exception types aren't initialized, something is wrong with the package
+            PyRuntimeError::new_err(format!(
+                "blastdns exception types not initialized (packaging bug?): {msg}"
+            ))
+        })
+    })
+}
+
 impl From<BlastDNSError> for PyErr {
     fn from(err: BlastDNSError) -> Self {
-        PyRuntimeError::new_err(err.to_string())
+        blastdns_error_to_pyerr(err)
     }
 }
 
@@ -573,10 +627,12 @@ fn get_system_resolvers_py() -> PyResult<Vec<String>> {
 }
 
 #[pymodule]
-fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
     m.add_class::<PyMockBlastDNSClient>()?;
     m.add_function(wrap_pyfunction!(get_system_resolvers_py, m)?)?;
+    // Eagerly initialize exception types so they're ready before any errors occur
+    let _ = init_exception_types(py);
     Ok(())
 }
 
