@@ -31,9 +31,16 @@ jobs:
       - name: Start test DNS server
         run: sudo ./scripts/start-test-dns.sh
 
+      - name: Start AXFR test server
+        run: ./scripts/start-test-axfr.sh
+
       - name: Run tests
         run: cargo test --all --locked --verbose -- --include-ignored
-      
+
+      - name: Stop AXFR test server
+        if: always()
+        run: ./scripts/stop-test-axfr.sh || true
+
       - name: Stop test DNS server
         if: always()
         run: ./scripts/stop-test-dns.sh || true

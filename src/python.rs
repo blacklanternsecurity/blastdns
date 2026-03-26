@@ -626,11 +626,44 @@ fn get_system_resolvers_py() -> PyResult<Vec<String>> {
     Ok(resolver_ips.iter().map(|ip| ip.to_string()).collect())
 }
 
+/// Perform an AXFR (full zone transfer) against a specific nameserver.
+/// Returns a list of (name, record_type, rdata) tuples.
+#[pyfunction]
+#[pyo3(signature = (nameserver, zone, timeout_secs = 6.0))]
+fn zone_transfer_py<'py>(
+    py: Python<'py>,
+    nameserver: String,
+    zone: String,
+    timeout_secs: f64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let timeout = std::time::Duration::from_secs_f64(timeout_secs);
+    future_into_py(py, async move {
+        let result = crate::zone_transfer::zone_transfer(&nameserver, &zone, timeout)
+            .await
+            .map_err(PyErr::from)?;
+
+        // Convert records to JSON-serializable tuples: (name, type, rdata_string)
+        let records: Vec<(String, String, String)> = result
+            .records
+            .iter()
+            .map(|record| {
+                let name = record.name().to_string();
+                let rtype = record.record_type().to_string();
+                let rdata = record.data().to_string();
+                (name, rtype, rdata)
+            })
+            .collect();
+
+        Ok(records)
+    })
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
     m.add_class::<PyMockBlastDNSClient>()?;
     m.add_function(wrap_pyfunction!(get_system_resolvers_py, m)?)?;
+    m.add_function(wrap_pyfunction!(zone_transfer_py, m)?)?;
     // Eagerly initialize exception types so they're ready before any errors occur
     let _ = init_exception_types(py);
     Ok(())
