@@ -282,7 +282,7 @@ async def test_client_resolve_batch_full_skip_empty_allows_errors():
         request_timeout_ms=100,
         max_retries=0,
     )
-    bad_client = Client(["127.0.0.1:5354"], bad_config)
+    bad_client = Client(["127.0.0.1:5399"], bad_config)
 
     error_count = 0
     async for host, result in bad_client.resolve_batch_full(["example.com"], "A", skip_empty=True):
@@ -327,7 +327,7 @@ async def test_client_resolve_batch_full_skip_errors_filters_error_responses():
         request_timeout_ms=100,
         max_retries=0,
     )
-    bad_client = Client(["127.0.0.1:5354"], bad_config)
+    bad_client = Client(["127.0.0.1:5399"], bad_config)
 
     # With skip_errors=False, should get errors
     error_count = 0

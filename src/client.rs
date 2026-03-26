@@ -482,7 +482,7 @@ mod tests {
             ..Default::default()
         };
         let bad_client = Arc::new(
-            BlastDNSClient::with_config(vec!["127.0.0.1:5354".to_string()], bad_resolver_config)
+            BlastDNSClient::with_config(vec!["127.0.0.1:5399".to_string()], bad_resolver_config)
                 .expect("client init"),
         );
 
@@ -520,7 +520,7 @@ mod tests {
             ..Default::default()
         };
         let bad_client = Arc::new(
-            BlastDNSClient::with_config(vec!["127.0.0.1:5354".to_string()], bad_resolver_config)
+            BlastDNSClient::with_config(vec!["127.0.0.1:5399".to_string()], bad_resolver_config)
                 .expect("client init"),
         );
 
