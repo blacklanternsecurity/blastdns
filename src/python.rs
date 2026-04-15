@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{Stream, StreamExt};
-use hickory_client::proto::rr::RecordType;
-use hickory_client::proto::xfer::DnsResponse;
+use hickory_proto::op::Message;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::xfer::DnsResponse;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyIterator, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
+use serde_json::Value;
 use std::sync::OnceLock;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant;
@@ -343,9 +345,64 @@ fn parse_record_type(input: Option<&str>) -> PyResult<RecordType> {
 
 fn dns_response_to_bytes(response: DnsResponse) -> PyResult<Vec<u8>> {
     let message = response.into_message();
-    let serialized = serde_json::to_vec(&message)
-        .map_err(|err| PyValueError::new_err(format!("failed to serialize response: {err}")))?;
-    Ok(serialized)
+    let value = message_to_extended_value(&message);
+    serde_json::to_vec(&value)
+        .map_err(|err| PyValueError::new_err(format!("failed to serialize response: {err}")))
+}
+
+/// Serialize a Message in the same shape Pydantic's Response model expects, but
+/// with each Record carrying pre-computed ``text`` (presentation format via
+/// hickory's ``Display``) and ``targets`` (host strings worth following).
+fn message_to_extended_value(message: &Message) -> Value {
+    let to_records = |records: &[Record]| -> Vec<Value> {
+        records.iter().map(record_to_extended_value).collect()
+    };
+    serde_json::json!({
+        "header": serde_json::to_value(message.header()).unwrap_or(Value::Null),
+        "queries": serde_json::to_value(message.queries()).unwrap_or(Value::Null),
+        "answers": to_records(message.answers()),
+        "name_servers": to_records(message.name_servers()),
+        "additionals": to_records(message.additionals()),
+        "signature": serde_json::to_value(message.signature()).unwrap_or(Value::Null),
+        "edns": serde_json::to_value(message.extensions()).unwrap_or(Value::Null),
+    })
+}
+
+fn record_to_extended_value(record: &Record) -> Value {
+    let data = record.data();
+    serde_json::json!({
+        "name_labels": record.name().to_string(),
+        "ttl": record.ttl(),
+        "dns_class": record.dns_class().to_string(),
+        "rdata": serde_json::to_value(data).unwrap_or(Value::Null),
+        "text": data.to_string(),
+        "targets": targets_for_rdata(data),
+    })
+}
+
+/// For rdata variants whose payload includes a hostname BBOT-style consumers
+/// want to follow (A/AAAA literal IPs, CNAME chain target, MX exchange, etc),
+/// return the list of ``(rdtype, host)`` pairs. Names are normalized: trailing
+/// dot stripped, lowercased -- matching the historical BBOT shape.
+///
+/// TXT is intentionally omitted: extracting hostnames from free-form TXT
+/// content (SPF/DKIM/etc) is consumer-specific and stays in BBOT.
+fn targets_for_rdata(data: &RData) -> Vec<(String, String)> {
+    let rdtype = data.record_type().to_string();
+    let normalize = |n: &Name| n.to_string().trim_end_matches('.').to_ascii_lowercase();
+    match data {
+        RData::A(addr) => vec![(rdtype, addr.to_string())],
+        RData::AAAA(addr) => vec![(rdtype, addr.to_string())],
+        RData::CNAME(c) => vec![(rdtype, normalize(&c.0))],
+        RData::NS(n) => vec![(rdtype, normalize(&n.0))],
+        RData::PTR(p) => vec![(rdtype, normalize(&p.0))],
+        RData::ANAME(a) => vec![(rdtype, normalize(&a.0))],
+        RData::MX(mx) => vec![(rdtype, normalize(mx.exchange()))],
+        RData::SRV(srv) => vec![(rdtype, normalize(srv.target()))],
+        RData::SOA(soa) => vec![(rdtype, normalize(soa.mname()))],
+        RData::NAPTR(naptr) => vec![(rdtype, normalize(naptr.replacement()))],
+        _ => Vec::new(),
+    }
 }
 
 fn error_to_bytes(err: BlastDNSError) -> PyResult<Vec<u8>> {
