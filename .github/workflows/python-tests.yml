@@ -107,7 +107,10 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          manylinux: auto
+          # manylinux2014's rust-cross image ships GCC 4.8.5 (predates C11
+          # atomics by ~6 months), which breaks aws-lc-sys' aarch64 build.
+          # 2_28 ships GCC 7.5.0 with full C11 support.
+          manylinux: "2_28"
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
