@@ -209,11 +209,13 @@ impl MockBlastDNSClient {
         // Mock inputs are zone-file format, no exceptions. Hand off to hickory's
         // zone-format parser, which handles A, AAAA, CNAME, NS, PTR, MX, SOA,
         // SRV, TXT, CAA, NAPTR, SVCB, HTTPS, TLSA, and the rest in one call.
-        RData::try_from_str(record_type, rdata_str).map(Some).map_err(|e| {
-            BlastDNSError::Configuration(format!(
-                "invalid mock {record_type} record `{rdata_str}`: {e}"
-            ))
-        })
+        RData::try_from_str(record_type, rdata_str)
+            .map(Some)
+            .map_err(|e| {
+                BlastDNSError::Configuration(format!(
+                    "invalid mock {record_type} record `{rdata_str}`: {e}"
+                ))
+            })
     }
 }
 
