@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
-use hickory_client::proto::op::{Header, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_client::proto::rr::rdata::{CNAME, MX, NS, NULL, PTR, TXT};
-use hickory_client::proto::rr::{Name, RData, Record, RecordType};
-use hickory_client::proto::xfer::DnsResponse;
+use hickory_proto::op::{Header, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::serialize::txt::RDataParser;
+use hickory_proto::xfer::DnsResponse;
 use regex::Regex;
 
 use crate::error::BlastDNSError;
@@ -206,80 +206,14 @@ impl MockBlastDNSClient {
         record_type: RecordType,
         rdata_str: &str,
     ) -> Result<Option<RData>, BlastDNSError> {
-        let rdata = match record_type {
-            RecordType::A => {
-                let addr = rdata_str
-                    .parse()
-                    .map_err(|e| BlastDNSError::Configuration(format!("invalid A record: {e}")))?;
-                RData::A(addr)
-            }
-            RecordType::AAAA => {
-                let addr = rdata_str.parse().map_err(|e| {
-                    BlastDNSError::Configuration(format!("invalid AAAA record: {e}"))
-                })?;
-                RData::AAAA(addr)
-            }
-            RecordType::CNAME => {
-                let name = Name::from_str(rdata_str)
-                    .map_err(|e| BlastDNSError::Configuration(format!("invalid CNAME: {e}")))?;
-                RData::CNAME(CNAME(name))
-            }
-            RecordType::MX => {
-                // MX records like "10 aspmx.l.google.com."
-                let parts: Vec<&str> = rdata_str.split_whitespace().collect();
-                if parts.len() == 2 {
-                    let preference = parts[0].parse().map_err(|e| {
-                        BlastDNSError::Configuration(format!("invalid MX preference: {e}"))
-                    })?;
-                    let exchange = Name::from_str(parts[1])
-                        .map_err(|e| BlastDNSError::Configuration(format!("invalid MX: {e}")))?;
-                    RData::MX(MX::new(preference, exchange))
-                } else {
-                    let exchange = Name::from_str(rdata_str)
-                        .map_err(|e| BlastDNSError::Configuration(format!("invalid MX: {e}")))?;
-                    RData::MX(MX::new(0, exchange))
-                }
-            }
-            RecordType::TXT => {
-                // DNS TXT strings are limited to 255 bytes each.
-                // Split long strings into 255-byte chunks.
-                let bytes = rdata_str.as_bytes();
-                let mut chunks = Vec::new();
-                for chunk in bytes.chunks(255) {
-                    chunks.push(String::from_utf8_lossy(chunk).to_string());
-                }
-                RData::TXT(TXT::new(chunks))
-            }
-            RecordType::NS => {
-                let name = Name::from_str(rdata_str)
-                    .map_err(|e| BlastDNSError::Configuration(format!("invalid NS: {e}")))?;
-                RData::NS(NS(name))
-            }
-            RecordType::PTR => {
-                let name = Name::from_str(rdata_str)
-                    .map_err(|e| BlastDNSError::Configuration(format!("invalid PTR: {e}")))?;
-                RData::PTR(PTR(name))
-            }
-            RecordType::SOA => {
-                // For simplicity, parse as minimal SOA or return None
-                return Ok(None);
-            }
-            RecordType::SRV => {
-                // For simplicity, parse as minimal SRV or return None
-                return Ok(None);
-            }
-            other => {
-                // For unsupported record types, store the raw string as NULL data
-                // This allows the mock to pass through arbitrary record data
-                let raw_bytes = rdata_str.as_bytes().to_vec();
-                RData::Unknown {
-                    code: other,
-                    rdata: NULL::with(raw_bytes),
-                }
-            }
-        };
-
-        Ok(Some(rdata))
+        // Mock inputs are zone-file format, no exceptions. Hand off to hickory's
+        // zone-format parser, which handles A, AAAA, CNAME, NS, PTR, MX, SOA,
+        // SRV, TXT, CAA, NAPTR, SVCB, HTTPS, TLSA, and the rest in one call.
+        RData::try_from_str(record_type, rdata_str).map(Some).map_err(|e| {
+            BlastDNSError::Configuration(format!(
+                "invalid mock {record_type} record `{rdata_str}`: {e}"
+            ))
+        })
     }
 }
 

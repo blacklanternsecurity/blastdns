@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -54,12 +54,33 @@ class Query(BaseModel):
 
 
 class Record(BaseModel):
-    """DNS resource record (answer, name server, or additional)."""
+    """DNS resource record (answer, name server, or additional).
+
+    ``text`` and ``targets`` are computed on the Rust side from the underlying
+    hickory ``RData`` so callers don't have to re-derive presentation format
+    or pull host names out of nested rdata dicts in Python.
+    """
 
     name_labels: str
     ttl: int
     dns_class: str
     rdata: Dict[str, Any]
+    text: str = ""
+    targets: List[Tuple[str, str]] = Field(default_factory=list)
+
+    def to_text(self) -> str:
+        """Presentation (zone-file) format of the rdata. Equivalent to
+        dnspython's ``answer.to_text()``."""
+        return self.text
+
+    def extract_targets(self) -> List[Tuple[str, str]]:
+        """Hostnames embedded in the rdata that BBOT-style consumers want to
+        follow (A literal IPs, CNAME chain target, MX exchange, etc).
+
+        TXT records return ``[]`` -- pulling hostnames out of free-form TXT
+        content (SPF/DKIM/etc) is consumer-specific and is up to the caller.
+        """
+        return list(self.targets)
 
 
 class Response(BaseModel):
