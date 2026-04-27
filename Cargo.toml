@@ -23,7 +23,7 @@ crossfire = "2.1.7"
 futures = "0.3.31"
 hickory-proto = { version = "0.25.2", features = ["serde", "dnssec-aws-lc-rs", "text-parsing", "tokio"] }
 hickory-client = { version = "0.25.2", features = ["serde", "dnssec-aws-lc-rs"] }
-hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config"] }
+hickory-resolver = { version = "0.26.0", default-features = false, features = ["system-config"] }
 libc = "0.2"
 lru = "0.16"
 regex = "1"
