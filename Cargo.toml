@@ -25,7 +25,7 @@ hickory-proto = { version = "0.25.2", features = ["serde", "dnssec-aws-lc-rs", "
 hickory-client = { version = "0.25.2", features = ["serde", "dnssec-aws-lc-rs"] }
 hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config"] }
 libc = "0.2"
-lru = "0.16"
+lru = "0.18"
 regex = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
