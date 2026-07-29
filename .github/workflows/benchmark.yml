@@ -32,7 +32,7 @@ jobs:
           sudo cp /tmp/massdns/bin/massdns /usr/local/bin/massdns
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
