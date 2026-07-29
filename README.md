@@ -64,8 +64,16 @@ Options:
           Record type to query (A, AAAA, MX, ...) [default: A]
       --resolvers <FILE>
           File containing DNS nameservers (one per line)
-      --threads-per-resolver <THREADS_PER_RESOLVER>
-          Worker threads per resolver [default: 2]
+      --max-inflight-per-resolver <MAX_INFLIGHT_PER_RESOLVER>
+          Maximum queries in flight to any single resolver [default: 2]
+      --max-concurrency <MAX_CONCURRENCY>
+          Maximum queries in flight across all resolvers [default: 256]
+      --rate-limit <RATE_LIMIT>
+          Ceiling on dispatch rate in queries per second (0 = unlimited) [default: 0]
+      --resolver-probe
+          Drop resolvers that don't answer a probe query at startup
+      --no-adaptive
+          Disable automatic backoff when resolvers start losing queries
       --timeout-ms <TIMEOUT_MS>
           Per-request timeout in milliseconds [default: 1000]
       --retries <RETRIES>
@@ -213,7 +221,8 @@ let client = BlastDNSClient::new(resolvers).await?;
 
 // or with custom config
 let mut config = BlastDNSConfig::default();
-config.threads_per_resolver = 5;
+config.max_concurrency = 512;             // total queries in flight
+config.max_inflight_per_resolver = 4;     // per-resolver politeness bound
 config.request_timeout = Duration::from_secs(2);
 let client = BlastDNSClient::with_config(resolvers, config).await?;
 
@@ -373,7 +382,7 @@ from blastdns import Client, ClientConfig, DNSResult, DNSError, get_system_resol
 
 async def main():
     # Option 1: Use system resolvers (pass empty list)
-    client = Client([], ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
+    client = Client([], ClientConfig(max_inflight_per_resolver=4, request_timeout_ms=1500))
     
     # Check what resolvers are being used
     print(f"Using resolvers: {client.resolvers}")
@@ -384,7 +393,7 @@ async def main():
     
     # Option 3: Use custom resolvers
     resolvers = ["1.1.1.1:53", "8.8.8.8:53"]
-    client = Client(resolvers, ClientConfig(threads_per_resolver=4, request_timeout_ms=1500))
+    client = Client(resolvers, ClientConfig(max_inflight_per_resolver=4, request_timeout_ms=1500))
 
     # resolve: lookup a single host, returns only rdata strings
     answers = await client.resolve("example.com", "A")
@@ -577,15 +586,50 @@ The `*_full()` methods return Pydantic V2 models for type safety and IDE autocom
 
 The base methods (`resolve`, `resolve_batch`, `resolve_multi`) return simple Python types (lists, dicts, strings) for convenience when you don't need the full response structure.
 
-`ClientConfig` exposes the knobs shown above (`threads_per_resolver`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
+`ClientConfig` exposes the knobs shown above (`max_concurrency`, `max_inflight_per_resolver`, `rate_limit`, `adaptive`, `resolver_probe`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
+
+`Client.stats()` returns a `ResolverStats` per resolver, with cumulative counters where `attempted == answered + empty + timeout + error`. Diff two snapshots to account for a batch in full, including queries that never came back:
+
+```python
+before = {s.resolver: s.attempted for s in client.stats()}
+async for host, rdtype, answers in client.resolve_batch(hosts, "A"):
+    ...
+for s in client.stats():
+    sent = s.attempted - before[s.resolver]
+    print(f"{s.resolver}: {sent} sent, {s.timeout} timed out, pacing={s.rate_qps or 'unlimited'}")
+```
 
 ## Architecture
 
 BlastDNS is built on top of [`hickory-dns`](https://github.com/hickory-dns/hickory-dns), but only makes use of the low-level Client API, not the Resolver API.
 
-Beneath the hood of the `BlastDNSClient`, each resolver gets its own `ResolverWorker` tasks, with a configurable number of workers per resolver (default: 2, configurable via `BlastDNSConfig.threads_per_resolver`).
-
 When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which contains the request (host + rdtype) and a oneshot channel to hold the result. This `WorkItem` is put into a [crossfire](https://github.com/frostyplanet/crossfire-rs) MPMC queue, to be picked up by the first available `ResolverWorker`. Workers are spawned lazily when the first request is made.
+
+Workers are not bound to a resolver. `BlastDNSConfig.max_concurrency` (default: 256) sets how many workers exist and therefore how many queries are in flight overall, independently of how many resolvers are configured. Each worker picks a resolver per query, so adding resolvers increases the throughput available at a given politeness level rather than changing the concurrency limit.
+
+One UDP socket is opened per resolver, created on first use and shared by every worker that selects it, so file descriptor use scales with the resolver count and not with concurrency.
+
+### Dispatch Limits
+
+Three independent limits govern throughput. The tightest one binds.
+
+- **`max_concurrency`**: total queries in flight.
+- **`max_inflight_per_resolver`** (default: 2): the politeness bound. No resolver receives more than this at once, however large the pool or the workload. Because a busy resolver holds its permits until its query completes, resolver selection naturally sends less work to slow resolvers with no explicit weighting.
+- **`rate_limit`**: a ceiling on dispatch rate in queries per second. Unset means unlimited. Pacing is interval-based rather than token-bucketed, so there is no burst allowance and a resolver never sees a thundering herd on the first tick.
+
+### Adaptive Backoff
+
+With `adaptive` enabled (the default), BlastDNS does not need to be told how fast to go. It watches loss per resolver, and when a resolver starts dropping queries it records the rate at which that happened and holds below it. A configured `rate_limit` is a separate hard cap applied on top: adaptation happens either way, and the configured value only ever lowers the effective rate.
+
+A discovered limit expires after a while so the controller probes upward again, which keeps one transient blip from capping the rest of a long run.
+
+Loss on a single resolver throttles only that resolver. Cutting the *global* rate additionally requires loss to appear across many resolvers at once, and only resolvers that have previously delivered a clean interval can vote that way. This matters for large public resolver lists, where many entries never worked at all: that is a lot of broken resolvers, not evidence of congestion on our side, and retries are exactly what finds the live ones. When loss genuinely is correlated, retries are suppressed until it clears, since retrying into your own saturated egress only adds load.
+
+`Client.stats()` reports the current pacing rate per resolver, so a run that is going slowly can be explained rather than guessed at.
+
+### Optional Startup Probe
+
+With `resolver_probe` enabled, each resolver is queried once at startup and those that do not answer are dropped for the life of the client. This is aimed at large public resolver lists, where a substantial fraction of entries are typically dead. Probing queries the root nameservers, so liveness does not depend on any external zone.
 
 ### Caching
 
@@ -608,7 +652,7 @@ BlastDNS handles unreliable resolvers through a multi-layered retry system:
 
 **Client-Level Retries**: When a query fails with a retryable error (network timeouts, connection failures), the client automatically retries up to `max_retries` times (default: 10). Each retry creates a fresh `WorkItem` and sends it back to the shared queue, where it can be picked up by **any available worker**—not necessarily the same resolver. This means retries naturally route around problematic resolvers.
 
-**Purgatory System**: Each worker tracks consecutive errors. After hitting `purgatory_threshold` failures (default: 10), the worker enters "purgatory"—it sleeps for `purgatory_sentence` milliseconds (default: 1000ms) before resuming work. This temporarily sidelines struggling resolvers without removing them entirely, allowing the system to self-heal if resolver issues are transient.
+**Purgatory System**: Each resolver tracks consecutive errors. After hitting `purgatory_threshold` failures (default: 10), the resolver is benched for `purgatory_sentence` milliseconds (default: 1000ms) and skipped during selection. This temporarily sidelines struggling resolvers without removing them entirely, allowing the system to self-heal if resolver issues are transient.
 
 **Non-Retryable Errors**: Configuration errors (invalid hostnames) and system errors (queue closed) fail immediately without retry, preventing wasted work on queries that can't succeed.
 

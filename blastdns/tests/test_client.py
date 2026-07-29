@@ -27,7 +27,11 @@ def test_get_system_resolvers():
 def test_client_config_defaults():
     cfg = ClientConfig()
     assert cfg.model_dump() == {
-        "threads_per_resolver": 2,
+        "max_inflight_per_resolver": 2,
+        "max_concurrency": 256,
+        "rate_limit": None,
+        "adaptive": True,
+        "resolver_probe": False,
         "request_timeout_ms": 1000,
         "max_retries": 10,
         "purgatory_threshold": 10,
@@ -40,14 +44,22 @@ def test_client_config_defaults():
 
 def test_client_config_custom_values():
     cfg = ClientConfig(
-        threads_per_resolver=4,
+        max_inflight_per_resolver=4,
+        max_concurrency=512,
+        rate_limit=250.0,
+        adaptive=False,
+        resolver_probe=True,
         request_timeout_ms=2500,
         max_retries=3,
         purgatory_threshold=7,
         purgatory_sentence_ms=2000,
     )
     data = cfg.model_dump()
-    assert data["threads_per_resolver"] == 4
+    assert data["max_inflight_per_resolver"] == 4
+    assert data["max_concurrency"] == 512
+    assert data["rate_limit"] == 250.0
+    assert data["adaptive"] is False
+    assert data["resolver_probe"] is True
     assert data["request_timeout_ms"] == 2500
     assert data["max_retries"] == 3
     assert data["purgatory_threshold"] == 7
@@ -344,3 +356,38 @@ async def test_client_resolve_batch_full_skip_errors_filters_error_responses():
         filtered_count += 1
 
     assert filtered_count == 0, "errors should be filtered with skip_errors=True"
+
+
+def test_stats_start_at_zero_and_cover_every_resolver():
+    resolvers = ["127.0.0.1:5353", "127.0.0.2:5353"]
+    client = Client(resolvers)
+    stats = client.stats()
+
+    assert [s.resolver for s in stats] == resolvers, "one entry per configured resolver"
+    for s in stats:
+        assert s.attempted == 0
+        assert s.rate_qps is None, "nothing is throttled before any traffic"
+
+
+@pytest.mark.asyncio
+async def test_stats_account_for_every_query():
+    """Every dispatched query must land in exactly one outcome bucket, so a
+    caller can tell a complete batch from one that silently lost queries."""
+    client = Client(["127.0.0.1:5353"], ClientConfig(cache_capacity=0, max_retries=0))
+
+    hosts = [f"stats{i}.bench.local" for i in range(25)]
+    answered = 0
+    async for _host, _rdtype, _answers in client.resolve_batch(hosts, "A"):
+        answered += 1
+
+    (s,) = client.stats()
+    assert s.attempted == len(hosts)
+    assert s.answered + s.empty + s.timeout + s.error == s.attempted
+    assert s.answered == answered
+    assert s.rtt_mean_us > 0, "responses should record a round-trip time"
+
+
+def test_mock_client_reports_no_stats():
+    from blastdns import MockClient
+
+    assert MockClient().stats() == []

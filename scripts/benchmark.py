@@ -19,7 +19,7 @@ import dns.message
 import uvloop
 from tabulate import tabulate
 
-from blastdns import Client
+from blastdns import Client, ClientConfig
 
 
 # =============================================================================
@@ -101,7 +101,13 @@ async def benchmark_dnspython(hostnames, num_workers, nameserver):
 
 async def benchmark_blastdns(hostnames, num_workers, nameserver):
     """Benchmark blastdns with resolve_batch."""
-    client = Client([nameserver], config=None)
+    client = Client(
+        [nameserver],
+        # Honor num_workers, and turn off the features the other engines don't
+        # have, so this measures dispatch throughput rather than caching or
+        # adaptive backoff.
+        config=ClientConfig(max_concurrency=num_workers, adaptive=False, cache_capacity=0),
+    )
 
     start_time = time.perf_counter()
 
@@ -150,8 +156,12 @@ def benchmark_blastdns_native(hostnames, num_workers, nameserver):
                 hosts_path,
                 "--resolvers",
                 resolver_path,
-                "--threads-per-resolver",
+                "--max-concurrency",
                 str(num_workers),
+                # Measure raw engine throughput. Adaptive backoff would make the
+                # result depend on how the local resolver behaves under load,
+                # which is not what this comparison is isolating.
+                "--no-adaptive",
             ],
             capture_output=True,
             text=True,
