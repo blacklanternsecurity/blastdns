@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
 use hickory_client::proto::{op::Query, rr::RecordType, xfer::DnsResponse};
@@ -8,7 +15,10 @@ use tracing::debug;
 use crate::{
     cache::SimpleCache,
     config::BlastDNSConfig,
+    controller::AdaptiveController,
     error::BlastDNSError,
+    health::{ResolverPool, ResolverStats},
+    limiter::{RateLimiter, UNLIMITED_QPS},
     resolver::DnsResolver,
     utils::{check_ulimits, format_ptr_query, get_system_resolvers, parse_resolver},
     worker::{QuerySpec, ResolverWorker, WorkItem},
@@ -18,6 +28,11 @@ use crate::{
 #[derive(Clone)]
 pub struct BlastDNSClient {
     resolvers: Vec<SocketAddr>,
+    pool: Arc<ResolverPool>,
+    limiter: Arc<RateLimiter>,
+    /// Set by the controller while our own dispatch rate looks like the
+    /// bottleneck. Retrying into that only adds load.
+    suppress_retries: Arc<AtomicBool>,
     work_tx: MAsyncTx<WorkItem>,
     work_rx: MAsyncRx<WorkItem>,
     config: BlastDNSConfig,
@@ -72,13 +87,16 @@ impl BlastDNSClient {
             .map(|input| parse_resolver(&input))
             .collect::<Result<_, _>>()?;
 
-        let resolver_count = parsed.len();
+        // One socket per resolver, created on first use.
+        check_ulimits(parsed.len()).map_err(|e| BlastDNSError::Configuration(e.to_string()))?;
 
-        // Check system ulimits before spawning workers
-        check_ulimits(resolver_count, config.threads_per_resolver)
-            .map_err(|e| BlastDNSError::Configuration(e.to_string()))?;
+        let queue_capacity = config.max_concurrency.max(1);
+        let pool = Arc::new(ResolverPool::new(&parsed, &config));
+        // Always present so the controller has something to lower. An unset rate
+        // limit starts effectively unlimited rather than absent.
+        let limiter = Arc::new(RateLimiter::new(config.rate_limit.unwrap_or(UNLIMITED_QPS)));
 
-        let queue_capacity = (resolver_count * config.threads_per_resolver).max(1);
+        let suppress_retries = Arc::new(AtomicBool::new(false));
 
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
@@ -93,6 +111,9 @@ impl BlastDNSClient {
 
         Ok(Self {
             resolvers: parsed,
+            pool,
+            limiter,
+            suppress_retries,
             work_tx,
             work_rx,
             config,
@@ -107,11 +128,51 @@ impl BlastDNSClient {
         self.resolvers.iter().map(|addr| addr.to_string()).collect()
     }
 
-    /// Ensure workers are spawned (called lazily on first use).
+    /// Per-resolver counter snapshots, one entry per configured resolver.
+    ///
+    /// Counters are cumulative for the life of the client. Diff two snapshots to
+    /// account for a batch: every dispatched query lands in exactly one of
+    /// `answered`, `empty`, `timeout`, or `error`.
+    pub fn stats(&self) -> Vec<ResolverStats> {
+        self.pool.stats()
+    }
+
+    /// Ensure the pool is probed and workers are spawned (lazily, on first use).
     async fn ensure_workers(&self) {
+        let pool = self.pool.clone();
+        let limiter = self.limiter.clone();
+        let work_rx = self.work_rx.clone();
+        let concurrency = self.config.max_concurrency.max(1);
+        let probe = self.config.resolver_probe;
+        let adaptive = self.config.adaptive;
+        let ceiling = self.config.rate_limit.unwrap_or(UNLIMITED_QPS);
+        let suppress_retries = self.suppress_retries.clone();
+
         self.workers_spawned
-            .get_or_init(|| async {
-                self.spawn_workers(self.work_rx.clone());
+            .get_or_init(|| async move {
+                if probe {
+                    pool.probe(concurrency).await;
+                }
+                if adaptive {
+                    AdaptiveController::new(
+                        pool.resolvers().len(),
+                        limiter.clone(),
+                        ceiling,
+                        suppress_retries,
+                    )
+                    .spawn(&pool);
+                }
+                // Total concurrency is the worker count. Each worker picks a
+                // resolver per query, and the pool's per-resolver permits keep
+                // any single resolver from being oversubscribed.
+                for worker_idx in 0..concurrency {
+                    ResolverWorker::spawn(
+                        pool.clone(),
+                        limiter.clone(),
+                        work_rx.clone(),
+                        worker_idx,
+                    );
+                }
             })
             .await;
     }
@@ -195,7 +256,8 @@ impl BlastDNSClient {
                         error = %err,
                         "DNS resolution attempt failed"
                     );
-                    if attempt + 1 == attempts || !err.is_retryable() {
+                    let suppressed = self.suppress_retries.load(Ordering::Relaxed);
+                    if attempt + 1 == attempts || !err.is_retryable() || suppressed {
                         return Err(err);
                     }
                 }
@@ -203,16 +265,6 @@ impl BlastDNSClient {
         }
 
         Err(BlastDNSError::WorkerDropped)
-    }
-
-    fn spawn_workers(&self, work_rx: MAsyncRx<WorkItem>) {
-        let threads = self.config.threads_per_resolver.max(1);
-
-        for &resolver in &self.resolvers {
-            for worker_idx in 0..threads {
-                ResolverWorker::spawn(resolver, work_rx.clone(), self.config.clone(), worker_idx);
-            }
-        }
     }
 }
 
@@ -284,12 +336,13 @@ mod tests {
         let resolver: SocketAddr = "127.0.0.1:5353".parse().unwrap();
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
+        let pool = Arc::new(ResolverPool::new(&[resolver], &config));
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
-        ResolverWorker::spawn(resolver, rx, config.clone(), 0);
+        ResolverWorker::spawn(pool, Arc::new(RateLimiter::new(UNLIMITED_QPS)), rx, 0);
 
         let query = QuerySpec {
             host: "example.com.".into(),
@@ -327,12 +380,13 @@ mod tests {
         let resolver: SocketAddr = "[::1]:5353".parse().unwrap();
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
+        let pool = Arc::new(ResolverPool::new(&[resolver], &config));
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
-        ResolverWorker::spawn(resolver, rx, config.clone(), 0);
+        ResolverWorker::spawn(pool, Arc::new(RateLimiter::new(UNLIMITED_QPS)), rx, 0);
 
         let query = QuerySpec {
             host: "example.com.".into(),
@@ -356,7 +410,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -393,7 +447,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -477,7 +531,7 @@ mod tests {
         // Test that errors still pass through with skip_empty=true
         let bad_resolver_config = BlastDNSConfig {
             request_timeout: Duration::from_millis(100),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -515,7 +569,7 @@ mod tests {
     async fn resolve_batch_full_skip_errors_filters_error_responses() {
         let bad_resolver_config = BlastDNSConfig {
             request_timeout: Duration::from_millis(100),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -589,7 +643,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 2,
+            max_inflight_per_resolver: 2,
             ..Default::default()
         };
 
@@ -624,7 +678,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 2,
+            max_inflight_per_resolver: 2,
             ..Default::default()
         };
 
@@ -674,7 +728,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -706,7 +760,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 2,
+            max_inflight_per_resolver: 2,
             ..Default::default()
         };
 
@@ -767,7 +821,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -791,7 +845,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -842,7 +896,7 @@ mod tests {
         let resolvers = vec!["8.8.8.8:53".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -902,7 +956,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             cache_capacity: 100,
             ..Default::default()
         };
@@ -961,7 +1015,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             cache_capacity: 0, // Disable cache
             ..Default::default()
         };

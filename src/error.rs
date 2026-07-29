@@ -1,6 +1,9 @@
 use std::net::{AddrParseError, SocketAddr};
 
-use hickory_client::{ClientError, proto::ProtoError};
+use hickory_client::{
+    ClientError, ClientErrorKind,
+    proto::{ProtoError, ProtoErrorKind},
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -46,6 +49,20 @@ impl BlastDNSError {
             self,
             BlastDNSError::ResolverRequestFailed { .. } | BlastDNSError::WorkerDropped
         )
+    }
+
+    /// Returns `true` when the query got no response at all, as opposed to
+    /// failing for some other reason. Over UDP this is the loss signal.
+    pub fn is_timeout(&self) -> bool {
+        let BlastDNSError::ResolverRequestFailed { source, .. } = self else {
+            return false;
+        };
+        match source.kind() {
+            ClientErrorKind::Timeout => true,
+            ClientErrorKind::Io(e) => e.kind() == std::io::ErrorKind::TimedOut,
+            ClientErrorKind::Proto(e) => matches!(e.kind(), ProtoErrorKind::Timeout),
+            _ => false,
+        }
     }
 }
 

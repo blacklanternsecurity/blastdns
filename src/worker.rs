@@ -1,19 +1,21 @@
-use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crossfire::MAsyncRx;
 use hickory_client::{
-    client::{Client, ClientHandle},
+    client::ClientHandle,
     proto::{
         rr::{DNSClass, Name, RecordType},
-        runtime::TokioRuntimeProvider,
-        udp::UdpClientStream,
         xfer::DnsResponse,
     },
 };
-use tokio::{sync::oneshot, time::sleep};
+use tokio::{sync::oneshot, time::Instant};
 use tracing::debug;
 
-use crate::{BlastDNSConfig, error::BlastDNSError};
+use crate::{
+    error::BlastDNSError,
+    health::{ResolverHealth, ResolverPool},
+    limiter::RateLimiter,
+};
 
 /// DNS query specification containing the hostname and record type to query.
 #[derive(Debug)]
@@ -43,134 +45,109 @@ impl WorkItem {
     }
 }
 
-/// Worker that processes DNS queries by forwarding them to a resolver.
+/// Worker that pulls queries off the shared queue and dispatches each one to a
+/// resolver chosen from the pool.
+///
+/// Workers are not bound to a resolver. Capacity per resolver is enforced by the
+/// pool's per-resolver permits, so the worker count sets total concurrency
+/// independently of how many resolvers are configured.
 pub(crate) struct ResolverWorker {
-    resolver: SocketAddr,
-    config: BlastDNSConfig,
+    pool: Arc<ResolverPool>,
+    limiter: Arc<RateLimiter>,
     work_rx: MAsyncRx<WorkItem>,
-    client: Option<Client>,
 }
 
 impl ResolverWorker {
-    /// Spawns a new resolver worker task.
+    /// Spawns a new worker task.
     pub fn spawn(
-        resolver: SocketAddr,
+        pool: Arc<ResolverPool>,
+        limiter: Arc<RateLimiter>,
         work_rx: MAsyncRx<WorkItem>,
-        config: BlastDNSConfig,
         worker_idx: usize,
     ) {
         tokio::spawn(async move {
-            let resolver_addr = resolver;
             let worker = Self {
-                resolver: resolver_addr,
-                config,
+                pool,
+                limiter,
                 work_rx,
-                client: None,
             };
-
-            match worker.run().await {
-                Ok(()) => debug!("resolver worker {resolver_addr} (#{worker_idx}) shutting down"),
-                Err(err) => {
-                    eprintln!("resolver worker {resolver_addr} (#{worker_idx}) exited: {err:?}")
-                }
-            }
+            worker.run().await;
+            debug!(worker_idx, "resolver worker shutting down");
         });
     }
 
-    /// Main worker loop that receives and processes queries until the channel closes.
-    async fn run(mut self) -> Result<(), BlastDNSError> {
-        let mut consecutive_errors = 0usize;
-
-        loop {
-            if self.config.purgatory_threshold > 0
-                && consecutive_errors >= self.config.purgatory_threshold
-            {
-                let sentence = self.config.purgatory_sentence;
-                if !sentence.is_zero() {
-                    debug!(
-                        resolver = %self.resolver,
-                        sentence = ?sentence,
-                        consecutive_errors,
-                        "entering purgatory"
-                    );
-                    sleep(sentence).await;
-                }
-                consecutive_errors = consecutive_errors.saturating_sub(1);
-            }
-
-            let work_item = match self.work_rx.recv().await {
-                Ok(item) => item,
-                Err(_) => break,
-            };
-
-            // Lazy initialization: create client on first use
-            if self.client.is_none() {
-                self.client = Some(self.init_client().await?);
-            }
-
+    /// Main worker loop that receives and dispatches queries until the channel
+    /// closes.
+    async fn run(self) {
+        while let Ok(work_item) = self.work_rx.recv().await {
             let WorkItem { query, responder } = work_item;
-            match self.handle_query(query).await {
-                Ok(response) => {
-                    consecutive_errors = consecutive_errors.saturating_sub(1);
-                    let _ = responder.send(Ok(response));
+
+            // Reject unusable hostnames before spending a dispatch slot.
+            let name = match Name::from_ascii(&query.host) {
+                Ok(name) => name,
+                Err(source) => {
+                    let _ = responder.send(Err(BlastDNSError::InvalidHostname {
+                        name: query.host,
+                        source,
+                    }));
+                    continue;
                 }
-                Err(err) => {
-                    consecutive_errors = consecutive_errors.saturating_add(1);
-                    let _ = responder.send(Err(err));
-                }
-            }
+            };
+
+            // Pace dispatch before taking capacity, so the configured rate
+            // governs sends instead of being distorted by completion timing.
+            self.limiter.acquire().await;
+
+            let Some(reservation) = self.pool.reserve().await else {
+                let _ = responder.send(Err(BlastDNSError::NoResolvers));
+                continue;
+            };
+
+            // Respect the chosen resolver's own pacing on top of the global rate.
+            reservation.resolver.acquire_rate().await;
+
+            let result = Self::query(&reservation.resolver, name, query.record_type).await;
+            let _ = responder.send(result);
         }
-
-        Ok(())
     }
 
-    /// Initializes a DNS client connected to the configured resolver.
-    async fn init_client(&self) -> Result<Client, BlastDNSError> {
-        let provider = TokioRuntimeProvider::new();
-        let stream = UdpClientStream::builder(self.resolver, provider)
-            .with_timeout(Some(self.config.request_timeout))
-            .build();
+    /// Executes a single query against one resolver and records the outcome.
+    async fn query(
+        health: &ResolverHealth,
+        name: Name,
+        record_type: RecordType,
+    ) -> Result<DnsResponse, BlastDNSError> {
+        health.record_dispatch();
 
-        let (client, bg) =
-            Client::connect(stream)
-                .await
-                .map_err(|source| BlastDNSError::ResolverSetupFailed {
-                    resolver: self.resolver,
-                    source,
-                })?;
-
-        let resolver = self.resolver;
-        tokio::spawn(async move {
-            if let Err(err) = bg.await {
-                eprintln!("resolver {resolver} background task exited: {err}");
+        let mut client = match health.client().await {
+            Ok(client) => client,
+            Err(err) => {
+                health.record_error(false);
+                return Err(err);
             }
-        });
-
-        Ok(client)
-    }
-
-    /// Executes a DNS query using the client and returns the response.
-    async fn handle_query(&mut self, query: QuerySpec) -> Result<DnsResponse, BlastDNSError> {
-        let QuerySpec { host, record_type } = query;
+        };
 
         debug!(
-            resolver = %self.resolver,
-            host,
+            resolver = %health.addr(),
+            %name,
             %record_type,
             "querying DNS resolver"
         );
 
-        let name = Name::from_ascii(&host)
-            .map_err(|source| BlastDNSError::InvalidHostname { name: host, source })?;
-
-        self.client
-            .as_mut()
-            .unwrap()
-            .query(name, DNSClass::IN, record_type)
-            .await
-            .map_err(|source| BlastDNSError::ResolverRequestFailed {
-                resolver: self.resolver,
-                source,
-            })
+        let started = Instant::now();
+        match client.query(name, DNSClass::IN, record_type).await {
+            Ok(response) => {
+                health.record_response(started.elapsed(), !response.answers().is_empty());
+                Ok(response)
+            }
+            Err(source) => {
+                let err = BlastDNSError::ResolverRequestFailed {
+                    resolver: health.addr(),
+                    source,
+                };
+                health.record_error(err.is_timeout());
+                Err(err)
+            }
+        }
     }
 }

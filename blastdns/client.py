@@ -1,8 +1,10 @@
+from typing import Optional
+
 import orjson
 from pydantic import BaseModel, Field
 
 from . import _native  # type: ignore
-from .models import DNSError, DNSResult, DNSResultOrError
+from .models import DNSError, DNSResult, DNSResultOrError, ResolverStats
 
 __all__ = [
     "ClientConfig",
@@ -29,7 +31,24 @@ def get_system_resolvers() -> list[str]:
 
 
 class ClientConfig(BaseModel):
-    threads_per_resolver: int = Field(default=2, ge=1)
+    """Configuration for a :class:`Client`.
+
+    Throughput is governed by three independent limits: ``max_concurrency`` caps
+    total queries in flight, ``max_inflight_per_resolver`` caps how many any one
+    resolver receives at once (the politeness bound), and ``rate_limit`` caps the
+    dispatch rate outright. The tightest one binds.
+
+    With ``adaptive`` on (the default), pacing also backs off on its own: when a
+    resolver starts losing queries, its rate retreats below the rate at which that
+    began. ``rate_limit`` is an additional hard cap, not a replacement for it, so
+    adaptation happens whether or not one is set.
+    """
+
+    max_inflight_per_resolver: int = Field(default=2, ge=1)
+    max_concurrency: int = Field(default=256, ge=1)
+    rate_limit: Optional[float] = Field(default=None, gt=0)
+    adaptive: bool = Field(default=True)
+    resolver_probe: bool = Field(default=False)
     request_timeout_ms: int = Field(default=1000, ge=1)
     max_retries: int = Field(default=10, ge=0)
     purgatory_threshold: int = Field(default=10, ge=1)
@@ -70,6 +89,21 @@ class Client:
             print(client.resolvers)  # ["8.8.8.8:53"]
         """
         return self._inner.resolvers
+
+    def stats(self) -> list[ResolverStats]:
+        """Cumulative per-resolver counters, one entry per configured resolver.
+
+        Every dispatched query lands in exactly one of ``answered``, ``empty``,
+        ``timeout``, or ``error``, so diffing two snapshots accounts for a batch
+        in full and reveals queries that never came back.
+
+        Example:
+            before = {s.resolver: s for s in client.stats()}
+            async for host, rdtype, answers in client.resolve_batch(hosts, "A"):
+                ...
+            after = client.stats()
+        """
+        return [ResolverStats.model_validate(s) for s in orjson.loads(self._inner.stats())]
 
     async def resolve(self, host, record_type=None) -> list[str]:
         """Resolve a hostname to DNS records, returning simplified rdata strings.
@@ -231,6 +265,10 @@ class MockClient(Client):
     def resolvers(self) -> list[str]:
         """Mock client has no real resolvers."""
         return ["mock:53"]
+
+    def stats(self) -> list[ResolverStats]:
+        """Mock client dispatches to no real resolvers, so there are no counters."""
+        return []
 
     def mock_dns(self, data):
         """Configure mock DNS responses.

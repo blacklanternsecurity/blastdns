@@ -55,6 +55,12 @@ impl PyBlastDNSClient {
         self.inner.resolvers()
     }
 
+    /// Per-resolver counter snapshots, serialized as a JSON array.
+    fn stats(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner.stats())
+            .map_err(|e| PyValueError::new_err(format!("failed to serialize stats: {e}")))
+    }
+
     #[pyo3(signature = (host, record_type = None))]
     fn resolve<'py>(
         &self,

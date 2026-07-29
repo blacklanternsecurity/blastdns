@@ -10,9 +10,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use blastdns::{
     BlastDNSClient, BlastDNSConfig, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_MAX_TTL,
-    DEFAULT_CACHE_MIN_TTL, DEFAULT_MAX_RETRIES, DEFAULT_PURGATORY_SENTENCE,
-    DEFAULT_PURGATORY_THRESHOLD, DEFAULT_REQUEST_TIMEOUT, DEFAULT_THREADS_PER_RESOLVER,
-    DnsResolver,
+    DEFAULT_CACHE_MIN_TTL, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_INFLIGHT_PER_RESOLVER,
+    DEFAULT_MAX_RETRIES, DEFAULT_PURGATORY_SENTENCE, DEFAULT_PURGATORY_THRESHOLD,
+    DEFAULT_REQUEST_TIMEOUT, DnsResolver,
 };
 use clap::Parser;
 use futures::StreamExt;
@@ -32,9 +32,21 @@ struct Args {
     /// File containing DNS nameservers (one per line).
     #[arg(long, value_name = "FILE")]
     resolvers: PathBuf,
-    /// Worker threads per resolver.
-    #[arg(long, default_value_t = DEFAULT_THREADS_PER_RESOLVER)]
-    threads_per_resolver: usize,
+    /// Maximum queries in flight to any single resolver.
+    #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_PER_RESOLVER)]
+    max_inflight_per_resolver: usize,
+    /// Maximum queries in flight across all resolvers.
+    #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENCY)]
+    max_concurrency: usize,
+    /// Ceiling on dispatch rate in queries per second (0 = unlimited).
+    #[arg(long, default_value_t = 0.0)]
+    rate_limit: f64,
+    /// Drop resolvers that don't answer a probe query at startup.
+    #[arg(long)]
+    resolver_probe: bool,
+    /// Disable automatic backoff when resolvers start losing queries.
+    #[arg(long)]
+    no_adaptive: bool,
     /// Per-request timeout in milliseconds.
     #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT.as_millis() as u64)]
     timeout_ms: u64,
@@ -75,7 +87,11 @@ async fn main() -> Result<()> {
 
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
     let config = BlastDNSConfig {
-        threads_per_resolver: args.threads_per_resolver.max(1),
+        max_inflight_per_resolver: args.max_inflight_per_resolver.max(1),
+        max_concurrency: args.max_concurrency.max(1),
+        rate_limit: (args.rate_limit > 0.0).then_some(args.rate_limit),
+        adaptive: !args.no_adaptive,
+        resolver_probe: args.resolver_probe,
         request_timeout: timeout,
         max_retries: args.retries,
         purgatory_threshold: args.purgatory_threshold,
