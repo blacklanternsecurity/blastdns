@@ -1,7 +1,7 @@
 from typing import Optional
 
 import orjson
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import _native  # type: ignore
 from .models import DNSError, DNSResult, DNSResultOrError, ResolverStats
@@ -42,7 +42,12 @@ class ClientConfig(BaseModel):
     resolver starts losing queries, its rate retreats below the rate at which that
     began. ``rate_limit`` is an additional hard cap, not a replacement for it, so
     adaptation happens whether or not one is set.
+
+    Unknown keys are rejected rather than ignored, so a stale or misspelled
+    option fails loudly instead of silently falling back to a default.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     max_inflight_per_resolver: int = Field(default=2, ge=1)
     max_concurrency: int = Field(default=256, ge=1)

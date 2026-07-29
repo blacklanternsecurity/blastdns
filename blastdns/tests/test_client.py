@@ -391,3 +391,15 @@ def test_mock_client_reports_no_stats():
     from blastdns import MockClient
 
     assert MockClient().stats() == []
+
+
+def test_client_config_rejects_unknown_options():
+    """An unknown option must fail loudly. Silently ignoring it would let a
+    stale name fall back to a default with no indication anything was wrong."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        ClientConfig(threads_per_resolver=10)
+
+    with pytest.raises(pydantic.ValidationError):
+        ClientConfig(maxx_concurrency=100)
