@@ -26,12 +26,22 @@ pub(crate) fn parse_resolver(input: &str) -> Result<SocketAddr, BlastDNSError> {
     }
 }
 
+/// File descriptors needed to run at `max_concurrency`.
+///
+/// Roughly one socket per query in flight, plus headroom for hickory's
+/// background tasks, stdin/stdout/stderr, and other system needs.
+fn required_fds(max_concurrency: usize) -> usize {
+    (max_concurrency * 3) + 100
+}
+
 /// Checks if the system's NOFILE limit is sufficient for the given configuration.
 ///
-/// One UDP socket is opened per resolver, shared by every worker that selects it,
-/// so the requirement scales with the resolver count and not with concurrency.
+/// A UDP socket is bound per in-flight query rather than per resolver, since
+/// hickory randomizes the source port for each one. The requirement therefore
+/// scales with concurrency and is independent of how many resolvers are
+/// configured.
 pub fn check_ulimits(
-    #[cfg_attr(not(unix), allow(unused_variables))] num_resolvers: usize,
+    #[cfg_attr(not(unix), allow(unused_variables))] max_concurrency: usize,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -72,31 +82,28 @@ pub fn check_ulimits(
 
         let current_limit = rlimit.rlim_cur;
 
-        // Each resolver needs at least 1 FD for its UDP socket, plus hickory
-        // spawns background tasks that may use additional FDs. Add overhead for
-        // stdin/stdout/stderr and other system needs.
-        let required = (num_resolvers * 3) + 100;
+        let required = required_fds(max_concurrency);
 
         // rlim_cur is u64 on most platforms but u32 on armv7, so convert for portability
         #[allow(clippy::useless_conversion)]
         if u64::from(current_limit) < required as u64 {
             bail!(
                 "NOFILE limit too low even after raising soft limit: current={}, required={}\n\
-                 {} resolvers need ~{} FDs\n\
-                 Increase with: ulimit -n {} (or higher)",
+                 max_concurrency of {} needs ~{} FDs\n\
+                 Increase with: ulimit -n {} (or higher), or lower max_concurrency",
                 current_limit,
                 required,
-                num_resolvers,
+                max_concurrency,
                 required,
                 required
             );
         }
 
         tracing::debug!(
-            "ulimit check: NOFILE={} (need ~{} for {} resolvers)",
+            "ulimit check: NOFILE={} (need ~{} for max_concurrency {})",
             current_limit,
             required,
-            num_resolvers
+            max_concurrency
         );
     }
 
@@ -189,6 +196,23 @@ mod tests {
         assert_eq!(
             format_ptr_query("2001:4860:4860::8888"),
             "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"
+        );
+    }
+
+    #[test]
+    fn ulimit_requirement_scales_with_concurrency_not_resolvers() {
+        // A UDP socket is bound per query in flight, so a small resolver list
+        // with high concurrency still needs a high limit. Basing the check on
+        // the resolver count would let it pass and then run out of FDs mid-run.
+        let modest = required_fds(100);
+        let heavy = required_fds(5000);
+        assert!(
+            heavy > modest * 10,
+            "concurrency must dominate the requirement: {modest} vs {heavy}"
+        );
+        assert!(
+            heavy >= 5000,
+            "5000 concurrent queries need at least that many FDs, got {heavy}"
         );
     }
 
