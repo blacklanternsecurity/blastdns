@@ -8,7 +8,11 @@ use std::{
 };
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
-use hickory_client::proto::{op::Query, rr::RecordType, xfer::DnsResponse};
+use hickory_client::proto::{
+    op::{Query, ResponseCode},
+    rr::RecordType,
+    xfer::DnsResponse,
+};
 use tokio::sync::{OnceCell, oneshot};
 use tracing::debug;
 
@@ -57,6 +61,18 @@ pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
 /// Result item produced by [`BlastDNSClient::resolve_batch`].
 pub type BatchResultBasic = (String, String, Vec<String>);
+
+/// Whether a response actually settles whether the name exists.
+///
+/// NOERROR and NXDOMAIN do. Every other response code reports that this
+/// particular resolver would not or could not answer, which is not evidence
+/// about the name itself.
+fn answers_the_question(response: &DnsResponse) -> bool {
+    matches!(
+        response.response_code(),
+        ResponseCode::NoError | ResponseCode::NXDomain
+    )
+}
 
 impl BlastDNSClient {
     /// Build a client using the default configuration.
@@ -237,6 +253,22 @@ impl BlastDNSClient {
 
             match response {
                 Ok(resp) => {
+                    // Only NOERROR and NXDOMAIN actually say whether the name
+                    // exists. Anything else (REFUSED, SERVFAIL, ...) means this
+                    // resolver would not or could not answer, so ask another one
+                    // rather than reporting the name as absent.
+                    let suppressed = self.suppress_retries.load(Ordering::Relaxed);
+                    if !answers_the_question(&resp) && attempt + 1 < attempts && !suppressed {
+                        debug!(
+                            attempt = attempt + 1,
+                            attempts,
+                            host,
+                            rcode = %resp.response_code(),
+                            "resolver declined to answer, retrying elsewhere"
+                        );
+                        continue;
+                    }
+
                     // Cache successful responses with answers
                     if let Some(cache) = &self.cache
                         && !resp.answers().is_empty()
@@ -317,6 +349,89 @@ mod tests {
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
+    }
+
+    #[tokio::test]
+    async fn refused_is_retried_rather_than_believed() {
+        // A resolver that refuses says nothing about whether the name exists.
+        // Reporting that as "no record" would silently discard a real subdomain,
+        // so it has to be retried against a different resolver.
+        use crate::sim::{SimConfig, SimResolver};
+
+        let refusing = SimResolver::start(SimConfig {
+            refuse_one_in: Some(1), // refuses everything
+            ..Default::default()
+        })
+        .await;
+        let answering = SimResolver::start(SimConfig::default()).await;
+
+        let config = BlastDNSConfig {
+            max_concurrency: 4,
+            max_inflight_per_resolver: 1,
+            request_timeout: Duration::from_millis(500),
+            max_retries: 10,
+            cache_capacity: 0,
+            purgatory_threshold: 0,
+            adaptive: false,
+            ..Default::default()
+        };
+        let client =
+            BlastDNSClient::with_config(vec![refusing.addr(), answering.addr()], config).unwrap();
+
+        // Rotation will land on the refusing resolver, but retries must find the
+        // one that actually answers.
+        for i in 0..10 {
+            let response = client
+                .resolve_full(format!("h{i}.example.com."), RecordType::A)
+                .await
+                .expect("should get an answer despite a refusing resolver");
+            assert_eq!(
+                response.response_code(),
+                ResponseCode::NoError,
+                "REFUSED must not be returned while another resolver would answer"
+            );
+            assert!(
+                !response.answers().is_empty(),
+                "a refusing resolver must not be mistaken for a nonexistent name"
+            );
+        }
+        assert!(refusing.received() > 0, "the refusing resolver was used");
+    }
+
+    #[tokio::test]
+    async fn refused_is_returned_once_retries_are_exhausted() {
+        // With nowhere better to go, report the REFUSED rather than inventing an
+        // answer; the caller can then tell "unknown" from "does not exist".
+        use crate::sim::{SimConfig, SimResolver};
+
+        let refusing = SimResolver::start(SimConfig {
+            refuse_one_in: Some(1),
+            ..Default::default()
+        })
+        .await;
+
+        let config = BlastDNSConfig {
+            max_concurrency: 2,
+            max_inflight_per_resolver: 1,
+            request_timeout: Duration::from_millis(500),
+            max_retries: 2,
+            cache_capacity: 0,
+            purgatory_threshold: 0,
+            adaptive: false,
+            ..Default::default()
+        };
+        let client = BlastDNSClient::with_config(vec![refusing.addr()], config).unwrap();
+
+        let response = client
+            .resolve_full("only.example.com.".to_string(), RecordType::A)
+            .await
+            .expect("a REFUSED response is still a response");
+        assert_eq!(response.response_code(), ResponseCode::Refused);
+        assert!(
+            refusing.received() >= 3,
+            "should have retried before giving up, got {} attempts",
+            refusing.received()
+        );
     }
 
     #[test]

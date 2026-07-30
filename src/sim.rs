@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hickory_client::proto::{
-    op::{Message, MessageType},
+    op::{Message, MessageType, ResponseCode},
     rr::{RData, Record, RecordType, rdata::A},
     serialize::binary::BinDecodable,
 };
@@ -31,6 +31,9 @@ pub(crate) struct SimConfig {
     pub capacity_qps: Option<f64>,
     /// Drop one in every N queries regardless of rate. `None` means never.
     pub drop_one_in: Option<u64>,
+    /// Answer REFUSED for one in every N queries, simulating a resolver that
+    /// declines rather than one that is merely slow.
+    pub refuse_one_in: Option<u64>,
 }
 
 impl Default for SimConfig {
@@ -39,6 +42,7 @@ impl Default for SimConfig {
             latency: Duration::from_millis(1),
             capacity_qps: None,
             drop_one_in: None,
+            refuse_one_in: None,
         }
     }
 }
@@ -132,11 +136,14 @@ async fn serve(socket: Arc<UdpSocket>, config: SimConfig, counters: Arc<Counters
         let socket = socket.clone();
         let counters = counters.clone();
         let latency = config.latency;
+        let refuse = config
+            .refuse_one_in
+            .is_some_and(|n| n > 0 && seq.is_multiple_of(n));
         tokio::spawn(async move {
             if !latency.is_zero() {
                 tokio::time::sleep(latency).await;
             }
-            if let Ok(bytes) = build_response(&request).to_vec()
+            if let Ok(bytes) = build_response(&request, refuse).to_vec()
                 && socket.send_to(&bytes, src).await.is_ok()
             {
                 counters.answered.fetch_add(1, Ordering::Relaxed);
@@ -185,7 +192,7 @@ fn should_drop(
     }
 }
 
-fn build_response(request: &Message) -> Message {
+fn build_response(request: &Message, refuse: bool) -> Message {
     let mut response = Message::new();
     response.set_id(request.id());
     response.set_message_type(MessageType::Response);
@@ -195,6 +202,13 @@ fn build_response(request: &Message) -> Message {
 
     for query in request.queries() {
         response.add_query(query.clone());
+    }
+
+    // A refusing resolver returns no answers, but REFUSED says nothing about
+    // whether the name exists.
+    if refuse {
+        response.set_response_code(ResponseCode::Refused);
+        return response;
     }
 
     // Answer A queries with a fixed address. Anything else gets an empty
