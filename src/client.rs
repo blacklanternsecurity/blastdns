@@ -352,6 +352,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_responses_are_refetched_over_tcp() {
+        // A truncated response is an arbitrary subset of the real answer set.
+        // Returning it as-is silently loses records, so TC must trigger a TCP
+        // refetch that returns the whole thing.
+        use crate::sim::{SimConfig, SimResolver};
+
+        let sim = SimResolver::start(SimConfig {
+            truncate_udp: true,
+            ..Default::default()
+        })
+        .await;
+
+        let config = BlastDNSConfig {
+            max_concurrency: 2,
+            max_inflight_per_resolver: 1,
+            request_timeout: Duration::from_millis(500),
+            max_retries: 0,
+            cache_capacity: 0,
+            purgatory_threshold: 0,
+            adaptive: false,
+            ..Default::default()
+        };
+        let client = BlastDNSClient::with_config(vec![sim.addr()], config).unwrap();
+
+        let response = client
+            .resolve_full("big.example.com.".to_string(), RecordType::A)
+            .await
+            .expect("should resolve");
+
+        assert!(
+            !response.truncated(),
+            "a truncated response must not be handed back to the caller"
+        );
+        assert_eq!(
+            response.answers().len(),
+            8,
+            "should carry the full answer set from TCP, not the 2-record UDP subset"
+        );
+        assert!(sim.tcp_served() > 0, "TCP was never used");
+
+        let stats = client.stats();
+        assert_eq!(stats[0].truncated, 1, "truncation should be counted");
+    }
+
+    #[tokio::test]
     async fn refused_is_retried_rather_than_believed() {
         // A resolver that refuses says nothing about whether the name exists.
         // Reporting that as "no record" would silently discard a real subdomain,

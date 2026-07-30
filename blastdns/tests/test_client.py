@@ -1,6 +1,8 @@
+import orjson
 import pytest
 
 from blastdns import Client, ClientConfig, ConfigurationError, DNSError, DNSResult, get_system_resolvers
+from blastdns.models import ResolverStats
 
 
 def test_get_system_resolvers():
@@ -404,3 +406,12 @@ def test_client_config_rejects_unknown_options():
 
     with pytest.raises(pydantic.ValidationError):
         ClientConfig(maxx_concurrency=100)
+
+
+def test_resolver_stats_model_covers_every_field_the_engine_emits():
+    """The Rust and Python sides of ResolverStats are mirrored by hand, so a field
+    added on one side is silently invisible on the other. Compare the real keys."""
+    client = Client(["127.0.0.1:5353"])
+    (raw,) = orjson.loads(client._inner.stats())
+    missing = set(raw) - set(ResolverStats.model_fields)
+    assert not missing, f"Python ResolverStats is missing engine fields: {sorted(missing)}"

@@ -501,6 +501,7 @@ mod tests {
             capacity_qps: Some(CAPACITY),
             drop_one_in: None,
             refuse_one_in: None,
+            truncate_udp: false,
         })
         .await;
 

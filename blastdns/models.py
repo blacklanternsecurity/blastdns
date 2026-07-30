@@ -124,6 +124,7 @@ class ResolverStats(BaseModel):
     rtt_mean_us: int
     rtt_min_us: int
     purgatory_entries: int
+    truncated: int = 0
     rate_qps: Optional[float] = None
     """Current pacing rate, or ``None`` when unthrottled. A value here means the
     adaptive controller is holding this resolver below the rate at which it began

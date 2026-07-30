@@ -11,6 +11,7 @@ use hickory_client::{
         rr::{DNSClass, Name, RecordType},
         runtime::TokioRuntimeProvider,
         runtime::TokioTime,
+        tcp::TcpClientStream,
         udp::{UdpClientStream, UdpStream},
         xfer::{DnsClientStream, SerialMessage},
     },
@@ -90,6 +91,8 @@ pub struct ResolverStats {
     pub rtt_mean_us: u64,
     pub rtt_min_us: u64,
     pub purgatory_entries: u64,
+    /// Responses that arrived truncated and were refetched over TCP.
+    pub truncated: u64,
     /// Current pacing rate in queries per second, or `None` when unthrottled.
     /// Set by the adaptive controller; a value here means this resolver is being
     /// held below the rate at which it started losing queries.
@@ -108,6 +111,8 @@ pub(crate) struct ResolverHealth {
     purgatory_threshold: usize,
     purgatory_sentence: Duration,
     client: OnceCell<Client>,
+    /// Built only if a response arrives truncated. Most resolvers never need it.
+    tcp_client: OnceCell<Client>,
     inflight: Arc<Semaphore>,
     /// Per-resolver dispatch pacing. Starts effectively unlimited so the
     /// in-flight permits are what bind until the controller lowers it.
@@ -122,6 +127,7 @@ pub(crate) struct ResolverHealth {
     consecutive_errors: AtomicU64,
     benched_until_ns: AtomicU64,
     purgatory_entries: AtomicU64,
+    truncated: AtomicU64,
     rtt_ewma_us: AtomicU64,
     rtt_min_us: AtomicU64,
     rtt_min_window_ns: AtomicU64,
@@ -140,6 +146,7 @@ impl ResolverHealth {
             purgatory_threshold: config.purgatory_threshold,
             purgatory_sentence: config.purgatory_sentence,
             client: OnceCell::new(),
+            tcp_client: OnceCell::new(),
             inflight: Arc::new(Semaphore::new(config.max_inflight_per_resolver.max(1))),
             limiter: RateLimiter::new(UNLIMITED_QPS),
             start,
@@ -152,6 +159,7 @@ impl ResolverHealth {
             consecutive_errors: AtomicU64::new(0),
             benched_until_ns: AtomicU64::new(0),
             purgatory_entries: AtomicU64::new(0),
+            truncated: AtomicU64::new(0),
             rtt_ewma_us: AtomicU64::new(0),
             rtt_min_us: AtomicU64::new(0),
             rtt_min_window_ns: AtomicU64::new(0),
@@ -234,6 +242,43 @@ impl ResolverHealth {
         let client = self
             .client
             .get_or_try_init(|| async { self.connect().await })
+            .await?;
+        Ok(client.clone())
+    }
+
+    pub(crate) fn record_truncated(&self) {
+        self.truncated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A TCP client for this resolver, built on first truncated response.
+    ///
+    /// UDP caps a response at the negotiated payload size; when the server sets
+    /// TC it has dropped records to fit. RFC 1035 says to re-ask over TCP, which
+    /// has no such limit.
+    pub(crate) async fn tcp_client(&self) -> Result<Client, BlastDNSError> {
+        let client = self
+            .tcp_client
+            .get_or_try_init(|| async {
+                let (stream, handle) = TcpClientStream::new(
+                    self.resolver,
+                    None,
+                    Some(self.request_timeout),
+                    TokioRuntimeProvider::new(),
+                );
+                let (client, bg) = Client::new(stream, handle, None).await.map_err(|source| {
+                    BlastDNSError::ResolverSetupFailed {
+                        resolver: self.resolver,
+                        source,
+                    }
+                })?;
+                let resolver = self.resolver;
+                tokio::spawn(async move {
+                    if let Err(err) = bg.await {
+                        debug!(%resolver, %err, "resolver TCP background task exited");
+                    }
+                });
+                Ok::<_, BlastDNSError>(client)
+            })
             .await?;
         Ok(client.clone())
     }
@@ -399,6 +444,7 @@ impl ResolverHealth {
             rtt_mean_us: self.rtt_ewma_us.load(Ordering::Relaxed),
             rtt_min_us: self.rtt_min_us.load(Ordering::Relaxed),
             purgatory_entries: self.purgatory_entries.load(Ordering::Relaxed),
+            truncated: self.truncated.load(Ordering::Relaxed),
             rate_qps: {
                 let rate = self.limiter.rate();
                 (rate < UNLIMITED_QPS).then_some(rate)

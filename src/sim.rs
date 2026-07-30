@@ -34,6 +34,10 @@ pub(crate) struct SimConfig {
     /// Answer REFUSED for one in every N queries, simulating a resolver that
     /// declines rather than one that is merely slow.
     pub refuse_one_in: Option<u64>,
+    /// Answer over UDP with the TC bit set and a reduced answer set, as a server
+    /// does when the full response will not fit. A TCP listener serves the whole
+    /// thing, so a correct client recovers the dropped records.
+    pub truncate_udp: bool,
 }
 
 impl Default for SimConfig {
@@ -43,6 +47,7 @@ impl Default for SimConfig {
             capacity_qps: None,
             drop_one_in: None,
             refuse_one_in: None,
+            truncate_udp: false,
         }
     }
 }
@@ -51,6 +56,7 @@ struct Counters {
     received: AtomicU64,
     answered: AtomicU64,
     dropped: AtomicU64,
+    tcp_served: AtomicU64,
     budget_ns: AtomicU64,
 }
 
@@ -59,11 +65,15 @@ pub(crate) struct SimResolver {
     addr: SocketAddr,
     counters: Arc<Counters>,
     handle: JoinHandle<()>,
+    tcp_handle: Option<JoinHandle<()>>,
 }
 
 impl Drop for SimResolver {
     fn drop(&mut self) {
         self.handle.abort();
+        if let Some(h) = &self.tcp_handle {
+            h.abort();
+        }
     }
 }
 
@@ -79,15 +89,28 @@ impl SimResolver {
             received: AtomicU64::new(0),
             answered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            tcp_served: AtomicU64::new(0),
             budget_ns: AtomicU64::new(0),
         });
 
-        let handle = tokio::spawn(serve(socket, config, counters.clone()));
+        let handle = tokio::spawn(serve(socket, config.clone(), counters.clone()));
+
+        // A truncating resolver must also answer over TCP, or a client doing the
+        // right thing has nowhere to go.
+        let tcp_handle = if config.truncate_udp {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("bind simulated resolver TCP");
+            Some(tokio::spawn(serve_tcp(listener, counters.clone())))
+        } else {
+            None
+        };
 
         Self {
             addr,
             counters,
             handle,
+            tcp_handle,
         }
     }
 
@@ -105,6 +128,11 @@ impl SimResolver {
 
     pub(crate) fn dropped(&self) -> u64 {
         self.counters.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Queries answered over TCP, i.e. how often a client recovered from TC.
+    pub(crate) fn tcp_served(&self) -> u64 {
+        self.counters.tcp_served.load(Ordering::Relaxed)
     }
 }
 
@@ -139,14 +167,57 @@ async fn serve(socket: Arc<UdpSocket>, config: SimConfig, counters: Arc<Counters
         let refuse = config
             .refuse_one_in
             .is_some_and(|n| n > 0 && seq.is_multiple_of(n));
+        let truncate_udp = config.truncate_udp;
         tokio::spawn(async move {
             if !latency.is_zero() {
                 tokio::time::sleep(latency).await;
             }
-            if let Ok(bytes) = build_response(&request, refuse).to_vec()
+            let response = if truncate_udp {
+                build_response_sized(&request, refuse, TRUNCATED_ANSWER_COUNT, true)
+            } else {
+                build_response(&request, refuse)
+            };
+            if let Ok(bytes) = response.to_vec()
                 && socket.send_to(&bytes, src).await.is_ok()
             {
                 counters.answered.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+}
+
+/// Serves complete responses over TCP, using the two-byte length prefix DNS
+/// requires there.
+async fn serve_tcp(listener: tokio::net::TcpListener, counters: Arc<Counters>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let counters = counters.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let mut len_buf = [0u8; 2];
+                if stream.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
+                let len = u16::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                if stream.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let Ok(request) = Message::from_bytes(&buf) else {
+                    return;
+                };
+                let Ok(bytes) = build_response(&request, false).to_vec() else {
+                    return;
+                };
+                let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&bytes);
+                if stream.write_all(&framed).await.is_err() {
+                    return;
+                }
+                counters.tcp_served.fetch_add(1, Ordering::Relaxed);
             }
         });
     }
@@ -192,7 +263,21 @@ fn should_drop(
     }
 }
 
+/// How many A records the simulated zone holds for a truncating name. UDP gets a
+/// subset with TC set; TCP gets all of them.
+const TRUNCATED_ANSWER_COUNT: usize = 2;
+const FULL_ANSWER_COUNT: usize = 8;
+
 fn build_response(request: &Message, refuse: bool) -> Message {
+    build_response_sized(request, refuse, FULL_ANSWER_COUNT, false)
+}
+
+fn build_response_sized(
+    request: &Message,
+    refuse: bool,
+    answer_count: usize,
+    truncated: bool,
+) -> Message {
     let mut response = Message::new();
     response.set_id(request.id());
     response.set_message_type(MessageType::Response);
@@ -211,17 +296,20 @@ fn build_response(request: &Message, refuse: bool) -> Message {
         return response;
     }
 
-    // Answer A queries with a fixed address. Anything else gets an empty
-    // NOERROR, which is a valid response and enough for liveness probes.
+    // Answer A queries. Anything else gets an empty NOERROR, which is a valid
+    // response and enough for liveness probes.
     if let Some(query) = request.queries().first()
         && query.query_type() == RecordType::A
     {
-        response.add_answer(Record::from_rdata(
-            query.name().clone(),
-            60,
-            RData::A(A::new(127, 0, 0, 1)),
-        ));
+        for i in 0..answer_count {
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                60,
+                RData::A(A::new(127, 0, 0, (i + 1) as u8)),
+            ));
+        }
     }
+    response.set_truncated(truncated);
 
     response
 }
@@ -255,7 +343,10 @@ mod tests {
             .await
             .expect("simulated resolver should answer");
 
-        assert_eq!(answers, vec!["127.0.0.1"]);
+        // The simulated zone holds several records per name so truncation has
+        // something to drop.
+        assert_eq!(answers.len(), FULL_ANSWER_COUNT);
+        assert_eq!(answers[0], "127.0.0.1");
         assert_eq!(sim.received(), 1);
         assert_eq!(sim.answered(), 1);
     }

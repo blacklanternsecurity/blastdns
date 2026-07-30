@@ -111,6 +111,29 @@ impl ResolverWorker {
         }
     }
 
+    /// Re-ask a truncated query over TCP. Returns `None` if TCP is unavailable,
+    /// leaving the caller with the partial UDP answer, which still beats nothing.
+    async fn refetch_over_tcp(
+        health: &ResolverHealth,
+        name: Name,
+        record_type: RecordType,
+    ) -> Option<DnsResponse> {
+        let mut tcp = match health.tcp_client().await {
+            Ok(tcp) => tcp,
+            Err(err) => {
+                debug!(resolver = %health.addr(), %err, "TCP unavailable for truncated response");
+                return None;
+            }
+        };
+        match tcp.query(name, DNSClass::IN, record_type).await {
+            Ok(response) => Some(response),
+            Err(err) => {
+                debug!(resolver = %health.addr(), %err, "TCP refetch failed");
+                None
+            }
+        }
+    }
+
     /// Executes a single query against one resolver and records the outcome.
     async fn query(
         health: &ResolverHealth,
@@ -135,7 +158,17 @@ impl ResolverWorker {
         );
 
         let started = Instant::now();
-        match client.query(name, DNSClass::IN, record_type).await {
+        match client.query(name.clone(), DNSClass::IN, record_type).await {
+            Ok(response) if response.truncated() => {
+                // TC means the server dropped records to fit the UDP payload, so
+                // what arrived is an arbitrary subset. Re-ask over TCP, which has
+                // no size limit, rather than reporting a partial answer as whole.
+                health.record_truncated();
+                let full = Self::refetch_over_tcp(health, name, record_type).await;
+                let response = full.unwrap_or(response);
+                health.record_response(started.elapsed(), !response.answers().is_empty());
+                Ok(response)
+            }
             Ok(response) => {
                 health.record_response(started.elapsed(), !response.answers().is_empty());
                 Ok(response)
