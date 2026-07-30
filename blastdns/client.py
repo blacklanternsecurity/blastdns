@@ -54,6 +54,7 @@ class ClientConfig(BaseModel):
     rate_limit: Optional[float] = Field(default=None, gt=0)
     adaptive: bool = Field(default=True)
     resolver_probe: bool = Field(default=False)
+    persistent_socket: bool = Field(default=False)
     request_timeout_ms: int = Field(default=1000, ge=1)
     max_retries: int = Field(default=10, ge=0)
     purgatory_threshold: int = Field(default=10, ge=1)

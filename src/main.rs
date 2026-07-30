@@ -47,6 +47,9 @@ struct Args {
     /// Disable automatic backoff when resolvers start losing queries.
     #[arg(long)]
     no_adaptive: bool,
+    /// Keep one long-lived socket per resolver instead of binding one per query.
+    #[arg(long)]
+    persistent_socket: bool,
     /// Per-request timeout in milliseconds.
     #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT.as_millis() as u64)]
     timeout_ms: u64,
@@ -92,6 +95,7 @@ async fn main() -> Result<()> {
         rate_limit: (args.rate_limit > 0.0).then_some(args.rate_limit),
         adaptive: !args.no_adaptive,
         resolver_probe: args.resolver_probe,
+        persistent_socket: args.persistent_socket,
         request_timeout: timeout,
         max_retries: args.retries,
         purgatory_threshold: args.purgatory_threshold,

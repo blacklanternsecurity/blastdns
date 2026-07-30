@@ -32,6 +32,7 @@ def test_client_config_defaults():
         "rate_limit": None,
         "adaptive": True,
         "resolver_probe": False,
+        "persistent_socket": False,
         "request_timeout_ms": 1000,
         "max_retries": 10,
         "purgatory_threshold": 10,

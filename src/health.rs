@@ -1,18 +1,22 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use hickory_client::{
     client::{Client, ClientHandle},
     proto::{
+        ProtoError,
         rr::{DNSClass, Name, RecordType},
         runtime::TokioRuntimeProvider,
-        udp::UdpClientStream,
+        runtime::TokioTime,
+        udp::{UdpClientStream, UdpStream},
+        xfer::{DnsClientStream, SerialMessage},
     },
 };
 use serde::Serialize;
+use std::future::Future;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
@@ -21,6 +25,48 @@ use crate::{
     error::BlastDNSError,
     limiter::{RateLimiter, UNLIMITED_QPS},
 };
+
+/// The background driver for a resolver's client. The per-query and persistent
+/// transports produce different future types, so they are boxed to one shape.
+type ClientBackground = std::pin::Pin<Box<dyn Future<Output = Result<(), ProtoError>> + Send>>;
+
+/// Adapts hickory's raw [`UdpStream`] into a client stream, so one long-lived
+/// UDP socket can back a multiplexed client.
+///
+/// hickory implements `DnsClientStream` only for TCP, because it treats UDP as
+/// one socket per query. The stream is already the right shape; all it lacks is
+/// the remote address the client layer needs to report.
+struct PersistentUdpStream {
+    inner: UdpStream<TokioRuntimeProvider>,
+    name_server: SocketAddr,
+}
+
+impl Stream for PersistentUdpStream {
+    type Item = Result<SerialMessage, ProtoError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.get_mut().inner)
+            .poll_next(cx)
+            .map(|item| item.map(|result| result.map_err(ProtoError::from)))
+    }
+}
+
+impl std::fmt::Display for PersistentUdpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UDP({})", self.name_server)
+    }
+}
+
+impl DnsClientStream for PersistentUdpStream {
+    type Time = TokioTime;
+
+    fn name_server_addr(&self) -> SocketAddr {
+        self.name_server
+    }
+}
 
 /// How long a minimum-RTT observation stays authoritative before the window
 /// resets. Without this a single lucky sample would pin the baseline forever.
@@ -58,6 +104,7 @@ pub struct ResolverStats {
 pub(crate) struct ResolverHealth {
     resolver: SocketAddr,
     request_timeout: Duration,
+    persistent_socket: bool,
     purgatory_threshold: usize,
     purgatory_sentence: Duration,
     client: OnceCell<Client>,
@@ -89,6 +136,7 @@ impl ResolverHealth {
         Self {
             resolver,
             request_timeout: config.request_timeout,
+            persistent_socket: config.persistent_socket,
             purgatory_threshold: config.purgatory_threshold,
             purgatory_sentence: config.purgatory_sentence,
             client: OnceCell::new(),
@@ -191,18 +239,11 @@ impl ResolverHealth {
     }
 
     async fn connect(&self) -> Result<Client, BlastDNSError> {
-        let provider = TokioRuntimeProvider::new();
-        let stream = UdpClientStream::builder(self.resolver, provider)
-            .with_timeout(Some(self.request_timeout))
-            .build();
-
-        let (client, bg) =
-            Client::connect(stream)
-                .await
-                .map_err(|source| BlastDNSError::ResolverSetupFailed {
-                    resolver: self.resolver,
-                    source,
-                })?;
+        let (client, bg) = if self.persistent_socket {
+            self.connect_persistent().await?
+        } else {
+            self.connect_per_query().await?
+        };
 
         let resolver = self.resolver;
         tokio::spawn(async move {
@@ -212,6 +253,59 @@ impl ResolverHealth {
         });
 
         Ok(client)
+    }
+
+    /// hickory's default: a fresh randomly-bound socket for every query.
+    ///
+    /// Maximum source-port entropy, but it creates one NAT/conntrack entry per
+    /// query, which churns state on every device in the path.
+    async fn connect_per_query(&self) -> Result<(Client, ClientBackground), BlastDNSError> {
+        let provider = TokioRuntimeProvider::new();
+        let stream = UdpClientStream::builder(self.resolver, provider)
+            .with_timeout(Some(self.request_timeout))
+            .build();
+
+        Client::connect(stream)
+            .await
+            .map(|(client, bg)| (client, Box::pin(bg) as ClientBackground))
+            .map_err(|source| BlastDNSError::ResolverSetupFailed {
+                resolver: self.resolver,
+                source,
+            })
+    }
+
+    /// One long-lived socket per resolver, with queries multiplexed over it by
+    /// transaction ID.
+    ///
+    /// Trades per-query port randomization for stable path state: conntrack sees
+    /// one reused entry per resolver instead of one per query. Matches hickory's
+    /// unconnected-socket model, so the source address check and transaction ID
+    /// remain the response validation.
+    async fn connect_persistent(&self) -> Result<(Client, ClientBackground), BlastDNSError> {
+        let bind: SocketAddr = if self.resolver.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = tokio::net::UdpSocket::bind(bind).await.map_err(|e| {
+            BlastDNSError::Configuration(format!(
+                "failed to bind socket for {}: {e}",
+                self.resolver
+            ))
+        })?;
+
+        let (inner, handle) = UdpStream::<TokioRuntimeProvider>::with_bound(socket, self.resolver);
+        let stream = PersistentUdpStream {
+            inner,
+            name_server: self.resolver,
+        };
+        Client::new(Box::pin(futures::future::ready(Ok(stream))), handle, None)
+            .await
+            .map(|(client, bg)| (client, Box::pin(bg) as ClientBackground))
+            .map_err(|source| BlastDNSError::ResolverSetupFailed {
+                resolver: self.resolver,
+                source,
+            })
     }
 
     pub(crate) fn record_dispatch(&self) {

@@ -42,6 +42,12 @@ pub struct BlastDNSConfig {
     pub adaptive: bool,
     /// Probe each resolver once at startup and keep only those that answer.
     pub resolver_probe: bool,
+    /// Keep one long-lived socket per resolver, multiplexing queries over it by
+    /// transaction ID, instead of binding a fresh socket per query.
+    ///
+    /// Cuts NAT/conntrack state from one entry per query to one reused entry per
+    /// resolver, at the cost of a fixed source port per resolver.
+    pub persistent_socket: bool,
     /// Per-request timeout while talking to a resolver.
     pub request_timeout: Duration,
     /// How many times to retry a failed lookup.
@@ -66,6 +72,7 @@ pub struct BlastDNSConfigWire {
     pub rate_limit: Option<f64>,
     pub adaptive: bool,
     pub resolver_probe: bool,
+    pub persistent_socket: bool,
     pub request_timeout_ms: u64,
     pub max_retries: usize,
     pub purgatory_threshold: usize,
@@ -83,6 +90,7 @@ impl From<BlastDNSConfigWire> for BlastDNSConfig {
             rate_limit: w.rate_limit.filter(|r| *r > 0.0),
             adaptive: w.adaptive,
             resolver_probe: w.resolver_probe,
+            persistent_socket: w.persistent_socket,
             request_timeout: Duration::from_millis(w.request_timeout_ms.max(1)),
             max_retries: w.max_retries,
             purgatory_threshold: w.purgatory_threshold,
@@ -102,6 +110,7 @@ impl Default for BlastDNSConfig {
             rate_limit: None,
             adaptive: true,
             resolver_probe: false,
+            persistent_socket: false,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             purgatory_threshold: DEFAULT_PURGATORY_THRESHOLD,
