@@ -385,12 +385,12 @@ impl ResolverHealth {
             return;
         }
 
-        // Bench the resolver, then relieve one unit of error pressure so a
-        // resolver that recovers is not stuck at the threshold.
+        // The sentence discharges the failures that earned it, so clear the count.
+        // Decaying it instead buys a fresh sentence on the very next failure.
         let until = self.now_ns() + self.purgatory_sentence.as_nanos() as u64;
         self.benched_until_ns.store(until, Ordering::Relaxed);
         self.purgatory_entries.fetch_add(1, Ordering::Relaxed);
-        self.decay_errors();
+        self.consecutive_errors.store(0, Ordering::Relaxed);
         debug!(
             resolver = %self.resolver,
             sentence = ?self.purgatory_sentence,
@@ -642,6 +642,31 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(!health.is_benched(), "sentence should lapse");
+    }
+
+    #[tokio::test]
+    async fn a_second_sentence_costs_another_full_threshold() {
+        let health = ResolverHealth::new(addr(1), &config(1, 3), tokio::time::Instant::now());
+
+        for _ in 0..3 {
+            health.record_error(true);
+        }
+        assert!(health.is_benched(), "threshold reached but not benched");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // One more failure must not re-bench: a sentence per failure would pace
+        // an all-benched pool at one query per sentence.
+        health.record_error(true);
+        assert!(!health.is_benched(), "single failure re-armed the sentence");
+        assert_eq!(health.stats().purgatory_entries, 1);
+
+        health.record_error(true);
+        health.record_error(true);
+        assert!(
+            health.is_benched(),
+            "threshold reached again but not benched"
+        );
+        assert_eq!(health.stats().purgatory_entries, 2);
     }
 
     #[tokio::test]
