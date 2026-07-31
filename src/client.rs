@@ -114,9 +114,8 @@ impl BlastDNSClient {
             .collect::<Result<_, _>>()?;
 
         let queue_capacity = config.max_concurrency.max(1);
-        // Sockets are bound per in-flight query, so concurrency drives the FD
-        // requirement rather than the size of the resolver list.
-        check_ulimits(queue_capacity).map_err(|e| BlastDNSError::Configuration(e.to_string()))?;
+        check_ulimits(queue_capacity, parsed.len(), config.persistent_socket)
+            .map_err(|e| BlastDNSError::Configuration(e.to_string()))?;
         let pool = Arc::new(ResolverPool::new(&parsed, &config));
         // Always present so the controller has something to lower. An unset rate
         // limit starts effectively unlimited rather than absent.

@@ -26,22 +26,26 @@ pub(crate) fn parse_resolver(input: &str) -> Result<SocketAddr, BlastDNSError> {
     }
 }
 
-/// File descriptors needed to run at `max_concurrency`.
+/// File descriptors needed to run this configuration.
 ///
-/// Roughly one socket per query in flight, plus headroom for hickory's
-/// background tasks, stdin/stdout/stderr, and other system needs.
-fn required_fds(max_concurrency: usize) -> usize {
-    (max_concurrency * 3) + 100
+/// The UDP socket count depends on the transport: per-query sockets exist only
+/// while a query is in flight, so at most `max_concurrency` are open at once,
+/// while persistent sockets are held for the client's life, one per resolver.
+/// Truncated responses can add a TCP socket per in-flight query on top.
+fn required_fds(max_concurrency: usize, resolvers: usize, persistent_socket: bool) -> usize {
+    let udp = if persistent_socket {
+        resolvers
+    } else {
+        max_concurrency
+    };
+    udp + max_concurrency + 100
 }
 
 /// Checks if the system's NOFILE limit is sufficient for the given configuration.
-///
-/// A UDP socket is bound per in-flight query rather than per resolver, since
-/// hickory randomizes the source port for each one. The requirement therefore
-/// scales with concurrency and is independent of how many resolvers are
-/// configured.
 pub fn check_ulimits(
     #[cfg_attr(not(unix), allow(unused_variables))] max_concurrency: usize,
+    #[cfg_attr(not(unix), allow(unused_variables))] resolvers: usize,
+    #[cfg_attr(not(unix), allow(unused_variables))] persistent_socket: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -82,28 +86,37 @@ pub fn check_ulimits(
 
         let current_limit = rlimit.rlim_cur;
 
-        let required = required_fds(max_concurrency);
+        let required = required_fds(max_concurrency, resolvers, persistent_socket);
 
         // rlim_cur is u64 on most platforms but u32 on armv7, so convert for portability
         #[allow(clippy::useless_conversion)]
         if u64::from(current_limit) < required as u64 {
+            let driver = if persistent_socket {
+                format!(
+                    "persistent sockets for {resolvers} resolvers plus max_concurrency {max_concurrency}"
+                )
+            } else {
+                format!("max_concurrency of {max_concurrency}")
+            };
             bail!(
                 "NOFILE limit too low even after raising soft limit: current={}, required={}\n\
-                 max_concurrency of {} needs ~{} FDs\n\
+                 {} needs ~{} FDs\n\
                  Increase with: ulimit -n {} (or higher), or lower max_concurrency",
                 current_limit,
                 required,
-                max_concurrency,
+                driver,
                 required,
                 required
             );
         }
 
         tracing::debug!(
-            "ulimit check: NOFILE={} (need ~{} for max_concurrency {})",
+            "ulimit check: NOFILE={} (need ~{} for max_concurrency {}, {} resolvers, persistent_socket={})",
             current_limit,
             required,
-            max_concurrency
+            max_concurrency,
+            resolvers,
+            persistent_socket
         );
     }
 
@@ -200,12 +213,12 @@ mod tests {
     }
 
     #[test]
-    fn ulimit_requirement_scales_with_concurrency_not_resolvers() {
+    fn per_query_sockets_scale_with_concurrency_not_resolvers() {
         // A UDP socket is bound per query in flight, so a small resolver list
         // with high concurrency still needs a high limit. Basing the check on
         // the resolver count would let it pass and then run out of FDs mid-run.
-        let modest = required_fds(100);
-        let heavy = required_fds(5000);
+        let modest = required_fds(100, 5, false);
+        let heavy = required_fds(5000, 5, false);
         assert!(
             heavy > modest * 10,
             "concurrency must dominate the requirement: {modest} vs {heavy}"
@@ -213,6 +226,26 @@ mod tests {
         assert!(
             heavy >= 5000,
             "5000 concurrent queries need at least that many FDs, got {heavy}"
+        );
+    }
+
+    #[test]
+    fn persistent_sockets_scale_with_the_resolver_list() {
+        // Persistent sockets are held for the client's life, one per resolver, so
+        // a large pool outgrows the concurrency setting. Sizing this off
+        // concurrency alone passes a config that then runs out of FDs.
+        let concurrency = 1000;
+        let resolvers = 6000;
+        let persistent = required_fds(concurrency, resolvers, true);
+        let per_query = required_fds(concurrency, resolvers, false);
+        assert!(
+            persistent >= resolvers,
+            "{resolvers} persistent sockets need at least that many FDs, got {persistent}"
+        );
+        assert!(
+            persistent > per_query,
+            "a resolver list larger than concurrency must raise the requirement: \
+             {per_query} per-query vs {persistent} persistent"
         );
     }
 
