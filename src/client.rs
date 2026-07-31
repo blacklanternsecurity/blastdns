@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
 use hickory_client::proto::{
@@ -27,6 +34,7 @@ pub struct BlastDNSClient {
     resolvers: Vec<SocketAddr>,
     pool: Arc<ResolverPool>,
     limiter: Arc<RateLimiter>,
+    outcomes: Arc<Outcomes>,
     work_tx: MAsyncTx<WorkItem>,
     work_rx: MAsyncRx<WorkItem>,
     config: BlastDNSConfig,
@@ -51,6 +59,18 @@ pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
 /// Result item produced by [`BlastDNSClient::resolve_batch`].
 pub type BatchResultBasic = (String, String, Vec<String>);
+
+/// Counts of queries that finished, and of those that finished with nothing.
+///
+/// A query is only "lost" here once its retries are exhausted. Individual attempt
+/// failures do not count: on a public resolver pool a few percent of attempts are
+/// refused as a matter of course, and a retry elsewhere answers them. Treating
+/// those as loss makes a healthy pool look permanently congested.
+#[derive(Debug, Default)]
+pub(crate) struct Outcomes {
+    pub(crate) completed: AtomicU64,
+    pub(crate) failed: AtomicU64,
+}
 
 /// Whether a response actually settles whether the name exists.
 ///
@@ -102,6 +122,8 @@ impl BlastDNSClient {
         // limit starts effectively unlimited rather than absent.
         let limiter = Arc::new(RateLimiter::new(config.rate_limit.unwrap_or(UNLIMITED_QPS)));
 
+        let outcomes = Arc::new(Outcomes::default());
+
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
         // Initialize cache if capacity > 0
@@ -117,6 +139,7 @@ impl BlastDNSClient {
             resolvers: parsed,
             pool,
             limiter,
+            outcomes,
             work_tx,
             work_rx,
             config,
@@ -149,6 +172,7 @@ impl BlastDNSClient {
         let probe = self.config.resolver_probe;
         let adaptive = self.config.adaptive;
         let ceiling = self.config.rate_limit.unwrap_or(UNLIMITED_QPS);
+        let outcomes = self.outcomes.clone();
 
         self.workers_spawned
             .get_or_init(|| async move {
@@ -156,8 +180,13 @@ impl BlastDNSClient {
                     pool.probe(concurrency).await;
                 }
                 if adaptive {
-                    AdaptiveController::new(pool.resolvers().len(), limiter.clone(), ceiling)
-                        .spawn(&pool);
+                    AdaptiveController::new(
+                        pool.resolvers().len(),
+                        limiter.clone(),
+                        ceiling,
+                        outcomes,
+                    )
+                    .spawn(&pool);
                 }
                 // Total concurrency is the worker count. Each worker picks a
                 // resolver per query, and the pool's per-resolver permits keep
@@ -258,6 +287,7 @@ impl BlastDNSClient {
                         cache.insert(query, resp.clone(), Instant::now());
                         debug!(host, %record_type, "cached response");
                     }
+                    self.outcomes.completed.fetch_add(1, Ordering::Relaxed);
                     return Ok(resp);
                 }
                 Err(err) => {
@@ -269,6 +299,8 @@ impl BlastDNSClient {
                         "DNS resolution attempt failed"
                     );
                     if attempt + 1 == attempts || !err.is_retryable() {
+                        self.outcomes.completed.fetch_add(1, Ordering::Relaxed);
+                        self.outcomes.failed.fetch_add(1, Ordering::Relaxed);
                         return Err(err);
                     }
                 }

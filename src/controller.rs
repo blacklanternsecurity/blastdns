@@ -22,12 +22,14 @@
 //! either way, so it is what makes this useful at brute-force scale.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::time::Instant;
 use tracing::debug;
 
 use crate::{
+    client::Outcomes,
     health::{ResolverHealth, ResolverPool},
     limiter::{RateLimiter, UNLIMITED_QPS},
 };
@@ -40,12 +42,8 @@ const GROWTH: f64 = 1.25;
 const LOSS_THRESHOLD: f64 = 0.02;
 /// Queries against one resolver in a tick before its own loss ratio is trusted.
 const MIN_SAMPLES: u64 = 20;
-/// Queries across all proven resolvers in a tick before the aggregate is trusted.
+/// Queries finished in a tick before the global failure rate is trusted.
 const MIN_AGGREGATE_SAMPLES: u64 = 100;
-/// Largest share of the tick's losses one resolver may account for and still have
-/// the loss treated as a path problem. Above this it is that resolver's problem,
-/// and its own throttle is the right response.
-const LOSS_CONCENTRATION_LIMIT: f64 = 0.5;
 /// How often limits are recomputed.
 const TICK: Duration = Duration::from_millis(500);
 /// How long a discovered edge is honored. Without expiry, one transient blip
@@ -73,7 +71,14 @@ pub(crate) struct AdaptiveController {
     global_ceiling: f64,
     per_resolver: Vec<Observation>,
     edges: Vec<Option<Edge>>,
-    global_edge: Option<Edge>,
+    /// Queries finished and lost, as of the previous tick.
+    outcomes: Arc<Outcomes>,
+    previous_outcomes: Observation,
+    /// Current global ceiling, or `None` while unthrottled. Retreat is relative to
+    /// this rather than to observed throughput: observed can sit far below the
+    /// limit simply because the workload is small, and retreating from it would
+    /// clamp the limit for no reason and then compound on every tick.
+    global_limit: Option<f64>,
 }
 
 impl AdaptiveController {
@@ -81,13 +86,16 @@ impl AdaptiveController {
         resolver_count: usize,
         global: Arc<RateLimiter>,
         global_ceiling: f64,
+        outcomes: Arc<Outcomes>,
     ) -> Self {
         Self {
             global,
             global_ceiling,
             per_resolver: vec![Observation::default(); resolver_count],
             edges: (0..resolver_count).map(|_| None).collect(),
-            global_edge: None,
+            outcomes,
+            previous_outcomes: Observation::default(),
+            global_limit: None,
         }
     }
 
@@ -117,12 +125,6 @@ impl AdaptiveController {
         let resolvers = pool.resolvers();
 
         let mut attempted_total = 0u64;
-        // Aggregate only over resolvers that have ever returned a response.
-        // "Ever" rather than "recently": a dead list entry never qualifies, and a
-        // working one does not need to re-prove itself every tick to be counted.
-        let mut proven_attempted = 0u64;
-        let mut proven_lost = 0u64;
-        let mut worst_resolver_lost = 0u64;
 
         for (i, resolver) in resolvers.iter().enumerate() {
             let stats = resolver.stats();
@@ -135,12 +137,6 @@ impl AdaptiveController {
             let attempted = current.attempted.saturating_sub(previous.attempted);
             let lost = current.lost.saturating_sub(previous.lost);
             attempted_total += attempted;
-
-            if stats.answered + stats.empty > 0 {
-                proven_attempted += attempted;
-                proven_lost += lost;
-                worst_resolver_lost = worst_resolver_lost.max(lost);
-            }
 
             // Throttling one resolver needs that resolver's own loss ratio, which
             // needs enough queries against it. Let any stale edge expire
@@ -169,14 +165,7 @@ impl AdaptiveController {
             }
         }
 
-        self.adjust_global(
-            now,
-            seconds,
-            attempted_total,
-            proven_attempted,
-            proven_lost,
-            worst_resolver_lost,
-        );
+        self.adjust_global(seconds, attempted_total);
     }
 
     /// Ease a resolver's pacing back up: expire a stale edge outright, otherwise
@@ -203,68 +192,59 @@ impl AdaptiveController {
         }
     }
 
-    fn adjust_global(
-        &mut self,
-        now: Instant,
-        seconds: f64,
-        attempted: u64,
-        proven_attempted: u64,
-        proven_lost: u64,
-        worst_resolver_lost: u64,
-    ) {
-        let aggregate_loss = if proven_attempted > 0 {
-            proven_lost as f64 / proven_attempted as f64
+    /// Adjust the global rate from queries that ultimately failed.
+    ///
+    /// Deliberately not the per-attempt loss used for individual resolvers. A
+    /// public pool refuses a few percent of attempts as a matter of course and a
+    /// retry elsewhere answers them; counting those makes a healthy pool look
+    /// permanently congested, and a permanent congestion signal drives the rate
+    /// to a standstill. A query that no amount of retrying could answer is real
+    /// evidence about the path.
+    fn adjust_global(&mut self, seconds: f64, attempted: u64) {
+        let current = Observation {
+            attempted: self.outcomes.completed.load(Ordering::Relaxed),
+            lost: self.outcomes.failed.load(Ordering::Relaxed),
+        };
+        let previous = std::mem::replace(&mut self.previous_outcomes, current);
+        let completed = current.attempted.saturating_sub(previous.attempted);
+        let failed = current.lost.saturating_sub(previous.lost);
+
+        let loss = if completed > 0 {
+            failed as f64 / completed as f64
         } else {
             0.0
         };
-        // Loss piled up on one resolver is that resolver misbehaving, and its own
-        // throttle already answers it. Only loss spread across the pool is
-        // evidence about the path we share.
-        let concentration = if proven_lost > 0 {
-            worst_resolver_lost as f64 / proven_lost as f64
-        } else {
-            0.0
-        };
-        let congested = proven_attempted >= MIN_AGGREGATE_SAMPLES
-            && aggregate_loss > LOSS_THRESHOLD
-            && concentration < LOSS_CONCENTRATION_LIMIT;
+        let congested = completed >= MIN_AGGREGATE_SAMPLES && loss > LOSS_THRESHOLD;
 
         if congested {
-            let observed_qps = attempted as f64 / seconds;
-            let target = (RETREAT * observed_qps)
-                .max(MIN_RATE_QPS)
-                .min(self.global_ceiling);
-            self.global_edge = Some(Edge {
-                qps: observed_qps,
-                seen_at: now,
-            });
+            // Retreat from the standing limit, not from observed throughput. The
+            // first event has no limit yet, so observed is the only number
+            // available; after that, compounding on observed would ratchet toward
+            // a standstill whether or not the retreat helped.
+            let basis = self.global_limit.unwrap_or(attempted as f64 / seconds);
+            let target = (basis * RETREAT).max(MIN_RATE_QPS).min(self.global_ceiling);
+            self.global_limit = Some(target);
             self.global.set_rate(target);
             debug!(
-                aggregate_loss,
-                concentration,
-                proven_attempted,
-                observed_qps,
-                target,
-                "aggregate loss across proven resolvers, cutting global rate"
+                loss,
+                completed, failed, target, "queries failing outright, lowering global rate"
             );
             return;
         }
 
-        let Some(edge) = &self.global_edge else {
+        // No unrecoverable loss: ease back up, and stop limiting once the ceiling
+        // is reached so a healthy path is not paced at all.
+        let Some(limit) = self.global_limit else {
             return;
         };
-        if now.duration_since(edge.seen_at) >= EDGE_TTL {
-            self.global_edge = None;
+        let grown = limit * GROWTH;
+        if grown >= self.global_ceiling {
+            self.global_limit = None;
             self.global.set_rate(self.global_ceiling);
-            debug!("global edge expired, restoring configured ceiling");
-            return;
-        }
-        let target = (RETREAT * edge.qps)
-            .max(MIN_RATE_QPS)
-            .min(self.global_ceiling);
-        let current = self.global.rate();
-        if current < target {
-            self.global.set_rate((current * GROWTH).min(target));
+            debug!("global rate recovered to the configured ceiling");
+        } else {
+            self.global_limit = Some(grown);
+            self.global.set_rate(grown);
         }
     }
 }
@@ -299,10 +279,21 @@ mod tests {
         Arc::new(ResolverPool::new(&addrs, &config))
     }
 
-    fn controller(count: usize, ceiling: f64) -> (AdaptiveController, Arc<RateLimiter>) {
+    fn controller(
+        count: usize,
+        ceiling: f64,
+    ) -> (AdaptiveController, Arc<RateLimiter>, Arc<Outcomes>) {
         let global = Arc::new(RateLimiter::new(ceiling));
-        let c = AdaptiveController::new(count, global.clone(), ceiling);
-        (c, global)
+        let outcomes = Arc::new(Outcomes::default());
+        let c = AdaptiveController::new(count, global.clone(), ceiling, outcomes.clone());
+        (c, global, outcomes)
+    }
+
+    /// Record `completed` finished queries, `failed` of which returned nothing
+    /// even after retries.
+    fn finish(outcomes: &Outcomes, completed: u64, failed: u64) {
+        outcomes.completed.fetch_add(completed, Ordering::Relaxed);
+        outcomes.failed.fetch_add(failed, Ordering::Relaxed);
     }
 
     /// Drive `attempted` queries through a resolver, `lost` of them failing.
@@ -320,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn clean_traffic_leaves_pacing_unlimited() {
         let pool = pool(1);
-        let (mut c, _global) = controller(1, UNLIMITED_QPS);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
 
         drive(&pool.resolvers()[0], 100, 0);
         c.tick(&pool, Duration::from_secs(1), Instant::now());
@@ -335,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn loss_retreats_to_the_configured_fraction_of_the_edge() {
         let pool = pool(1);
-        let (mut c, _global) = controller(1, UNLIMITED_QPS);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
 
         // 200 queries in one second with 10% loss: the edge is 200 QPS.
         drive(&pool.resolvers()[0], 200, 20);
@@ -352,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn sustained_loss_ratchets_down() {
         let pool = pool(1);
-        let (mut c, _global) = controller(1, UNLIMITED_QPS);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
         let resolver = &pool.resolvers()[0];
 
         drive(resolver, 200, 20);
@@ -373,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn a_single_bad_resolver_does_not_cut_the_global_rate() {
         let pool = pool(5);
-        let (mut c, global) = controller(5, UNLIMITED_QPS);
+        let (mut c, global, _outcomes) = controller(5, UNLIMITED_QPS);
 
         // One resolver is losing badly, four are clean.
         drive(&pool.resolvers()[0], 100, 50);
@@ -399,7 +390,7 @@ mod tests {
         // worked. That is many broken resolvers, not us sending too fast, and
         // retries are exactly what finds the live ones.
         let pool = pool(10);
-        let (mut c, global) = controller(10, UNLIMITED_QPS);
+        let (mut c, global, _outcomes) = controller(10, UNLIMITED_QPS);
 
         for _ in 0..3 {
             for r in &pool.resolvers()[..8] {
@@ -419,84 +410,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loss_spread_across_proven_resolvers_cuts_the_global_rate() {
-        // Loss spread across resolvers that have all answered before is evidence
-        // about the shared path rather than about any one of them.
+    async fn recovered_failures_do_not_touch_the_global_rate() {
+        // The regression that matters most. A public resolver pool refuses a few
+        // percent of attempts as a matter of course, and a retry elsewhere answers
+        // them. Counting those as congestion throttled a healthy path down to a
+        // sixth of its throughput while losing nothing.
         let pool = pool(5);
-        let (mut c, global) = controller(5, UNLIMITED_QPS);
+        let (mut c, global, outcomes) = controller(5, UNLIMITED_QPS);
 
-        for r in pool.resolvers() {
-            drive(r, 100, 0);
+        for _ in 0..10 {
+            // Heavy per-attempt loss, but every query ultimately answered.
+            for r in pool.resolvers() {
+                drive(r, 100, 30);
+            }
+            finish(&outcomes, 500, 0);
+            c.tick(&pool, Duration::from_millis(500), Instant::now());
         }
-        c.tick(&pool, Duration::from_secs(1), Instant::now());
-        assert_eq!(global.rate(), UNLIMITED_QPS, "clean start, no throttling");
 
-        // ~8% aggregate: enough to slow down, not enough to stop retrying.
-        for r in pool.resolvers() {
-            drive(r, 100, 10);
-        }
-        c.tick(&pool, Duration::from_secs(1), Instant::now());
-
-        assert!(
-            global.rate() < UNLIMITED_QPS,
-            "broad loss should cut the global rate"
+        assert_eq!(
+            global.rate(),
+            UNLIMITED_QPS,
+            "attempt failures that retries recovered from must not pace the pool"
         );
     }
 
     #[tokio::test]
-    async fn severe_loss_paces_harder_but_never_stops_retrying() {
-        // Even a badly degraded path only slows dispatch. Abandoning retries under
-        // load was measured to take unanswered queries from 0% to 3.5%, so the
-        // controller has no lever that can drop results.
+    async fn queries_failing_outright_lower_the_global_rate() {
         let pool = pool(5);
-        let (mut c, global) = controller(5, UNLIMITED_QPS);
+        let (mut c, global, outcomes) = controller(5, UNLIMITED_QPS);
 
         for r in pool.resolvers() {
             drive(r, 100, 0);
         }
+        finish(&outcomes, 500, 40); // 8% could not be answered at all
         c.tick(&pool, Duration::from_secs(1), Instant::now());
 
-        // ~48% aggregate, spread evenly.
-        for r in pool.resolvers() {
-            drive(r, 100, 60);
-        }
-        c.tick(&pool, Duration::from_secs(1), Instant::now());
-
-        let severe = global.rate();
-        assert!(severe < UNLIMITED_QPS, "severe loss should pace dispatch");
         assert!(
-            severe >= MIN_RATE_QPS,
-            "pacing must never reach a standstill"
+            global.rate() < UNLIMITED_QPS,
+            "unrecoverable loss is real evidence about the path"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rate_recovers_once_loss_clears() {
+        // Sustained congestion lowers the rate, but it has to come back, or one
+        // bad patch would hobble the rest of a long scan.
+        let pool = pool(5);
+        let (mut c, global, outcomes) = controller(5, UNLIMITED_QPS);
+
+        for _ in 0..3 {
+            for r in pool.resolvers() {
+                drive(r, 100, 0);
+            }
+            finish(&outcomes, 500, 40);
+            c.tick(&pool, Duration::from_secs(1), Instant::now());
+        }
+        let throttled = global.rate();
+        assert!(throttled < UNLIMITED_QPS, "should have been paced");
+
+        // Clean ticks: the limit climbs 25% each tick and eventually stops
+        // limiting. Reaching a real-world rate takes a few ticks; dropping the
+        // limiter entirely takes ~33s, which is why this loops a while.
+        for _ in 0..80 {
+            for r in pool.resolvers() {
+                drive(r, 100, 0);
+            }
+            finish(&outcomes, 500, 0);
+            c.tick(&pool, Duration::from_secs(1), Instant::now());
+        }
+
+        assert_eq!(
+            global.rate(),
+            UNLIMITED_QPS,
+            "a healthy path must end up unpaced, not merely faster"
         );
     }
 
     #[tokio::test]
     async fn brute_force_scale_is_still_judged() {
-        // The case this controller previously could not see at all: a large pool
-        // where every resolver carries a trickle. Spread ~290 qps over 2,000
-        // resolvers and a 500ms tick gives each one well under one query, so no
-        // per-resolver ratio exists. The aggregate still does.
+        // The case the controller previously could not see at all: thousands of
+        // resolvers each carrying a trickle, so no per-resolver ratio exists. The
+        // global signal comes from query outcomes, which do not depend on any one
+        // resolver being individually measurable.
         let pool = pool_of(2000);
-        let (mut c, global) = controller(2000, UNLIMITED_QPS);
+        let (mut c, global, outcomes) = controller(2000, UNLIMITED_QPS);
         let tick = Duration::from_millis(500);
 
-        // Establish that every resolver has answered at some point.
         for r in pool.resolvers() {
             drive(r, 1, 0);
         }
+        finish(&outcomes, 2000, 0);
         c.tick(&pool, tick, Instant::now());
         assert_eq!(global.rate(), UNLIMITED_QPS, "clean trickle, no throttling");
 
-        // Now a trickle with broad loss: one query each, 10% of them lost, so no
-        // single resolver comes anywhere near MIN_SAMPLES.
         for (i, r) in pool.resolvers().iter().enumerate() {
             drive(r, 1, if i % 10 == 0 { 1 } else { 0 });
         }
+        finish(&outcomes, 2000, 200);
         c.tick(&pool, tick, Instant::now());
 
         assert!(
             global.rate() < UNLIMITED_QPS,
-            "aggregate loss must be actionable even when no resolver is individually measurable"
+            "unrecoverable loss must be actionable even when no resolver is individually measurable"
         );
     }
 
@@ -504,7 +519,7 @@ mod tests {
     async fn a_configured_ceiling_is_never_exceeded() {
         let pool = pool(5);
         let ceiling = 50.0;
-        let (mut c, global) = controller(5, ceiling);
+        let (mut c, global, _outcomes) = controller(5, ceiling);
 
         // Correlated loss at a delivered rate far above the ceiling.
         for r in pool.resolvers() {
@@ -522,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_edge_releases_the_throttle() {
         let pool = pool(1);
-        let (mut c, _global) = controller(1, UNLIMITED_QPS);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
         let resolver = &pool.resolvers()[0];
         let start = Instant::now();
 
@@ -544,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_climbs_back_toward_the_target() {
         let pool = pool(1);
-        let (mut c, _global) = controller(1, UNLIMITED_QPS);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
         let resolver = &pool.resolvers()[0];
         let now = Instant::now();
 
@@ -654,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn small_samples_are_not_treated_as_signal() {
         let pool = pool(1);
-        let (mut c, _global) = controller(1, UNLIMITED_QPS);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
 
         // Below MIN_SAMPLES, even total loss must not move the rate.
         drive(&pool.resolvers()[0], 5, 5);
