@@ -157,8 +157,29 @@ impl ResolverWorker {
             "querying DNS resolver"
         );
 
+        // Bound the wait here rather than relying on the transport to do it: a
+        // query holds a resolver's in-flight permit until it returns, so one that
+        // never returns costs capacity, not just its own result.
+        let timeout = health.request_timeout();
         let started = Instant::now();
-        match client.query(name.clone(), DNSClass::IN, record_type).await {
+        let answer = match tokio::time::timeout(
+            timeout,
+            client.query(name.clone(), DNSClass::IN, record_type),
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            Err(_) => {
+                let err = BlastDNSError::QueryTimedOut {
+                    resolver: health.addr(),
+                    timeout,
+                };
+                health.record_error(true);
+                return Err(err);
+            }
+        };
+
+        match answer {
             Ok(response) if response.truncated() => {
                 // TC means the server dropped records to fit the UDP payload, so
                 // what arrived is an arbitrary subset. Re-ask over TCP, which has

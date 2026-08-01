@@ -38,6 +38,11 @@ pub enum BlastDNSError {
         #[source]
         source: ClientError,
     },
+    #[error("resolver {resolver} did not answer within {timeout:?}")]
+    QueryTimedOut {
+        resolver: SocketAddr,
+        timeout: std::time::Duration,
+    },
     #[error("configuration error: {0}")]
     Configuration(String),
 }
@@ -47,13 +52,18 @@ impl BlastDNSError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            BlastDNSError::ResolverRequestFailed { .. } | BlastDNSError::WorkerDropped
+            BlastDNSError::ResolverRequestFailed { .. }
+                | BlastDNSError::QueryTimedOut { .. }
+                | BlastDNSError::WorkerDropped
         )
     }
 
     /// Returns `true` when the query got no response at all, as opposed to
     /// failing for some other reason. Over UDP this is the loss signal.
     pub fn is_timeout(&self) -> bool {
+        if matches!(self, BlastDNSError::QueryTimedOut { .. }) {
+            return true;
+        }
         let BlastDNSError::ResolverRequestFailed { source, .. } = self else {
             return false;
         };

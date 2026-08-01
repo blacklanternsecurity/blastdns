@@ -170,6 +170,10 @@ impl ResolverHealth {
         self.resolver
     }
 
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     fn now_ns(&self) -> u64 {
         self.start.elapsed().as_nanos() as u64
     }

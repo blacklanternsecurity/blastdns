@@ -351,6 +351,44 @@ mod tests {
         assert_eq!(sim.answered(), 1);
     }
 
+    /// A query holds its resolver's in-flight permit until it returns, so an
+    /// unanswered one has to give that permit back on a deadline. Both transports
+    /// must honour the timeout rather than leaving it to whichever one happens to
+    /// set it on its stream: otherwise lost UDP responses park permits until the
+    /// pool starves.
+    #[tokio::test]
+    async fn an_unanswered_query_times_out_on_every_transport() {
+        for persistent_socket in [false, true] {
+            let sim = SimResolver::start(SimConfig {
+                drop_one_in: Some(1),
+                ..Default::default()
+            })
+            .await;
+            let config = BlastDNSConfig {
+                persistent_socket,
+                ..client_config()
+            };
+            let timeout = config.request_timeout;
+            let client = BlastDNSClient::with_config(vec![sim.addr()], config).unwrap();
+
+            let started = tokio::time::Instant::now();
+            let result = client
+                .resolve("example.com.".to_string(), RecordType::A)
+                .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "persistent_socket={persistent_socket}: a dropped response must not resolve"
+            );
+            assert!(
+                elapsed < timeout * 4,
+                "persistent_socket={persistent_socket}: waited {elapsed:?} for a {timeout:?} timeout"
+            );
+            assert_eq!(sim.dropped(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn deterministic_loss_drops_the_expected_share() {
         let sim = SimResolver::start(SimConfig {

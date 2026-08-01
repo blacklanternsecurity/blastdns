@@ -455,6 +455,7 @@ fn blastdns_error_to_pyerr(err: BlastDNSError) -> PyErr {
                 .get()
                 .and_then(|t| make_pyerr(py, t, msg.clone())),
             BlastDNSError::ResolverRequestFailed { .. }
+            | BlastDNSError::QueryTimedOut { .. }
             | BlastDNSError::ResolverSetupFailed { .. }
             | BlastDNSError::WorkerDropped
             | BlastDNSError::QueueClosed => PY_RESOLVER_ERROR
