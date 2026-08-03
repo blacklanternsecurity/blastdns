@@ -368,7 +368,6 @@ mod tests {
                 resolver_probe: true,
                 ..client_config()
             };
-            let timeout = config.request_timeout;
             let client = BlastDNSClient::with_config(vec![sim.addr()], config).unwrap();
 
             let started = tokio::time::Instant::now();
@@ -377,10 +376,13 @@ mod tests {
                 .await;
             let elapsed = started.elapsed();
 
+            // The probe deliberately allows more than the request timeout, so this
+            // bounds it against the unbounded behavior it replaced: a transport with
+            // no per-request deadline sat on a dropped response for ~5s.
             assert!(
-                elapsed < timeout * 6,
+                elapsed < Duration::from_secs(4),
                 "persistent_socket={persistent_socket}: probing one dead resolver \
-                 took {elapsed:?} against a {timeout:?} timeout"
+                 took {elapsed:?}, which is not a bounded wait"
             );
         }
     }

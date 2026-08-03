@@ -76,6 +76,9 @@ const RTT_MIN_WINDOW: Duration = Duration::from_secs(30);
 /// Weight of the newest sample in the RTT moving average (1/8, as in TCP).
 const RTT_EWMA_SHIFT: u64 = 3;
 
+/// Shortest deadline the startup probe will use, whatever the request timeout is.
+const PROBE_DEADLINE_FLOOR: Duration = Duration::from_secs(2);
+
 /// Counter snapshot for one resolver.
 ///
 /// `attempted` equals `answered + empty + timeout + error`, so a caller can
@@ -208,20 +211,21 @@ impl ResolverHealth {
         self.limiter.set_rate(queries_per_second);
     }
 
-    /// Send one query to this resolver, bounded by the request timeout.
+    /// Send one query to this resolver, giving up after `deadline`.
     ///
-    /// The deadline lives here rather than at the call sites because only the
+    /// The bound is applied here rather than at the call sites because only the
     /// per-query transport can carry one on its stream; a persistent socket has
     /// no per-request deadline of its own, so an unanswered query would otherwise
     /// wait indefinitely.
-    pub(crate) async fn query_bounded(
+    pub(crate) async fn query_within(
         &self,
         name: Name,
         record_type: RecordType,
+        deadline: Duration,
     ) -> Result<DnsResponse, BlastDNSError> {
         let mut client = self.client().await?;
         let query = client.query(name, DNSClass::IN, record_type);
-        match tokio::time::timeout(self.request_timeout, query).await {
+        match tokio::time::timeout(deadline, query).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(source)) => Err(BlastDNSError::ResolverRequestFailed {
                 resolver: self.resolver,
@@ -229,18 +233,35 @@ impl ResolverHealth {
             }),
             Err(_) => Err(BlastDNSError::QueryTimedOut {
                 resolver: self.resolver,
-                timeout: self.request_timeout,
+                timeout: deadline,
             }),
         }
+    }
+
+    /// Send one query to this resolver under the configured request timeout.
+    pub(crate) async fn query_bounded(
+        &self,
+        name: Name,
+        record_type: RecordType,
+    ) -> Result<DnsResponse, BlastDNSError> {
+        self.query_within(name, record_type, self.request_timeout)
+            .await
     }
 
     /// Confirm this resolver answers queries, deactivating it if not.
     ///
     /// Queries the root nameservers, which every working recursive resolver
     /// answers, so liveness does not depend on any external zone.
+    ///
+    /// Judged on a looser deadline than a normal query. Deactivation lasts for the
+    /// life of the client, and a root-NS query to a cold resolver is slower than
+    /// the cached lookups a scan mostly makes, so a brute-force timeout of a few
+    /// hundred milliseconds would evict resolvers that serve those lookups fine --
+    /// and a passing latency spike would take out much of the pool at once.
     pub(crate) async fn probe(&self) -> bool {
+        let deadline = self.request_timeout.max(PROBE_DEADLINE_FLOOR);
         let alive = self
-            .query_bounded(Name::root(), RecordType::NS)
+            .query_within(Name::root(), RecordType::NS, deadline)
             .await
             .is_ok();
         if !alive {
