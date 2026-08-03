@@ -351,6 +351,40 @@ mod tests {
         assert_eq!(sim.answered(), 1);
     }
 
+    /// The startup probe queries every resolver, so an unanswered probe has to hit
+    /// the same deadline as any other query. Left unbounded on a transport that
+    /// carries no per-request deadline, a pool full of dead entries turns startup
+    /// into a wait proportional to how many of them there are.
+    #[tokio::test]
+    async fn the_startup_probe_is_bounded_on_every_transport() {
+        for persistent_socket in [false, true] {
+            let sim = SimResolver::start(SimConfig {
+                drop_one_in: Some(1),
+                ..Default::default()
+            })
+            .await;
+            let config = BlastDNSConfig {
+                persistent_socket,
+                resolver_probe: true,
+                ..client_config()
+            };
+            let timeout = config.request_timeout;
+            let client = BlastDNSClient::with_config(vec![sim.addr()], config).unwrap();
+
+            let started = tokio::time::Instant::now();
+            let _ = client
+                .resolve("example.com.".to_string(), RecordType::A)
+                .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < timeout * 6,
+                "persistent_socket={persistent_socket}: probing one dead resolver \
+                 took {elapsed:?} against a {timeout:?} timeout"
+            );
+        }
+    }
+
     /// A query holds its resolver's in-flight permit until it returns, so an
     /// unanswered one has to give that permit back on a deadline. Both transports
     /// must honour the timeout rather than leaving it to whichever one happens to

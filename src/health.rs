@@ -13,7 +13,7 @@ use hickory_client::{
         runtime::TokioTime,
         tcp::TcpClientStream,
         udp::{UdpClientStream, UdpStream},
-        xfer::{DnsClientStream, SerialMessage},
+        xfer::{DnsClientStream, DnsResponse, SerialMessage},
     },
 };
 use serde::Serialize;
@@ -170,10 +170,6 @@ impl ResolverHealth {
         self.resolver
     }
 
-    pub(crate) fn request_timeout(&self) -> Duration {
-        self.request_timeout
-    }
-
     fn now_ns(&self) -> u64 {
         self.start.elapsed().as_nanos() as u64
     }
@@ -212,18 +208,41 @@ impl ResolverHealth {
         self.limiter.set_rate(queries_per_second);
     }
 
+    /// Send one query to this resolver, bounded by the request timeout.
+    ///
+    /// The deadline lives here rather than at the call sites because only the
+    /// per-query transport can carry one on its stream; a persistent socket has
+    /// no per-request deadline of its own, so an unanswered query would otherwise
+    /// wait indefinitely.
+    pub(crate) async fn query_bounded(
+        &self,
+        name: Name,
+        record_type: RecordType,
+    ) -> Result<DnsResponse, BlastDNSError> {
+        let mut client = self.client().await?;
+        let query = client.query(name, DNSClass::IN, record_type);
+        match tokio::time::timeout(self.request_timeout, query).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(source)) => Err(BlastDNSError::ResolverRequestFailed {
+                resolver: self.resolver,
+                source,
+            }),
+            Err(_) => Err(BlastDNSError::QueryTimedOut {
+                resolver: self.resolver,
+                timeout: self.request_timeout,
+            }),
+        }
+    }
+
     /// Confirm this resolver answers queries, deactivating it if not.
     ///
     /// Queries the root nameservers, which every working recursive resolver
     /// answers, so liveness does not depend on any external zone.
     pub(crate) async fn probe(&self) -> bool {
-        let alive = match self.client().await {
-            Ok(mut client) => client
-                .query(Name::root(), DNSClass::IN, RecordType::NS)
-                .await
-                .is_ok(),
-            Err(_) => false,
-        };
+        let alive = self
+            .query_bounded(Name::root(), RecordType::NS)
+            .await
+            .is_ok();
         if !alive {
             self.active.store(false, Ordering::Relaxed);
             debug!(resolver = %self.resolver, "resolver failed startup probe");

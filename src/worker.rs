@@ -142,14 +142,6 @@ impl ResolverWorker {
     ) -> Result<DnsResponse, BlastDNSError> {
         health.record_dispatch();
 
-        let mut client = match health.client().await {
-            Ok(client) => client,
-            Err(err) => {
-                health.record_error(false);
-                return Err(err);
-            }
-        };
-
         debug!(
             resolver = %health.addr(),
             %name,
@@ -157,29 +149,8 @@ impl ResolverWorker {
             "querying DNS resolver"
         );
 
-        // Bound the wait here rather than relying on the transport to do it: a
-        // query holds a resolver's in-flight permit until it returns, so one that
-        // never returns costs capacity, not just its own result.
-        let timeout = health.request_timeout();
         let started = Instant::now();
-        let answer = match tokio::time::timeout(
-            timeout,
-            client.query(name.clone(), DNSClass::IN, record_type),
-        )
-        .await
-        {
-            Ok(answer) => answer,
-            Err(_) => {
-                let err = BlastDNSError::QueryTimedOut {
-                    resolver: health.addr(),
-                    timeout,
-                };
-                health.record_error(true);
-                return Err(err);
-            }
-        };
-
-        match answer {
+        match health.query_bounded(name.clone(), record_type).await {
             Ok(response) if response.truncated() => {
                 // TC means the server dropped records to fit the UDP payload, so
                 // what arrived is an arbitrary subset. Re-ask over TCP, which has
@@ -194,11 +165,7 @@ impl ResolverWorker {
                 health.record_response(started.elapsed(), !response.answers().is_empty());
                 Ok(response)
             }
-            Err(source) => {
-                let err = BlastDNSError::ResolverRequestFailed {
-                    resolver: health.addr(),
-                    source,
-                };
+            Err(err) => {
                 health.record_error(err.is_timeout());
                 Err(err)
             }
