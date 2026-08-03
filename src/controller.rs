@@ -16,9 +16,10 @@
 //! problem.
 //!
 //! The two signals need different amounts of evidence. A per-resolver loss ratio
-//! needs enough queries against that one resolver, and the per-resolver in-flight
-//! cap means a few queries per tick at most, so those samples accumulate across
-//! ticks until the ratio means something. The aggregate is well sampled every tick.
+//! needs enough queries against that one resolver, which only happens with a
+//! small pool; spread a few hundred queries per second over thousands of
+//! resolvers and no single one is ever measurable. The aggregate is well sampled
+//! either way, so it is what makes this useful at brute-force scale.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -39,16 +40,10 @@ const RETREAT: f64 = 0.85;
 const GROWTH: f64 = 1.25;
 /// Loss fraction above which a resolver counts as degraded.
 const LOSS_THRESHOLD: f64 = 0.02;
-/// Queries against one resolver before its own loss ratio is trusted. Accumulated
-/// across ticks: a resolver held to a couple of queries in flight cannot produce
-/// this many within one tick, so demanding it per tick never judges anything.
+/// Queries against one resolver in a tick before its own loss ratio is trusted.
 const MIN_SAMPLES: u64 = 20;
 /// Queries finished in a tick before the global failure rate is trusted.
 const MIN_AGGREGATE_SAMPLES: u64 = 100;
-/// How long a sampling window may stay open. Past this the samples span too many
-/// conditions to be one measurement, and a resolver drawing this little traffic is
-/// not one we could be overloading anyway.
-const WINDOW_TTL: Duration = Duration::from_secs(10);
 /// How often limits are recomputed.
 const TICK: Duration = Duration::from_millis(500);
 /// How long a discovered edge is honored. Without expiry, one transient blip
@@ -63,28 +58,6 @@ struct Observation {
     lost: u64,
 }
 
-/// Sampling state for one resolver.
-///
-/// `last` gives the per-tick delta, which is what the global rate is measured
-/// against. `window` accumulates those deltas until there are enough to trust a
-/// loss ratio for this one resolver, which usually takes several ticks.
-///
-/// The window's span is accumulated from the elapsed time each tick reports rather
-/// than read off the clock, so the caller's notion of time is the only one in play.
-#[derive(Default)]
-struct Sampler {
-    last: Observation,
-    window: Observation,
-    window_seconds: f64,
-}
-
-impl Sampler {
-    fn reopen(&mut self) {
-        self.window = Observation::default();
-        self.window_seconds = 0.0;
-    }
-}
-
 /// A rate at which loss was observed, and when it was seen.
 struct Edge {
     qps: f64,
@@ -96,7 +69,7 @@ pub(crate) struct AdaptiveController {
     global: Arc<RateLimiter>,
     /// Configured hard cap. `UNLIMITED_QPS` when none was set.
     global_ceiling: f64,
-    per_resolver: Vec<Sampler>,
+    per_resolver: Vec<Observation>,
     edges: Vec<Option<Edge>>,
     /// Queries finished and lost, as of the previous tick.
     outcomes: Arc<Outcomes>,
@@ -118,7 +91,7 @@ impl AdaptiveController {
         Self {
             global,
             global_ceiling,
-            per_resolver: (0..resolver_count).map(|_| Sampler::default()).collect(),
+            per_resolver: vec![Observation::default(); resolver_count],
             edges: (0..resolver_count).map(|_| None).collect(),
             outcomes,
             previous_outcomes: Observation::default(),
@@ -159,40 +132,23 @@ impl AdaptiveController {
                 attempted: stats.attempted,
                 lost: stats.timeout + stats.error,
             };
+            let previous = std::mem::replace(&mut self.per_resolver[i], current);
 
-            let sampler = &mut self.per_resolver[i];
-            let tick_attempted = current.attempted.saturating_sub(sampler.last.attempted);
-            let tick_lost = current.lost.saturating_sub(sampler.last.lost);
-            sampler.last = current;
-            sampler.window.attempted += tick_attempted;
-            sampler.window.lost += tick_lost;
-            sampler.window_seconds += seconds;
+            let attempted = current.attempted.saturating_sub(previous.attempted);
+            let lost = current.lost.saturating_sub(previous.lost);
+            attempted_total += attempted;
 
-            // The global rate is measured per tick; only the per-resolver ratio
-            // accumulates.
-            attempted_total += tick_attempted;
-
-            let window = sampler.window;
-            let window_seconds = sampler.window_seconds;
-
-            if window.attempted < MIN_SAMPLES {
-                // Not enough queries against this resolver to judge it yet. Drop a
-                // window that has gone stale rather than deciding on it, and let any
-                // existing edge expire so an idle resolver is not throttled forever.
-                if window_seconds >= WINDOW_TTL.as_secs_f64() {
-                    sampler.reopen();
-                }
+            // Throttling one resolver needs that resolver's own loss ratio, which
+            // needs enough queries against it. Let any stale edge expire
+            // regardless, so an idle resolver does not stay throttled forever.
+            if attempted < MIN_SAMPLES {
                 self.relax(i, now, resolver);
                 continue;
             }
 
-            self.per_resolver[i].reopen();
-
-            let loss = window.lost as f64 / window.attempted as f64;
+            let loss = lost as f64 / attempted as f64;
             if loss > LOSS_THRESHOLD {
-                // The rate sustained over the window is the rate at which loss
-                // appeared, so it is the edge. Operate below it.
-                let observed_qps = window.attempted as f64 / window_seconds.max(1e-6);
+                let observed_qps = attempted as f64 / seconds;
                 let target = (RETREAT * observed_qps).max(MIN_RATE_QPS);
                 self.edges[i] = Some(Edge {
                     qps: observed_qps,
@@ -514,7 +470,6 @@ mod tests {
         let (mut c, global, outcomes) = controller(1, UNLIMITED_QPS);
         let tick = Duration::from_secs(1);
 
-        // A well-sampled tick where everything fails outright.
         drive(&pool.resolvers()[0], 500, 0);
         finish(&outcomes, 500, 500);
         c.tick(&pool, tick, Instant::now());
@@ -767,61 +722,6 @@ mod tests {
             pool.resolvers()[0].rate(),
             UNLIMITED_QPS,
             "a handful of failures is not enough to conclude anything"
-        );
-    }
-
-    /// The per-resolver in-flight cap holds a resolver to a few queries per tick,
-    /// so requiring MIN_SAMPLES within a single tick never judges one at all. The
-    /// samples have to carry across ticks.
-    #[tokio::test]
-    async fn a_trickle_accumulates_until_it_is_judged() {
-        let pool = pool(1);
-        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
-        let resolver = &pool.resolvers()[0];
-        let tick = Duration::from_millis(500);
-
-        // 5 queries per tick with one failing: 20% loss, far above the threshold,
-        // but never 20 samples in any single tick.
-        for _ in 0..3 {
-            drive(resolver, 5, 1);
-            c.tick(&pool, tick, Instant::now());
-            assert_eq!(
-                resolver.rate(),
-                UNLIMITED_QPS,
-                "must not act before there are enough samples to trust the ratio"
-            );
-        }
-
-        drive(resolver, 5, 1);
-        c.tick(&pool, tick, Instant::now());
-
-        // 20 queries over four 500ms ticks is 10 QPS, so that is the edge.
-        let expected = RETREAT * 10.0;
-        let rate = resolver.rate();
-        assert!(
-            (rate - expected).abs() / expected < 0.05,
-            "expected ~{expected} QPS (85% of the 10 QPS edge), got {rate}"
-        );
-    }
-
-    /// A resolver too lightly loaded to reach MIN_SAMPLES inside the window is left
-    /// alone rather than judged on samples spanning many seconds of conditions.
-    #[tokio::test]
-    async fn a_window_that_never_fills_is_discarded_rather_than_judged() {
-        let pool = pool(1);
-        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
-        let resolver = &pool.resolvers()[0];
-
-        // One failing query per second, so the window expires before it ever fills.
-        for _ in 0..40 {
-            drive(resolver, 1, 1);
-            c.tick(&pool, Duration::from_secs(1), Instant::now());
-        }
-
-        assert_eq!(
-            resolver.rate(),
-            UNLIMITED_QPS,
-            "traffic this light is not evidence we are overloading anything"
         );
     }
 }
