@@ -258,7 +258,8 @@ impl AdaptiveController {
         } else {
             0.0
         };
-        let congested = completed >= MIN_AGGREGATE_SAMPLES && loss > LOSS_THRESHOLD;
+        let well_sampled = completed >= MIN_AGGREGATE_SAMPLES;
+        let congested = well_sampled && loss > LOSS_THRESHOLD;
 
         if congested {
             // Retreat from the standing limit, not from observed throughput. The
@@ -276,11 +277,19 @@ impl AdaptiveController {
             return;
         }
 
-        // No unrecoverable loss: ease back up, and stop limiting once the ceiling
-        // is reached so a healthy path is not paced at all.
         let Some(limit) = self.global_limit else {
             return;
         };
+
+        // Too few queries finished to say anything, so hold. Climbing here would
+        // read a quiet tick as proof of health and inflate the limit between two
+        // congested ticks, so a path losing everything would drift upward.
+        if !well_sampled {
+            return;
+        }
+
+        // Queries are finishing and not failing: ease back up, and stop limiting
+        // once the ceiling is reached so a healthy path is not paced at all.
         let grown = limit * GROWTH;
         if grown >= self.global_ceiling {
             self.global_limit = None;
@@ -492,6 +501,41 @@ mod tests {
         assert!(
             global.rate() < UNLIMITED_QPS,
             "unrecoverable loss is real evidence about the path"
+        );
+    }
+
+    /// A tick that finished too few queries to judge must hold the limit. Growing
+    /// on it treats a quiet moment as proof of health, so bursty traffic over a
+    /// failing path drifts the limit upward between congested ticks instead of
+    /// converging down.
+    #[tokio::test]
+    async fn quiet_ticks_do_not_raise_the_limit_on_a_failing_path() {
+        let pool = pool(1);
+        let (mut c, global, outcomes) = controller(1, UNLIMITED_QPS);
+        let tick = Duration::from_secs(1);
+
+        // A well-sampled tick where everything fails outright.
+        drive(&pool.resolvers()[0], 500, 0);
+        finish(&outcomes, 500, 500);
+        c.tick(&pool, tick, Instant::now());
+        let first = global.rate();
+        assert!(
+            first < UNLIMITED_QPS,
+            "total loss should have paced the path"
+        );
+
+        // Quiet ticks: a trickle finishes, still all failing, but too few to judge.
+        for _ in 0..5 {
+            drive(&pool.resolvers()[0], 10, 0);
+            finish(&outcomes, 10, 10);
+            c.tick(&pool, tick, Instant::now());
+        }
+
+        assert!(
+            global.rate() <= first,
+            "a failing path must not drift upward on under-sampled ticks: \
+             {first} then {}",
+            global.rate()
         );
     }
 
