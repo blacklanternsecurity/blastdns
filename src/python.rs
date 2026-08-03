@@ -722,12 +722,33 @@ fn zone_transfer_py<'py>(
     })
 }
 
+/// Send blastdns's internal logs to stderr.
+///
+/// Explicit rather than automatic: the subscriber is process-global, and a
+/// library claiming it on import would silently take it from whatever embeds it.
+/// Returns `False` if one is already installed, which is not an error -- it just
+/// means the host application is in charge of where logs go.
+#[pyfunction]
+#[pyo3(signature = (filter=None))]
+fn init_logging(filter: Option<&str>) -> bool {
+    let env_filter = match filter {
+        Some(directive) => tracing_subscriber::EnvFilter::new(directive),
+        None => tracing_subscriber::EnvFilter::from_default_env(),
+    };
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .try_init()
+        .is_ok()
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlastDNSClient>()?;
     m.add_class::<PyMockBlastDNSClient>()?;
     m.add_function(wrap_pyfunction!(get_system_resolvers_py, m)?)?;
     m.add_function(wrap_pyfunction!(zone_transfer_py, m)?)?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     // Eagerly initialize exception types so they're ready before any errors occur
     let _ = init_exception_types(py);
     Ok(())

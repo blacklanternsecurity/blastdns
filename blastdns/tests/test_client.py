@@ -396,6 +396,19 @@ def test_mock_client_reports_no_stats():
     assert MockClient().stats() == []
 
 
+def test_init_logging_reports_whether_it_took_the_subscriber():
+    """The log subscriber is process-global, so a second call must decline rather
+    than replace the first or raise. Without calling this at all, nothing the
+    engine logs is visible from Python."""
+    from blastdns import init_logging
+
+    # "off" so installing a process-wide subscriber does not flood the rest of
+    # the run with engine logs.
+    first = init_logging("off")
+    assert isinstance(first, bool)
+    assert init_logging("off") is False, "a second call must report that a subscriber is already installed"
+
+
 def test_client_config_rejects_unknown_options():
     """An unknown option must fail loudly. Silently ignoring it would let a
     stale name fall back to a default with no indication anything was wrong."""

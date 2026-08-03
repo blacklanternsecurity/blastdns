@@ -11,7 +11,29 @@ __all__ = [
     "Client",
     "MockClient",
     "get_system_resolvers",
+    "init_logging",
 ]
+
+
+def init_logging(filter: Optional[str] = None) -> bool:
+    """Send blastdns's internal logs to stderr.
+
+    Without this, nothing the engine logs is visible from Python: resolver
+    diagnostics, purgatory sentences, TCP refetches on truncation, and adaptive
+    rate changes are all discarded. Call it once, early.
+
+    Args:
+        filter: A ``RUST_LOG``-style directive, e.g. ``"blastdns=debug"``.
+                Defaults to reading ``RUST_LOG`` from the environment.
+
+    Returns:
+        bool: False if a log subscriber is already installed, in which case that
+              one stays in charge. Not an error.
+
+    Example:
+        blastdns.init_logging("blastdns=debug")
+    """
+    return _native.init_logging(filter)
 
 
 def get_system_resolvers() -> list[str]:
