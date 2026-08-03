@@ -79,7 +79,9 @@ class ClientConfig(BaseModel):
     persistent_socket: bool = Field(default=False)
     request_timeout_ms: int = Field(default=1000, ge=1)
     max_retries: int = Field(default=10, ge=0)
-    purgatory_threshold: int = Field(default=10, ge=1)
+    purgatory_threshold: int = Field(default=10, ge=0)
+    """Consecutive failures before a resolver is benched. 0 disables benching, as
+    does a ``purgatory_sentence_ms`` of 0."""
     purgatory_sentence_ms: int = Field(default=1000, ge=0)
     cache_capacity: int = Field(default=10000, ge=0)
     cache_min_ttl_secs: int = Field(default=10, ge=0)

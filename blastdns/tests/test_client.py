@@ -396,6 +396,34 @@ def test_mock_client_reports_no_stats():
     assert MockClient().stats() == []
 
 
+@pytest.mark.asyncio
+async def test_purgatory_can_be_disabled():
+    """The engine treats a threshold of 0 as "never bench", so the config surface
+    has to allow expressing it. Rejecting 0 made that behavior unreachable."""
+    cfg = ClientConfig(purgatory_threshold=0)
+    assert cfg.purgatory_threshold == 0
+
+    # A resolver that never answers would normally be benched; with benching off
+    # it stays eligible, and the queries fail instead of being skipped.
+    client = Client(
+        ["192.0.2.1"],
+        ClientConfig(
+            purgatory_threshold=0,
+            request_timeout_ms=100,
+            max_retries=0,
+            cache_capacity=0,
+            max_concurrency=4,
+        ),
+    )
+    hosts = [f"h{i}.example.com" for i in range(12)]
+    errors = 0
+    async for _host, result in client.resolve_batch_full(hosts, "A"):
+        if isinstance(result, DNSError):
+            errors += 1
+    assert errors == len(hosts), "an unreachable resolver should fail every query"
+    assert client.stats()[0].purgatory_entries == 0, "benching should be disabled"
+
+
 def test_init_logging_reports_whether_it_took_the_subscriber():
     """The log subscriber is process-global, so a second call must decline rather
     than replace the first or raise. Without calling this at all, nothing the
