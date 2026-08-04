@@ -51,6 +51,23 @@ const TICK: Duration = Duration::from_millis(500);
 const EDGE_TTL: Duration = Duration::from_secs(30);
 /// Floor on any pacing rate, so a bad patch cannot stall a scan outright.
 const MIN_RATE_QPS: f64 = 1.0;
+/// Loss must fall to this fraction of the best seen so far to justify retreating
+/// again.
+///
+/// Backing off only helps when the rate is what caused the loss. A resolver
+/// dropping a fixed share of queries loses just as much at any rate, and retreating
+/// every tick would walk it to the floor without recovering a query. Comparing
+/// against the best loss of the episode rather than merely the previous tick keeps
+/// sampling noise from looking like progress; the margin stays small because real
+/// convergence toward a capacity limit improves gradually.
+const RETREAT_MUST_IMPROVE: f64 = 0.99;
+/// Consecutive ticks without improvement before a resolver's rate is held.
+///
+/// One flat tick is not proof: loss is a sampled ratio, and a noisy reading during
+/// a genuine convergence would otherwise stop it short of the resolver's real
+/// capacity. Requiring a couple in a row still bounds how far a rate can walk when
+/// the loss truly is not ours to fix.
+const STALL_TICKS: u8 = 2;
 
 #[derive(Default, Clone, Copy)]
 struct Observation {
@@ -71,6 +88,11 @@ pub(crate) struct AdaptiveController {
     global_ceiling: f64,
     per_resolver: Vec<Observation>,
     edges: Vec<Option<Edge>>,
+    /// Lowest loss seen for each resolver since its current episode of loss began,
+    /// so the next tick can tell whether backing off is actually buying anything.
+    best_loss: Vec<Option<f64>>,
+    /// Consecutive ticks a resolver's loss has failed to improve.
+    stalled: Vec<u8>,
     /// Queries finished and lost, as of the previous tick.
     outcomes: Arc<Outcomes>,
     previous_outcomes: Observation,
@@ -93,6 +115,8 @@ impl AdaptiveController {
             global_ceiling,
             per_resolver: vec![Observation::default(); resolver_count],
             edges: (0..resolver_count).map(|_| None).collect(),
+            best_loss: vec![None; resolver_count],
+            stalled: vec![0; resolver_count],
             outcomes,
             previous_outcomes: Observation::default(),
             global_limit: None,
@@ -147,22 +171,51 @@ impl AdaptiveController {
             }
 
             let loss = lost as f64 / attempted as f64;
-            if loss > LOSS_THRESHOLD {
-                let observed_qps = attempted as f64 / seconds;
-                let target = (RETREAT * observed_qps).max(MIN_RATE_QPS);
-                self.edges[i] = Some(Edge {
-                    qps: observed_qps,
-                    seen_at: now,
-                });
-                resolver.set_rate(target);
-                debug!(
-                    resolver = %resolver.addr(),
-                    loss, observed_qps, target,
-                    "resolver losing queries, retreating below the edge"
-                );
-            } else {
+            if loss <= LOSS_THRESHOLD {
+                self.best_loss[i] = None;
+                self.stalled[i] = 0;
                 self.relax(i, now, resolver);
+                continue;
             }
+
+            // Retreat only while there is evidence it is doing something. The first
+            // sight of loss earns one, and after that the loss has to actually be
+            // falling. Otherwise the loss is not coming from our rate, and lowering
+            // it again would only trade throughput for nothing.
+            let improving = match self.best_loss[i] {
+                Some(best) => loss < best * RETREAT_MUST_IMPROVE,
+                None => true,
+            };
+            if improving {
+                self.stalled[i] = 0;
+            } else {
+                self.stalled[i] = self.stalled[i].saturating_add(1);
+                if self.stalled[i] >= STALL_TICKS {
+                    debug!(
+                        resolver = %resolver.addr(),
+                        loss, stalled = self.stalled[i],
+                        "loss is not responding to retreat, holding rate"
+                    );
+                    continue;
+                }
+            }
+
+            let observed_qps = attempted as f64 / seconds;
+            let target = (RETREAT * observed_qps).max(MIN_RATE_QPS);
+            self.edges[i] = Some(Edge {
+                qps: observed_qps,
+                seen_at: now,
+            });
+            self.best_loss[i] = Some(match self.best_loss[i] {
+                Some(best) => best.min(loss),
+                None => loss,
+            });
+            resolver.set_rate(target);
+            debug!(
+                resolver = %resolver.addr(),
+                loss, observed_qps, target,
+                "resolver losing queries, retreating below the edge"
+            );
         }
 
         self.adjust_global(seconds, attempted_total);
@@ -177,6 +230,10 @@ impl AdaptiveController {
 
         if now.duration_since(edge.seen_at) >= EDGE_TTL {
             self.edges[i] = None;
+            // Forget what the episode achieved too: the next one gets judged on its
+            // own, not against a reading from 30 seconds ago.
+            self.best_loss[i] = None;
+            self.stalled[i] = 0;
             resolver.set_rate(UNLIMITED_QPS);
             debug!(
                 resolver = %resolver.addr(),
@@ -349,24 +406,41 @@ mod tests {
         );
     }
 
+    /// Retreating is only worth repeating while the loss is responding to it.
     #[tokio::test]
-    async fn sustained_loss_ratchets_down() {
-        let pool = pool(1);
-        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
-        let resolver = &pool.resolvers()[0];
+    async fn retreat_continues_only_while_loss_is_falling() {
+        let pool = pool(2);
+        let (mut c, _global, _outcomes) = controller(2, UNLIMITED_QPS);
+        let falling = &pool.resolvers()[0];
+        let stuck = &pool.resolvers()[1];
 
-        drive(resolver, 200, 20);
+        // Both start at 10% loss and earn their first retreat.
+        for r in pool.resolvers() {
+            drive(r, 200, 20);
+        }
         c.tick(&pool, Duration::from_secs(1), Instant::now());
-        let first = resolver.rate();
+        let (falling_first, stuck_first) = (falling.rate(), stuck.rate());
+        assert!(falling_first < UNLIMITED_QPS && stuck_first < UNLIMITED_QPS);
 
-        // Loss continues at a lower delivered rate, so the edge moves down too.
-        drive(resolver, 100, 20);
-        c.tick(&pool, Duration::from_secs(1), Instant::now());
-        let second = resolver.rate();
+        // The pacing takes hold, so the resolver whose loss is rate-driven both
+        // sends less and loses proportionally less. The stuck one keeps losing the
+        // same share of everything it sends.
+        for (attempted, lost) in [(150, 9), (110, 5), (80, 3)] {
+            drive(falling, attempted, lost);
+            drive(stuck, 200, 20);
+            c.tick(&pool, Duration::from_secs(1), Instant::now());
+        }
 
         assert!(
-            second < first,
-            "continued loss should lower the rate further: {first} then {second}"
+            falling.rate() < falling_first,
+            "loss that responds to retreat should draw further retreat: \
+             {falling_first} then {}",
+            falling.rate()
+        );
+        assert_eq!(
+            stuck.rate(),
+            stuck_first,
+            "loss that ignores retreat must hold, not walk the rate to the floor"
         );
     }
 
@@ -624,6 +698,75 @@ mod tests {
         );
     }
 
+    /// End-to-end against loss that no rate can fix: the resolver drops a fixed
+    /// share of queries regardless of how fast it is asked.
+    ///
+    /// Retreating cannot recover those, so the controller has to stop retreating.
+    /// Without that, the rate walks to the floor and a workload that would finish
+    /// in seconds never finishes at all.
+    #[tokio::test]
+    async fn rate_independent_loss_does_not_walk_the_rate_to_the_floor() {
+        use crate::sim::{SimConfig, SimResolver};
+        use crate::{BlastDNSClient, DnsResolver};
+        use futures::StreamExt;
+        use hickory_client::proto::rr::RecordType;
+
+        let sim = SimResolver::start(SimConfig {
+            // Enough latency that the run spans many control ticks, which is what
+            // gives a decaying rate the chance to matter.
+            latency: Duration::from_millis(20),
+            // One in eight is dropped no matter the rate.
+            drop_one_in: Some(8),
+            ..Default::default()
+        })
+        .await;
+
+        let client = Arc::new(
+            BlastDNSClient::with_config(
+                vec![sim.addr()],
+                BlastDNSConfig {
+                    max_concurrency: 8,
+                    max_inflight_per_resolver: 8,
+                    request_timeout: Duration::from_millis(200),
+                    max_retries: 3,
+                    cache_capacity: 0,
+                    purgatory_threshold: 0,
+                    adaptive: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        let hosts: Vec<String> = (0..3000).map(|i| format!("h{i}.example.com.")).collect();
+        let mut stream = client.clone().resolve_batch_full(
+            hosts.into_iter().map(Ok::<_, std::convert::Infallible>),
+            RecordType::A,
+            false,
+            false,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut delivered = 0usize;
+        while Instant::now() < deadline {
+            match stream.next().await {
+                Some(_) => delivered += 1,
+                None => break,
+            }
+        }
+
+        assert!(
+            delivered >= 3000,
+            "should have finished inside the deadline, delivered {delivered}/3000"
+        );
+        if let Some(rate) = client.stats()[0].rate_qps {
+            assert!(
+                rate > MIN_RATE_QPS * 5.0,
+                "rate should hold well above the floor, got {rate}"
+            );
+        }
+    }
+
     /// End-to-end: run real queries at a resolver that drops above a known
     /// capacity and confirm the controller finds that edge and settles below it,
     /// with loss falling as a result.
@@ -685,9 +828,13 @@ mod tests {
         let rate = client.stats()[0]
             .rate_qps
             .expect("controller should have set a pacing rate");
+        // Retreat stops once loss falls under the threshold, so the rate settles at
+        // the capacity rather than somewhere well beneath it. Landing just above,
+        // with a fraction of a percent of loss that retries absorb, is the intended
+        // outcome: undershooting would leave capacity unused.
         assert!(
-            rate < CAPACITY,
-            "controller should hold below the {CAPACITY} QPS edge, got {rate}"
+            rate < CAPACITY * 1.05,
+            "controller should settle at the {CAPACITY} QPS edge, got {rate}"
         );
         assert!(
             rate > CAPACITY * 0.3,
