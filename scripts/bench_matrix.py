@@ -193,6 +193,7 @@ class Result:
     peak_fds: int = 0
     conntrack: int = 0
     resolvers_used: int = 0
+    inflight: int = 0
     concurrency: int = 0
     note: str = ""
 
@@ -219,8 +220,21 @@ class Result:
 # ---------------------------------------------------------------- engines
 
 
+# A persistent socket multiplexes through one bounded channel, so this is the most
+# any single resolver can carry on that transport. Kept here so a new regime cannot
+# quietly configure past it and report the resulting collapse as a measurement.
+PERSISTENT_INFLIGHT_LIMIT = 32
+
+
 async def run_blastdns(hosts, resolvers, regime, persistent=False, inflight=2, concurrency=1000):
     from blastdns import Client, ClientConfig, DNSError
+
+    if persistent and inflight > PERSISTENT_INFLIGHT_LIMIT:
+        raise ValueError(
+            f"regime {regime!r} asks for {inflight} in flight per resolver on a "
+            f"persistent socket, which cannot carry more than "
+            f"{PERSISTENT_INFLIGHT_LIMIT}"
+        )
 
     client = Client(
         resolvers,
@@ -235,8 +249,10 @@ async def run_blastdns(hosts, resolvers, regime, persistent=False, inflight=2, c
         ),
     )
     result = Result("blastdns", regime, len(hosts))
-    # What the engine could actually hold in flight: the per-resolver cap binds
-    # before max_concurrency when the pool is small.
+    # Report the per-resolver depth separately from the aggregate. The transport
+    # bound that matters for persistent sockets is per resolver, so showing only a
+    # total invites reading a valid config as one that exceeds it.
+    result.inflight = inflight
     result.concurrency = min(concurrency, inflight * len(resolvers))
     with Footprint() as fp:
         start = time.monotonic()
@@ -262,6 +278,7 @@ async def run_dnspython(hosts, resolvers, regime, workers=100):
     resolver.lifetime = 2.0
 
     result = Result("dnspython", regime, len(hosts))
+    result.inflight = workers
     result.concurrency = workers
     queue = asyncio.Queue()
     for name in hosts:
@@ -493,8 +510,16 @@ def report(results, json_out=None):
             p99 = f"{r.pct(99):.3f}s" if r.pct(99) is not None else "n/a"
             p100 = f"{r.pct(100):.3f}s" if r.pct(100) is not None else "n/a"
             atts = f"{r.attempts_per_query:.2f}" if r.attempts_per_query else "n/a"
+            # e.g. "8/res, 256 total" -- the per-resolver figure is the one any
+            # transport limit applies to.
+            if not r.inflight:
+                depth = "-"
+            elif r.concurrency and r.concurrency != r.inflight:
+                depth = f"{r.inflight}/res, {r.concurrency} total"
+            else:
+                depth = str(r.inflight)
             print(
-                f"| {r.engine} | {r.concurrency or '-'} | {r.qps:,.0f} | {ratio} | {r.unanswered_pct:.3f}% | {atts} "
+                f"| {r.engine} | {depth} | {r.qps:,.0f} | {ratio} | {r.unanswered_pct:.3f}% | {atts} "
                 f"| {p50} | {p99} | {p100} | {r.peak_fds:,} | {r.conntrack:,} |"
             )
         print()
@@ -512,6 +537,7 @@ def report(results, json_out=None):
                 "peak_fds": r.peak_fds,
                 "conntrack": r.conntrack,
                 "resolvers_used": r.resolvers_used,
+                "inflight_per_resolver": r.inflight,
                 "concurrency": r.concurrency,
             }
             for r in results
