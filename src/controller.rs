@@ -93,6 +93,11 @@ pub(crate) struct AdaptiveController {
     best_loss: Vec<Option<f64>>,
     /// Consecutive ticks a resolver's loss has failed to improve.
     stalled: Vec<u8>,
+    /// Loss accumulated per resolver since its window opened, and how long that
+    /// window has been open. The window has to outlast the request timeout for the
+    /// ratio to compare the same period's dispatches and losses.
+    window: Vec<Observation>,
+    window_seconds: Vec<f64>,
     /// Queries finished and lost, as of the previous tick.
     outcomes: Arc<Outcomes>,
     previous_outcomes: Observation,
@@ -117,6 +122,8 @@ impl AdaptiveController {
             edges: (0..resolver_count).map(|_| None).collect(),
             best_loss: vec![None; resolver_count],
             stalled: vec![0; resolver_count],
+            window: vec![Observation::default(); resolver_count],
+            window_seconds: vec![0.0; resolver_count],
             outcomes,
             previous_outcomes: Observation::default(),
             global_limit: None,
@@ -158,19 +165,42 @@ impl AdaptiveController {
             };
             let previous = std::mem::replace(&mut self.per_resolver[i], current);
 
-            let attempted = current.attempted.saturating_sub(previous.attempted);
-            let lost = current.lost.saturating_sub(previous.lost);
-            attempted_total += attempted;
+            let tick_attempted = current.attempted.saturating_sub(previous.attempted);
+            let tick_lost = current.lost.saturating_sub(previous.lost);
+            attempted_total += tick_attempted;
+
+            // A query becomes "lost" only when its timeout expires, so losses land
+            // later than the dispatches that produced them. Measuring over a window
+            // shorter than the timeout puts the two in different windows: cut the
+            // rate and the next window counts the old rate's losses against the new
+            // rate's dispatches, which has been seen to read over 100% loss and to
+            // turn one retreat into a slide. Accumulate until the window is at least
+            // as long as the timeout, then judge once and start over.
+            self.window[i].attempted += tick_attempted;
+            self.window[i].lost += tick_lost;
+            self.window_seconds[i] += seconds;
+            if self.window_seconds[i] < resolver.request_timeout().as_secs_f64() {
+                self.relax(i, now, resolver);
+                continue;
+            }
+            let dispatched = self.window[i].attempted;
+            let lost = self.window[i].lost;
+            let window_seconds = self.window_seconds[i];
+            self.window[i] = Observation::default();
+            self.window_seconds[i] = 0.0;
 
             // Throttling one resolver needs that resolver's own loss ratio, which
             // needs enough queries against it. Let any stale edge expire
             // regardless, so an idle resolver does not stay throttled forever.
-            if attempted < MIN_SAMPLES {
+            if dispatched < MIN_SAMPLES {
                 self.relax(i, now, resolver);
                 continue;
             }
 
-            let loss = lost as f64 / attempted as f64;
+            // Clamped because a window whose rate was just cut can still be
+            // absorbing losses from the busier period before it, which reads as more
+            // than everything it sent.
+            let loss = (lost as f64 / dispatched as f64).min(1.0);
             if loss <= LOSS_THRESHOLD {
                 self.best_loss[i] = None;
                 self.stalled[i] = 0;
@@ -200,7 +230,7 @@ impl AdaptiveController {
                 }
             }
 
-            let observed_qps = attempted as f64 / seconds;
+            let observed_qps = dispatched as f64 / window_seconds.max(1e-6);
             let target = (RETREAT * observed_qps).max(MIN_RATE_QPS);
             self.edges[i] = Some(Edge {
                 qps: observed_qps,

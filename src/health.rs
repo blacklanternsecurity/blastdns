@@ -173,6 +173,12 @@ impl ResolverHealth {
         self.resolver
     }
 
+    /// How long a query may run before it counts as lost. The controller needs it
+    /// to know how far a loss lags the dispatch that caused it.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     fn now_ns(&self) -> u64 {
         self.start.elapsed().as_nanos() as u64
     }
