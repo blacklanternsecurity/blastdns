@@ -20,6 +20,8 @@ There are three ways to use it:
 
 100K DNS lookups against local `dnsmasq`, with 100 workers:
 
+This is one regime: a single resolver, no loss, no latency, which is the case that most favors raw dispatch and resembles no real workload. `scripts/benchmark.py` now reports several regimes — a resolver pool, injected loss, injected latency, and both socket transports — alongside delivery, retry amplification, completion percentiles, and socket plus connection-tracking peaks. Absolute rates here move over 30% between runs on shared CI hardware, so the ratio column is the durable figure.
+
 | Library         | Language | Time    | QPS    | Success | Failed | vs dnspython |
 |-----------------|----------|---------|--------|---------|--------|--------------|
 | massdns         | C        | 1.370s  | 72,998 | 100,000 | 0      | 28.63x       |
@@ -51,7 +53,6 @@ $ blastdns hosts.txt --rdtype A --resolvers resolvers.txt --skip-errors | jq
 #### CLI Help
 
 ```
-$ blastdns --help
 BlastDNS - Ultra-fast DNS Resolver written in Rust
 
 Usage: blastdns [OPTIONS] --resolvers <FILE> [HOSTS_TO_RESOLVE]
@@ -74,6 +75,8 @@ Options:
           Drop resolvers that don't answer a probe query at startup
       --no-adaptive
           Disable automatic backoff when resolvers start losing queries
+      --persistent-socket
+          Keep one long-lived socket per resolver instead of binding one per query
       --timeout-ms <TIMEOUT_MS>
           Per-request timeout in milliseconds [default: 1000]
       --retries <RETRIES>
@@ -586,7 +589,7 @@ The `*_full()` methods return Pydantic V2 models for type safety and IDE autocom
 
 The base methods (`resolve`, `resolve_batch`, `resolve_multi`) return simple Python types (lists, dicts, strings) for convenience when you don't need the full response structure.
 
-`ClientConfig` exposes the knobs shown above (`max_concurrency`, `max_inflight_per_resolver`, `rate_limit`, `adaptive`, `resolver_probe`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core.
+`ClientConfig` exposes the knobs shown above (`max_concurrency`, `max_inflight_per_resolver`, `rate_limit`, `adaptive`, `resolver_probe`, `persistent_socket`, `request_timeout_ms`, `max_retries`, `purgatory_threshold`, `purgatory_sentence_ms`) and validates them before handing them to the Rust core. Unknown keys are rejected rather than ignored, so a stale or misspelled option fails loudly instead of silently taking a default.
 
 `Client.stats()` returns a `ResolverStats` per resolver, with cumulative counters where `attempted == answered + empty + timeout + error`. Diff two snapshots to account for a batch in full, including queries that never came back:
 
@@ -607,7 +610,7 @@ When a user calls `BlastDNSClient::resolve`, a new `WorkItem` is created which c
 
 Workers are not bound to a resolver. `BlastDNSConfig.max_concurrency` (default: 256) sets how many workers exist and therefore how many queries are in flight overall, independently of how many resolvers are configured. Each worker picks a resolver per query, so adding resolvers increases the throughput available at a given politeness level rather than changing the concurrency limit.
 
-One UDP socket is opened per resolver, created on first use and shared by every worker that selects it, so file descriptor use scales with the resolver count and not with concurrency.
+Each query binds its own UDP socket by default, so file descriptor use tracks concurrency rather than the size of the resolver list. `persistent_socket` swaps that for one long-lived socket per resolver, shared by every worker that selects it; see [Sockets](#sockets) for the tradeoff, which is mostly about connection-tracking state rather than descriptors.
 
 ### Dispatch Limits
 
@@ -617,19 +620,38 @@ Three independent limits govern throughput. The tightest one binds.
 - **`max_inflight_per_resolver`** (default: 2): the politeness bound. No resolver receives more than this at once, however large the pool or the workload. Because a busy resolver holds its permits until its query completes, resolver selection naturally sends less work to slow resolvers with no explicit weighting.
 - **`rate_limit`**: a ceiling on dispatch rate in queries per second. Unset means unlimited. Pacing is interval-based rather than token-bucketed, so there is no burst allowance and a resolver never sees a thundering herd on the first tick.
 
+### Sockets
+
+By default a UDP socket is bound per query and closed when it completes, which randomizes the source port. That is worth having: an off-path attacker forging a response has to guess the port as well as the 16-bit query ID, which is the difference between 65 thousand guesses and four billion. Live sockets therefore track `max_concurrency`, not the size of the resolver list.
+
+The cost is connection-tracking state. Every query is a fresh source port, so every query is a distinct flow to any NAT or stateful firewall in the path, and those entries outlive the socket by the kernel's UDP timeout — 30 seconds is typical. Connection-tracking state therefore grows with the *query rate*, not with concurrency. A sustained few thousand queries per second is enough to fill a home router's table and start dropping unrelated traffic.
+
+`persistent_socket` trades that away. One socket per resolver is opened on first use and multiplexed by query ID, so flows are bounded by the size of the resolver list however long the run goes. On a single-domain brute-force this measured 114,342 connection-tracking entries per-query against roughly 5,800 persistent, at the same throughput. Two things to know before enabling it:
+
+- The source port is fixed per resolver for the life of the client, so spoofing entropy drops to the query ID alone. Reasonable when results are re-verified downstream; less so when a forged answer would be acted on directly.
+- One socket cannot carry more than 32 queries at once, which is the bound on a multiplexed client's request channel. Configuring `max_inflight_per_resolver` above that is refused rather than accepted, because exceeding it does not degrade gradually — it collapses.
+
 ### Adaptive Backoff
 
 With `adaptive` enabled (the default), BlastDNS does not need to be told how fast to go. It watches loss per resolver, and when a resolver starts dropping queries it records the rate at which that happened and holds below it. A configured `rate_limit` is a separate hard cap applied on top: adaptation happens either way, and the configured value only ever lowers the effective rate.
 
 A discovered limit expires after a while so the controller probes upward again, which keeps one transient blip from capping the rest of a long run.
 
-Loss on a single resolver throttles only that resolver. Cutting the *global* rate additionally requires loss to appear across many resolvers at once, and only resolvers that have previously delivered a clean interval can vote that way. This matters for large public resolver lists, where many entries never worked at all: that is a lot of broken resolvers, not evidence of congestion on our side, and retries are exactly what finds the live ones. When loss genuinely is correlated, retries are suppressed until it clears, since retrying into your own saturated egress only adds load.
+Backing off is only repeated while it is working. A resolver earns its first retreat as soon as it starts losing queries, and further ones only while the loss is actually falling. That distinction matters because not all loss is caused by the rate: a resolver that drops a fixed share of what it receives, or one behind a lossy link, loses just as much however slowly it is asked, and retreating on every tick would walk the rate to a standstill without recovering a single query. Two readings in a row that fail to improve hold the rate where it is instead.
 
-`Client.stats()` reports the current pacing rate per resolver, so a run that is going slowly can be explained rather than guessed at.
+Loss is measured over a window at least as long as `request_timeout_ms`, because a query only counts as lost once its timeout expires. A shorter window puts a dispatch and its eventual timeout in different windows, so lowering the rate would drop the denominator while the previous rate's losses were still arriving — which reads as more than 100% loss and, worse, reads as *improvement* on the way back down.
+
+Loss on a single resolver throttles only that resolver. Cutting the *global* rate takes a different signal: queries that failed after exhausting every retry. Individual attempt failures do not count, because a large public resolver list refuses a few percent of attempts as a matter of course and a retry elsewhere answers them — treating that as congestion makes a healthy pool look permanently saturated and drives the rate to a standstill. Retries are never abandoned, only paced; suppressing them under load was tried and measured, and it took unanswered queries from 0% to 3.5% on a 5,000-name brute-force to save load that was never shown to be a problem.
+
+`Client.stats()` reports the current pacing rate per resolver, so a run that is going slowly can be explained rather than guessed at. Note the field is an instantaneous reading: a resolver that was throttled and has since recovered reports no rate, so it undercounts episodes rather than accumulating them.
+
+Per-resolver judgement needs enough queries against that one resolver to trust the ratio, which only happens when a resolver is carrying real load. Spread a few hundred queries per second across thousands of resolvers and no single one is individually measurable, so at brute-force scale the politeness bound is `max_inflight_per_resolver` rather than the controller — each resolver is capped at roughly `max_inflight_per_resolver / RTT` regardless.
 
 ### Optional Startup Probe
 
 With `resolver_probe` enabled, each resolver is queried once at startup and those that do not answer are dropped for the life of the client. This is aimed at large public resolver lists, where a substantial fraction of entries are typically dead. Probing queries the root nameservers, so liveness does not depend on any external zone.
+
+The probe allows a looser deadline than a normal query — at least two seconds, however short `request_timeout_ms` is. Failing the probe removes a resolver for the whole run, and a root-NS query to a cold resolver is slower than the cached lookups most workloads make, so judging it on a few hundred milliseconds would evict resolvers that serve real traffic perfectly well and let a passing latency spike take out much of the pool at once.
 
 ### Caching
 
