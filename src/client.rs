@@ -1,23 +1,48 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use crossfire::{MAsyncRx, MAsyncTx, mpmc};
-use hickory_client::proto::{op::Query, rr::RecordType, xfer::DnsResponse};
+use hickory_client::proto::{
+    op::{Query, ResponseCode},
+    rr::RecordType,
+    xfer::DnsResponse,
+};
 use tokio::sync::{OnceCell, oneshot};
 use tracing::debug;
 
 use crate::{
     cache::SimpleCache,
     config::BlastDNSConfig,
+    controller::AdaptiveController,
     error::BlastDNSError,
+    health::{ResolverPool, ResolverStats},
+    limiter::{RateLimiter, UNLIMITED_QPS},
     resolver::DnsResolver,
     utils::{check_ulimits, format_ptr_query, get_system_resolvers, parse_resolver},
     worker::{QuerySpec, ResolverWorker, WorkItem},
 };
 
+/// Most queries a single persistent socket can carry at once.
+///
+/// Mirrors hickory's `CHANNEL_BUFFER_SIZE`, the bound on a multiplexed client's
+/// request channel. Every query for a resolver shares that one channel when
+/// `persistent_socket` is set, so this is the ceiling on in-flight work per
+/// resolver, not a tuning preference.
+const PERSISTENT_INFLIGHT_LIMIT: usize = 32;
+
 /// Primary API surface for performing DNS lookups concurrently.
 #[derive(Clone)]
 pub struct BlastDNSClient {
     resolvers: Vec<SocketAddr>,
+    pool: Arc<ResolverPool>,
+    limiter: Arc<RateLimiter>,
+    outcomes: Arc<Outcomes>,
     work_tx: MAsyncTx<WorkItem>,
     work_rx: MAsyncRx<WorkItem>,
     config: BlastDNSConfig,
@@ -42,6 +67,30 @@ pub type BatchResult = (String, Result<DnsResponse, BlastDNSError>);
 
 /// Result item produced by [`BlastDNSClient::resolve_batch`].
 pub type BatchResultBasic = (String, String, Vec<String>);
+
+/// Counts of queries that finished, and of those that finished with nothing.
+///
+/// A query is only "lost" here once its retries are exhausted. Individual attempt
+/// failures do not count: on a public resolver pool a few percent of attempts are
+/// refused as a matter of course, and a retry elsewhere answers them. Treating
+/// those as loss makes a healthy pool look permanently congested.
+#[derive(Debug, Default)]
+pub(crate) struct Outcomes {
+    pub(crate) completed: AtomicU64,
+    pub(crate) failed: AtomicU64,
+}
+
+/// Whether a response actually settles whether the name exists.
+///
+/// NOERROR and NXDOMAIN do. Every other response code reports that this
+/// particular resolver would not or could not answer, which is not evidence
+/// about the name itself.
+fn answers_the_question(response: &DnsResponse) -> bool {
+    matches!(
+        response.response_code(),
+        ResponseCode::NoError | ResponseCode::NXDomain
+    )
+}
 
 impl BlastDNSClient {
     /// Build a client using the default configuration.
@@ -72,13 +121,29 @@ impl BlastDNSClient {
             .map(|input| parse_resolver(&input))
             .collect::<Result<_, _>>()?;
 
-        let resolver_count = parsed.len();
+        // A persistent socket puts every query for a resolver through one
+        // multiplexed client, whose request channel hickory bounds at
+        // CHANNEL_BUFFER_SIZE. Past that, senders block: measured at 45,000 qps
+        // with 32 in flight and 188 qps with 40, so this is a cliff rather than a
+        // tradeoff worth offering.
+        if config.persistent_socket && config.max_inflight_per_resolver > PERSISTENT_INFLIGHT_LIMIT
+        {
+            return Err(BlastDNSError::Configuration(format!(
+                "max_inflight_per_resolver of {} exceeds the {} a persistent socket can \
+                 carry before its transport blocks; lower it or set persistent_socket=false",
+                config.max_inflight_per_resolver, PERSISTENT_INFLIGHT_LIMIT
+            )));
+        }
 
-        // Check system ulimits before spawning workers
-        check_ulimits(resolver_count, config.threads_per_resolver)
+        let queue_capacity = config.max_concurrency.max(1);
+        check_ulimits(queue_capacity, parsed.len(), config.persistent_socket)
             .map_err(|e| BlastDNSError::Configuration(e.to_string()))?;
+        let pool = Arc::new(ResolverPool::new(&parsed, &config));
+        // Always present so the controller has something to lower. An unset rate
+        // limit starts effectively unlimited rather than absent.
+        let limiter = Arc::new(RateLimiter::new(config.rate_limit.unwrap_or(UNLIMITED_QPS)));
 
-        let queue_capacity = (resolver_count * config.threads_per_resolver).max(1);
+        let outcomes = Arc::new(Outcomes::default());
 
         let (work_tx, work_rx) = mpmc::bounded_async::<WorkItem>(queue_capacity);
 
@@ -93,6 +158,9 @@ impl BlastDNSClient {
 
         Ok(Self {
             resolvers: parsed,
+            pool,
+            limiter,
+            outcomes,
             work_tx,
             work_rx,
             config,
@@ -107,11 +175,51 @@ impl BlastDNSClient {
         self.resolvers.iter().map(|addr| addr.to_string()).collect()
     }
 
-    /// Ensure workers are spawned (called lazily on first use).
+    /// Per-resolver counter snapshots, one entry per configured resolver.
+    ///
+    /// Counters are cumulative for the life of the client. Diff two snapshots to
+    /// account for a batch: every dispatched query lands in exactly one of
+    /// `answered`, `empty`, `timeout`, or `error`.
+    pub fn stats(&self) -> Vec<ResolverStats> {
+        self.pool.stats()
+    }
+
+    /// Ensure the pool is probed and workers are spawned (lazily, on first use).
     async fn ensure_workers(&self) {
+        let pool = self.pool.clone();
+        let limiter = self.limiter.clone();
+        let work_rx = self.work_rx.clone();
+        let concurrency = self.config.max_concurrency.max(1);
+        let probe = self.config.resolver_probe;
+        let adaptive = self.config.adaptive;
+        let ceiling = self.config.rate_limit.unwrap_or(UNLIMITED_QPS);
+        let outcomes = self.outcomes.clone();
+
         self.workers_spawned
-            .get_or_init(|| async {
-                self.spawn_workers(self.work_rx.clone());
+            .get_or_init(|| async move {
+                if probe {
+                    pool.probe(concurrency).await;
+                }
+                if adaptive {
+                    AdaptiveController::new(
+                        pool.resolvers().len(),
+                        limiter.clone(),
+                        ceiling,
+                        outcomes,
+                    )
+                    .spawn(&pool);
+                }
+                // Total concurrency is the worker count. Each worker picks a
+                // resolver per query, and the pool's per-resolver permits keep
+                // any single resolver from being oversubscribed.
+                for worker_idx in 0..concurrency {
+                    ResolverWorker::spawn(
+                        pool.clone(),
+                        limiter.clone(),
+                        work_rx.clone(),
+                        worker_idx,
+                    );
+                }
             })
             .await;
     }
@@ -176,6 +284,21 @@ impl BlastDNSClient {
 
             match response {
                 Ok(resp) => {
+                    // Only NOERROR and NXDOMAIN actually say whether the name
+                    // exists. Anything else (REFUSED, SERVFAIL, ...) means this
+                    // resolver would not or could not answer, so ask another one
+                    // rather than reporting the name as absent.
+                    if !answers_the_question(&resp) && attempt + 1 < attempts {
+                        debug!(
+                            attempt = attempt + 1,
+                            attempts,
+                            host,
+                            rcode = %resp.response_code(),
+                            "resolver declined to answer, retrying elsewhere"
+                        );
+                        continue;
+                    }
+
                     // Cache successful responses with answers
                     if let Some(cache) = &self.cache
                         && !resp.answers().is_empty()
@@ -185,6 +308,7 @@ impl BlastDNSClient {
                         cache.insert(query, resp.clone(), Instant::now());
                         debug!(host, %record_type, "cached response");
                     }
+                    self.outcomes.completed.fetch_add(1, Ordering::Relaxed);
                     return Ok(resp);
                 }
                 Err(err) => {
@@ -196,6 +320,8 @@ impl BlastDNSClient {
                         "DNS resolution attempt failed"
                     );
                     if attempt + 1 == attempts || !err.is_retryable() {
+                        self.outcomes.completed.fetch_add(1, Ordering::Relaxed);
+                        self.outcomes.failed.fetch_add(1, Ordering::Relaxed);
                         return Err(err);
                     }
                 }
@@ -203,16 +329,6 @@ impl BlastDNSClient {
         }
 
         Err(BlastDNSError::WorkerDropped)
-    }
-
-    fn spawn_workers(&self, work_rx: MAsyncRx<WorkItem>) {
-        let threads = self.config.threads_per_resolver.max(1);
-
-        for &resolver in &self.resolvers {
-            for worker_idx in 0..threads {
-                ResolverWorker::spawn(resolver, work_rx.clone(), self.config.clone(), worker_idx);
-            }
-        }
     }
 }
 
@@ -249,6 +365,42 @@ mod tests {
 
     use super::*;
 
+    /// One persistent socket carries every query for its resolver through a single
+    /// multiplexed channel that hickory bounds. Allowing more in flight than the
+    /// channel holds does not degrade gracefully -- measured at 45,000 qps with 32
+    /// and 188 qps with 40 -- so the combination is refused rather than offered.
+    #[test]
+    fn persistent_sockets_refuse_more_in_flight_than_the_transport_carries() {
+        let over = BlastDNSConfig {
+            persistent_socket: true,
+            max_inflight_per_resolver: PERSISTENT_INFLIGHT_LIMIT + 1,
+            ..Default::default()
+        };
+        let err = BlastDNSClient::with_config(vec!["127.0.0.1:53".to_string()], over)
+            .expect_err("should refuse more in flight than one socket can carry");
+        let message = err.to_string();
+        assert!(
+            message.contains("persistent_socket"),
+            "error should name the option to change, got: {message}"
+        );
+
+        // At the limit, and with per-query sockets at any depth, it is fine.
+        for (persistent_socket, max_inflight_per_resolver) in
+            [(true, PERSISTENT_INFLIGHT_LIMIT), (false, 512)]
+        {
+            let config = BlastDNSConfig {
+                persistent_socket,
+                max_inflight_per_resolver,
+                ..Default::default()
+            };
+            assert!(
+                BlastDNSClient::with_config(vec!["127.0.0.1:53".to_string()], config).is_ok(),
+                "persistent_socket={persistent_socket} inflight={max_inflight_per_resolver} \
+                 should be accepted"
+            );
+        }
+    }
+
     #[test]
     fn empty_resolvers_uses_system() {
         // This test verifies that empty resolvers fall back to system resolvers
@@ -265,6 +417,134 @@ mod tests {
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
+    }
+
+    #[tokio::test]
+    async fn truncated_responses_are_refetched_over_tcp() {
+        // A truncated response is an arbitrary subset of the real answer set.
+        // Returning it as-is silently loses records, so TC must trigger a TCP
+        // refetch that returns the whole thing.
+        use crate::sim::{SimConfig, SimResolver};
+
+        let sim = SimResolver::start(SimConfig {
+            truncate_udp: true,
+            ..Default::default()
+        })
+        .await;
+
+        let config = BlastDNSConfig {
+            max_concurrency: 2,
+            max_inflight_per_resolver: 1,
+            request_timeout: Duration::from_millis(500),
+            max_retries: 0,
+            cache_capacity: 0,
+            purgatory_threshold: 0,
+            adaptive: false,
+            ..Default::default()
+        };
+        let client = BlastDNSClient::with_config(vec![sim.addr()], config).unwrap();
+
+        let response = client
+            .resolve_full("big.example.com.".to_string(), RecordType::A)
+            .await
+            .expect("should resolve");
+
+        assert!(
+            !response.truncated(),
+            "a truncated response must not be handed back to the caller"
+        );
+        assert_eq!(
+            response.answers().len(),
+            8,
+            "should carry the full answer set from TCP, not the 2-record UDP subset"
+        );
+        assert!(sim.tcp_served() > 0, "TCP was never used");
+
+        let stats = client.stats();
+        assert_eq!(stats[0].truncated, 1, "truncation should be counted");
+    }
+
+    #[tokio::test]
+    async fn refused_is_retried_rather_than_believed() {
+        // A resolver that refuses says nothing about whether the name exists.
+        // Reporting that as "no record" would silently discard a real subdomain,
+        // so it has to be retried against a different resolver.
+        use crate::sim::{SimConfig, SimResolver};
+
+        let refusing = SimResolver::start(SimConfig {
+            refuse_one_in: Some(1), // refuses everything
+            ..Default::default()
+        })
+        .await;
+        let answering = SimResolver::start(SimConfig::default()).await;
+
+        let config = BlastDNSConfig {
+            max_concurrency: 4,
+            max_inflight_per_resolver: 1,
+            request_timeout: Duration::from_millis(500),
+            max_retries: 10,
+            cache_capacity: 0,
+            purgatory_threshold: 0,
+            adaptive: false,
+            ..Default::default()
+        };
+        let client =
+            BlastDNSClient::with_config(vec![refusing.addr(), answering.addr()], config).unwrap();
+
+        // Rotation will land on the refusing resolver, but retries must find the
+        // one that actually answers.
+        for i in 0..10 {
+            let response = client
+                .resolve_full(format!("h{i}.example.com."), RecordType::A)
+                .await
+                .expect("should get an answer despite a refusing resolver");
+            assert_eq!(
+                response.response_code(),
+                ResponseCode::NoError,
+                "REFUSED must not be returned while another resolver would answer"
+            );
+            assert!(
+                !response.answers().is_empty(),
+                "a refusing resolver must not be mistaken for a nonexistent name"
+            );
+        }
+        assert!(refusing.received() > 0, "the refusing resolver was used");
+    }
+
+    #[tokio::test]
+    async fn refused_is_returned_once_retries_are_exhausted() {
+        // With nowhere better to go, report the REFUSED rather than inventing an
+        // answer; the caller can then tell "unknown" from "does not exist".
+        use crate::sim::{SimConfig, SimResolver};
+
+        let refusing = SimResolver::start(SimConfig {
+            refuse_one_in: Some(1),
+            ..Default::default()
+        })
+        .await;
+
+        let config = BlastDNSConfig {
+            max_concurrency: 2,
+            max_inflight_per_resolver: 1,
+            request_timeout: Duration::from_millis(500),
+            max_retries: 2,
+            cache_capacity: 0,
+            purgatory_threshold: 0,
+            adaptive: false,
+            ..Default::default()
+        };
+        let client = BlastDNSClient::with_config(vec![refusing.addr()], config).unwrap();
+
+        let response = client
+            .resolve_full("only.example.com.".to_string(), RecordType::A)
+            .await
+            .expect("a REFUSED response is still a response");
+        assert_eq!(response.response_code(), ResponseCode::Refused);
+        assert!(
+            refusing.received() >= 3,
+            "should have retried before giving up, got {} attempts",
+            refusing.received()
+        );
     }
 
     #[test]
@@ -284,12 +564,13 @@ mod tests {
         let resolver: SocketAddr = "127.0.0.1:5353".parse().unwrap();
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
+        let pool = Arc::new(ResolverPool::new(&[resolver], &config));
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
-        ResolverWorker::spawn(resolver, rx, config.clone(), 0);
+        ResolverWorker::spawn(pool, Arc::new(RateLimiter::new(UNLIMITED_QPS)), rx, 0);
 
         let query = QuerySpec {
             host: "example.com.".into(),
@@ -327,12 +608,13 @@ mod tests {
         let resolver: SocketAddr = "[::1]:5353".parse().unwrap();
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
+        let pool = Arc::new(ResolverPool::new(&[resolver], &config));
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
-        ResolverWorker::spawn(resolver, rx, config.clone(), 0);
+        ResolverWorker::spawn(pool, Arc::new(RateLimiter::new(UNLIMITED_QPS)), rx, 0);
 
         let query = QuerySpec {
             host: "example.com.".into(),
@@ -356,7 +638,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(1),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -393,7 +675,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -477,7 +759,7 @@ mod tests {
         // Test that errors still pass through with skip_empty=true
         let bad_resolver_config = BlastDNSConfig {
             request_timeout: Duration::from_millis(100),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -515,7 +797,7 @@ mod tests {
     async fn resolve_batch_full_skip_errors_filters_error_responses() {
         let bad_resolver_config = BlastDNSConfig {
             request_timeout: Duration::from_millis(100),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -589,7 +871,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 2,
+            max_inflight_per_resolver: 2,
             ..Default::default()
         };
 
@@ -624,7 +906,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 2,
+            max_inflight_per_resolver: 2,
             ..Default::default()
         };
 
@@ -674,7 +956,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -706,7 +988,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 2,
+            max_inflight_per_resolver: 2,
             ..Default::default()
         };
 
@@ -767,7 +1049,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -791,7 +1073,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             ..Default::default()
         };
 
@@ -842,7 +1124,7 @@ mod tests {
         let resolvers = vec!["8.8.8.8:53".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             max_retries: 0,
             ..Default::default()
         };
@@ -902,7 +1184,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             cache_capacity: 100,
             ..Default::default()
         };
@@ -961,7 +1243,7 @@ mod tests {
         let resolvers = vec!["127.0.0.1:5353".to_string()];
         let config = BlastDNSConfig {
             request_timeout: Duration::from_secs(2),
-            threads_per_resolver: 1,
+            max_inflight_per_resolver: 1,
             cache_capacity: 0, // Disable cache
             ..Default::default()
         };
