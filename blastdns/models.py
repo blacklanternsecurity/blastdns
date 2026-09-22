@@ -108,4 +108,27 @@ class DNSError(BaseModel):
     error: str
 
 
+class ResolverStats(BaseModel):
+    """Cumulative counters for a single resolver.
+
+    ``attempted`` equals ``answered + empty + timeout + error``, so a caller can
+    account for every dispatched query. Diff two snapshots to measure one batch.
+    """
+
+    resolver: str
+    attempted: int
+    answered: int
+    empty: int
+    timeout: int
+    error: int
+    rtt_mean_us: int
+    rtt_min_us: int
+    purgatory_entries: int
+    truncated: int = 0
+    rate_qps: Optional[float] = None
+    """Current pacing rate, or ``None`` when unthrottled. A value here means the
+    adaptive controller is holding this resolver below the rate at which it began
+    losing queries."""
+
+
 DNSResultOrError = Union[DNSResult, DNSError]
