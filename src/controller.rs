@@ -42,7 +42,8 @@ const GROWTH: f64 = 1.25;
 const LOSS_THRESHOLD: f64 = 0.02;
 /// Queries against one resolver in a tick before its own loss ratio is trusted.
 const MIN_SAMPLES: u64 = 20;
-/// Queries finished in a tick before the global failure rate is trusted.
+/// Queries that must finish before the global failure rate is trusted. Gathered
+/// over as many ticks as it takes, so a low rate is judged late rather than never.
 const MIN_AGGREGATE_SAMPLES: u64 = 100;
 /// How often limits are recomputed.
 const TICK: Duration = Duration::from_millis(500);
@@ -101,6 +102,12 @@ pub(crate) struct AdaptiveController {
     /// Queries finished and lost, as of the previous tick.
     outcomes: Arc<Outcomes>,
     previous_outcomes: Observation,
+    /// Queries finished and lost since the global window opened, the attempts
+    /// dispatched over the same period, and how long it has been open. A tick too
+    /// small to judge is carried into the next one rather than thrown away.
+    global_window: Observation,
+    global_window_dispatched: u64,
+    global_window_seconds: f64,
     /// Current global ceiling, or `None` while unthrottled. Retreat is relative to
     /// this rather than to observed throughput: observed can sit far below the
     /// limit simply because the workload is small, and retreating from it would
@@ -126,6 +133,9 @@ impl AdaptiveController {
             window_seconds: vec![0.0; resolver_count],
             outcomes,
             previous_outcomes: Observation::default(),
+            global_window: Observation::default(),
+            global_window_dispatched: 0,
+            global_window_seconds: 0.0,
             global_limit: None,
         }
     }
@@ -293,23 +303,46 @@ impl AdaptiveController {
             lost: self.outcomes.failed.load(Ordering::Relaxed),
         };
         let previous = std::mem::replace(&mut self.previous_outcomes, current);
-        let completed = current.attempted.saturating_sub(previous.attempted);
-        let failed = current.lost.saturating_sub(previous.lost);
+        self.global_window.attempted += current.attempted.saturating_sub(previous.attempted);
+        self.global_window.lost += current.lost.saturating_sub(previous.lost);
+        self.global_window_dispatched += attempted;
+        self.global_window_seconds += seconds;
 
-        let loss = if completed > 0 {
-            failed as f64 / completed as f64
-        } else {
-            0.0
-        };
-        let well_sampled = completed >= MIN_AGGREGATE_SAMPLES;
-        let congested = well_sampled && loss > LOSS_THRESHOLD;
+        // Accumulate until enough queries have finished to trust the ratio, however
+        // many ticks that takes. Discarding an under-sampled tick instead would
+        // make the signal vanish exactly where it is needed most: the limit gates
+        // throughput and throughput gates the sample count, so once the limit is
+        // low enough that a tick finishes fewer than MIN_AGGREGATE_SAMPLES queries,
+        // neither congestion nor recovery can ever be seen again and whatever rate
+        // the retreat happened to land on becomes permanent. Judging over a longer
+        // window only makes a slow path slower to react, which is the right trade.
+        //
+        // Unlike the per-resolver window this needs no minimum duration. Both
+        // counters are incremented at the point a query finishes, so a shrinking
+        // window cannot count an earlier rate's losses against a later rate's
+        // dispatches the way per-resolver dispatch-versus-timeout counting can.
+        if self.global_window.attempted < MIN_AGGREGATE_SAMPLES {
+            return;
+        }
 
-        if congested {
+        let completed = self.global_window.attempted;
+        let failed = self.global_window.lost;
+        let dispatched = self.global_window_dispatched;
+        let window_seconds = self.global_window_seconds;
+        self.global_window = Observation::default();
+        self.global_window_dispatched = 0;
+        self.global_window_seconds = 0.0;
+
+        let loss = failed as f64 / completed as f64;
+
+        if loss > LOSS_THRESHOLD {
             // Retreat from the standing limit, not from observed throughput. The
             // first event has no limit yet, so observed is the only number
             // available; after that, compounding on observed would ratchet toward
             // a standstill whether or not the retreat helped.
-            let basis = self.global_limit.unwrap_or(attempted as f64 / seconds);
+            let basis = self
+                .global_limit
+                .unwrap_or(dispatched as f64 / window_seconds.max(1e-6));
             let target = (basis * RETREAT).max(MIN_RATE_QPS).min(self.global_ceiling);
             self.global_limit = Some(target);
             self.global.set_rate(target);
@@ -323,13 +356,6 @@ impl AdaptiveController {
         let Some(limit) = self.global_limit else {
             return;
         };
-
-        // Too few queries finished to say anything, so hold. Climbing here would
-        // read a quiet tick as proof of health and inflate the limit between two
-        // congested ticks, so a path losing everything would drift upward.
-        if !well_sampled {
-            return;
-        }
 
         // Queries are finishing and not failing: ease back up, and stop limiting
         // once the ceiling is reached so a healthy path is not paced at all.
@@ -630,6 +656,71 @@ mod tests {
             global.rate(),
             UNLIMITED_QPS,
             "a healthy path must end up unpaced, not merely faster"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_under_sampled_tick_is_carried_rather_than_discarded() {
+        // No single tick finishes MIN_AGGREGATE_SAMPLES queries, so none can be
+        // judged on its own. The same queries accumulated across ticks are plenty,
+        // and a client paced this slowly is exactly the one that needs judging.
+        let pool = pool(1);
+        let (mut c, global, outcomes) = controller(1, UNLIMITED_QPS);
+
+        for _ in 0..4 {
+            drive(&pool.resolvers()[0], 30, 0);
+            finish(&outcomes, 30, 3);
+            c.tick(&pool, Duration::from_millis(500), Instant::now());
+        }
+
+        assert!(
+            global.rate() < UNLIMITED_QPS,
+            "120 finished queries at 10% loss must be judged, even 30 ticks at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_path_is_not_latched_there() {
+        // Drives the loop the way it actually runs: the queries that finish in a
+        // tick are bounded by the rate the controller set on the previous one.
+        // Under that feedback the retreat used to compound until a tick finished
+        // too few queries to sample, at which point congestion and recovery both
+        // became invisible and the rate stayed pinned for the life of the client.
+        let pool = pool(5);
+        let ceiling = 5_000.0;
+        let (mut c, global, outcomes) = controller(5, ceiling);
+        let tick = Duration::from_millis(500);
+        let seconds = tick.as_secs_f64();
+
+        let step = |c: &mut AdaptiveController, loss: f64| {
+            let finished = (global.rate().min(ceiling) * seconds) as u64;
+            for r in pool.resolvers() {
+                drive(r, finished / 5, 0);
+            }
+            finish(&outcomes, finished, (finished as f64 * loss).round() as u64);
+            c.tick(&pool, tick, Instant::now());
+        };
+
+        // Thirty seconds of queries failing outright: far more than the twenty
+        // ticks it takes to compound 15% retreats below the old sampling floor.
+        for _ in 0..60 {
+            step(&mut c, 0.03);
+        }
+        let throttled = global.rate();
+        assert!(
+            throttled < ceiling,
+            "sustained unrecoverable loss should have paced the client down"
+        );
+
+        // The path is clean from here on, and the client has to find that out.
+        for _ in 0..400 {
+            step(&mut c, 0.0);
+        }
+
+        assert_eq!(
+            global.rate(),
+            ceiling,
+            "a healthy path must climb back to the ceiling, not stay pinned at {throttled}"
         );
     }
 

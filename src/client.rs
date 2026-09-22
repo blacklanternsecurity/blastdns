@@ -74,6 +74,11 @@ pub type BatchResultBasic = (String, String, Vec<String>);
 /// failures do not count: on a public resolver pool a few percent of attempts are
 /// refused as a matter of course, and a retry elsewhere answers them. Treating
 /// those as loss makes a healthy pool look permanently congested.
+///
+/// Neither counter moves for a query that failed without ever reaching the path.
+/// These numbers exist to answer one question -- is the path being driven too
+/// hard -- and a hostname that would not parse is no evidence either way, so it
+/// belongs in neither the numerator nor the denominator.
 #[derive(Debug, Default)]
 pub(crate) struct Outcomes {
     pub(crate) completed: AtomicU64,
@@ -320,8 +325,14 @@ impl BlastDNSClient {
                         "DNS resolution attempt failed"
                     );
                     if attempt + 1 == attempts || !err.is_retryable() {
-                        self.outcomes.completed.fetch_add(1, Ordering::Relaxed);
-                        self.outcomes.failed.fetch_add(1, Ordering::Relaxed);
+                        // Only queries that tell us something about the path are
+                        // worth recording. A malformed name is rejected before
+                        // anything is dispatched, so counting it would let bad
+                        // input read as congestion and pace the whole client down.
+                        if err.is_congestion_evidence() {
+                            self.outcomes.completed.fetch_add(1, Ordering::Relaxed);
+                            self.outcomes.failed.fetch_add(1, Ordering::Relaxed);
+                        }
                         return Err(err);
                     }
                 }
