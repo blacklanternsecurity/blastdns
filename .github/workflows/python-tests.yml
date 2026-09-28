@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   python-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version:
@@ -209,7 +209,7 @@ jobs:
 
   sdist-build:
     needs: python-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
     steps:
       - uses: actions/checkout@v7
@@ -232,7 +232,7 @@ jobs:
       - windows-build
       - macos-build
       - sdist-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       # Use to sign the release artifacts
       id-token: write

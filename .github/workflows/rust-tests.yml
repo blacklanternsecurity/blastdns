@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   rust-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v7
@@ -46,7 +46,7 @@ jobs:
         run: ./scripts/stop-test-dns.sh || true
 
   cli-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v7
@@ -75,7 +75,7 @@ jobs:
 
   rust-publish:
     needs: rust-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
 
     steps:
