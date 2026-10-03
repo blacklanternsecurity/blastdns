@@ -193,7 +193,7 @@ jobs:
       - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   pypi:
-    environment: release
+    environment: pypi
     needs: [version, linux-build, musllinux-build, windows-build, macos-build, sdist-build]
     runs-on: ubuntu-24.04
     permissions:
