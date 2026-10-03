@@ -19,8 +19,11 @@ uv sync && uv run maturin develop
 
 ## Tests
 
+Integration tests need the local dnsmasq from `scripts/start-test-dns.sh`, see "Integration Tests" in README.md. Without it the Python client tests fail with `ResolverError`.
+
 ```bash
-cargo test
+sudo ./scripts/start-test-dns.sh
+cargo test --all --locked -- --include-ignored
 uv run pytest
 ```
 
