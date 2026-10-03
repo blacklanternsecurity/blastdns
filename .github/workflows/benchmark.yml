@@ -27,7 +27,7 @@ jobs:
 
       - name: Build MassDNS
         run: |
-          git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
+          git clone --depth 1 --branch v1.1.0 https://github.com/blechschmidt/massdns.git /tmp/massdns
           cd /tmp/massdns && make
           sudo cp /tmp/massdns/bin/massdns /usr/local/bin/massdns
 
@@ -45,11 +45,8 @@ jobs:
       - name: Build Python extension
         run: uv run maturin develop --release
 
-      - name: Install dnsmasq
-        run: sudo apt-get update && sudo apt-get install -y dnsmasq
-
-      - name: Start test DNS server
-        run: sudo ./scripts/start-test-dns.sh
+      - name: Start test DNS servers
+        run: ./scripts/ci-setup.sh
 
       - name: Run benchmark
         run: uv run python scripts/benchmark.py > benchmark_report.md
@@ -65,9 +62,9 @@ jobs:
           path: benchmark_report.md
           retention-days: 30
 
-      - name: Stop test DNS server
+      - name: Stop test DNS servers
         if: always()
-        run: sudo ./scripts/stop-test-dns.sh || true
+        run: ./scripts/ci-teardown.sh
 
       - name: Comment benchmark results on PR
         if: github.event_name == 'pull_request'
@@ -151,4 +148,3 @@ jobs:
                 ].join('\n')
               });
             }
-
