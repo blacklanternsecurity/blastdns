@@ -22,6 +22,17 @@ jobs:
       setup-script: scripts/ci-setup.sh
       teardown-script: scripts/ci-teardown.sh
 
+  clippy-python-feature:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
   python:
     uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
     with:
