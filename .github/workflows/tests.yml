@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   rust:
-    uses: blacklanternsecurity/CLA/.github/workflows/rust-tests.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
+    uses: blacklanternsecurity/CLA/.github/workflows/rust-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
     with:
       cargo-args: --all --locked
       test-args: --include-ignored
@@ -34,7 +34,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   python:
-    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@de82726743e51ac51a1be31196d893312a9fea59 # main
+    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
     with:
       pytest-args: blastdns/tests tests/cli_tests.py -vv
       setup-script: scripts/ci-setup.sh
