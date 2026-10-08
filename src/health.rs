@@ -450,11 +450,15 @@ impl ResolverHealth {
     }
 
     fn decay_errors(&self) {
-        let _ = self
-            .consecutive_errors
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        let mut current = self.consecutive_errors.load(Ordering::Relaxed);
+        while let Err(actual) = self.consecutive_errors.compare_exchange_weak(
+            current,
+            current.saturating_sub(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = actual;
+        }
     }
 
     fn record_rtt(&self, rtt: Duration) {

@@ -751,3 +751,7 @@ uv run ruff check --fix
 # Run ruff for formatting
 uv run ruff format
 ```
+
+## Releasing
+
+Releases are cut by pushing a `vMAJOR.MINOR.PATCH` (or `vMAJOR.MINOR.PATCH-rc.N`) tag with the org's [release.sh](https://github.com/blacklanternsecurity/CLA/blob/40c6e18c0a6e32116eea4f89fc826f53c70889dc/scripts/release.sh), after the version bump is merged. The tag must equal the manifest version. `publish.yml` then tests, builds, publishes, and creates the GitHub release with its SBOM in the same run.

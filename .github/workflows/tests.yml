@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [stable]
+  workflow_call:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    uses: blacklanternsecurity/CLA/.github/workflows/rust-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+    with:
+      cargo-args: --all --locked
+      test-args: --include-ignored
+      setup-script: scripts/ci-setup.sh
+      teardown-script: scripts/ci-teardown.sh
+
+  clippy-python-feature:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  python:
+    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+    with:
+      pytest-args: blastdns/tests tests/cli_tests.py -vv
+      setup-script: scripts/ci-setup.sh
+      teardown-script: scripts/ci-teardown.sh
