@@ -6,19 +6,21 @@
 Each build is an interpreter whose environment has that build of blastdns
 installed. Every regime runs in a fresh process under each build, alternating
 which goes first each round so runner drift lands on both sides. The report shows
-medians side by side, and bolds a change only when the two builds' ranges across
-rounds don't overlap.
+medians side by side and bolds a change only when a t-test finds it significant
+after a Benjamini-Hochberg correction over every cell in the report, so a build
+compared against itself shows any bold at all only 1% of the time.
 
 Impairment is generated in-process and needs no root. Which queries it drops or
-refuses is random, seeded per round and shared by both builds, so chance shows up
-as spread across rounds instead of as a difference. Regimes that need throughput
-point at a real resolver (`--real-resolver`), since a Python server would itself
-become the ceiling.
+refuses is random, seeded per round and shared by both builds. Regimes that need
+throughput point at a real resolver (`--real-resolver`), since a Python server
+would itself become the ceiling.
 """
 
 import argparse
 import asyncio
+import enum
 import json
+import math
 import os
 import random
 import statistics
@@ -30,45 +32,84 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CONNTRACK_COUNT = Path("/proc/sys/net/netfilter/nf_conntrack_count")
-IMPAIRED_PORT = 15399
+# Loopback aliases one real resolver answers on, so a pool needs no extra servers.
+POOL_SIZE = 32
+# A Python server caps throughput, so impaired regimes are sized to finish quickly.
+IMPAIRED_QUERIES = 2000
+# Names starting with this are never answered by the impaired server.
+DEAD_PREFIX = "dead"
+FOOTPRINT_INTERVAL_S = 0.002
+# Every query goes to the network, and the global cap stays out of the way of the
+# per-resolver limit each regime sets.
+COMMON_CONFIG = {"cache_capacity": 0, "max_concurrency": 1000}
+# False discovery rate; also the chance of any bold when nothing changed.
+FALSE_DISCOVERY_RATE = 0.01
+# Smallest relative change worth bolding, however significant.
+MIN_EFFECT = 0.01
 
 
 # ---------------------------------------------------------------- regimes
 
 
+class Resolvers(enum.Enum):
+    REAL = "real"
+    POOL = "pool"
+    IMPAIRED = "impaired"
+
+
 @dataclass
 class Regime:
-    name: str
-    # "real" is one real resolver, "pool" is 32 loopback aliases of it, and
-    # "impaired" is an in-process server shaped by `impair`.
-    resolvers: str
-    small: bool = False
-    inflight: int = 2
-    persistent: bool = False
+    resolvers: Resolvers
+    # ClientConfig overrides on top of COMMON_CONFIG.
+    config: dict = field(default_factory=dict)
+    # ImpairedResolver options.
     impair: dict = field(default_factory=dict)
-    timeout_ms: int = 1000
-    retries: int = 10
-    # (names, one_in) segments, in order: every one_in-th name in a segment is one
-    # the impaired server never answers, at any rate.
+    # (names, one_in) segments, in order: every one_in-th name is never answered.
     dead: tuple = ()
+
+    @property
+    def name(self):
+        if self.resolvers is Resolvers.REAL:
+            return "ceiling/1-resolver"
+        if self.resolvers is Resolvers.POOL:
+            kind = "persistent" if self.config.get("persistent_socket") else "resolvers"
+            return f"pool/{POOL_SIZE}-{kind}"
+        parts = []
+        if "loss_one_in" in self.impair:
+            parts.append(f"{100 / self.impair['loss_one_in']:g}%-loss")
+        if "refuse_one_in" in self.impair:
+            parts.append(f"{100 / self.impair['refuse_one_in']:g}%-REFUSED")
+        if "latency_ms" in self.impair:
+            parts.append(f"{self.impair['latency_ms']}ms-latency")
+        if self.dead:
+            parts.append("-then-".join(f"{100 / one_in:g}%" for _, one_in in self.dead) + "-dead-names")
+        return "impaired/" + "-".join(parts)
+
+    def hosts(self, num_queries):
+        if not self.dead:
+            count = IMPAIRED_QUERIES if self.resolvers is Resolvers.IMPAIRED else num_queries
+            return [f"{i}.bench.local" for i in range(count)]
+        hosts = []
+        for names, one_in in self.dead:
+            for j in range(names):
+                prefix = DEAD_PREFIX if j % one_in == 0 else ""
+                hosts.append(f"{prefix}{len(hosts)}.bench.local")
+        return hosts
 
 
 REGIMES = [
-    Regime("ceiling/1-resolver", "real", inflight=32),
-    Regime("pool/32-resolvers", "pool"),
-    Regime("pool/32-persistent", "pool", inflight=8, persistent=True),
-    Regime("impaired/10%-loss", "impaired", small=True, inflight=32, impair={"loss_one_in": 10}),
-    Regime("impaired/20%-REFUSED", "impaired", small=True, inflight=32, impair={"refuse_one_in": 5}),
-    Regime("impaired/50ms-latency", "impaired", small=True, inflight=32, impair={"latency_ms": 50}),
+    Regime(Resolvers.REAL, config={"max_inflight_per_resolver": 32}),
+    Regime(Resolvers.POOL),
+    Regime(Resolvers.POOL, config={"persistent_socket": True, "max_inflight_per_resolver": 8}),
+    Regime(Resolvers.IMPAIRED, config={"max_inflight_per_resolver": 32}, impair={"loss_one_in": 10}),
+    Regime(Resolvers.IMPAIRED, config={"max_inflight_per_resolver": 32}, impair={"refuse_one_in": 5}),
+    Regime(Resolvers.IMPAIRED, config={"max_inflight_per_resolver": 32}, impair={"latency_ms": 50}),
     # Shaped like bbot's main client: a bad patch where a fifth of names never
     # answer, then a steady 2.5%. Pacing can't fix either, so once the patch
     # passes the rate has to come back.
     Regime(
-        "impaired/dead-names-after-bad-patch",
-        "impaired",
-        inflight=25,
-        timeout_ms=500,
-        retries=1,
+        Resolvers.IMPAIRED,
+        config={"max_inflight_per_resolver": 25, "request_timeout_ms": 500, "max_retries": 1},
         dead=((500, 5), (2500, 40)),
     ),
 ]
@@ -104,7 +145,7 @@ class ImpairedResolver(asyncio.DatagramProtocol):
             query = dns.message.from_wire(data)
         except Exception:
             return
-        if any(q.name.labels and q.name.labels[0].startswith(b"dead") for q in query.question):
+        if any(q.name.labels and q.name.labels[0].startswith(DEAD_PREFIX.encode()) for q in query.question):
             return
         response = dns.message.make_response(query)
         if self.refuse_one_in and self.rng.random() < 1 / self.refuse_one_in:
@@ -121,15 +162,16 @@ class ImpairedResolver(asyncio.DatagramProtocol):
 
 
 class ThreadedImpaired:
-    """Runs an impaired resolver on its own event loop in its own thread.
+    """Runs an impaired resolver on its own event loop in its own thread, on a port
+    the OS picks.
 
     It cannot share the caller's loop: the client holds that loop while awaiting a
     batch, so a server on it could never answer the queries being awaited.
     """
 
-    def __init__(self, port, **kwargs):
-        self.port = port
+    def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.port = None
         self._loop = None
         self._thread = None
         self._ready = threading.Event()
@@ -140,7 +182,8 @@ class ThreadedImpaired:
 
         async def boot():
             protocol = ImpairedResolver(**self.kwargs)
-            await self._loop.create_datagram_endpoint(lambda: protocol, local_addr=("127.0.0.1", self.port))
+            transport, _ = await self._loop.create_datagram_endpoint(lambda: protocol, local_addr=("127.0.0.1", 0))
+            self.port = transport.get_extra_info("sockname")[1]
             self._ready.set()
 
         self._loop.run_until_complete(boot())
@@ -150,7 +193,7 @@ class ThreadedImpaired:
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
-            raise RuntimeError(f"impaired resolver on :{self.port} did not start")
+            raise RuntimeError("impaired resolver did not start")
         return self
 
     def __exit__(self, *exc):
@@ -164,8 +207,7 @@ class ThreadedImpaired:
 class Footprint:
     """Samples what the process is holding while a run is in flight."""
 
-    def __init__(self, interval=0.002):
-        self.interval = interval
+    def __init__(self):
         self.peak_fds = 0
         self.peak_conntrack = 0
         self.base_conntrack = self._conntrack()
@@ -188,7 +230,7 @@ class Footprint:
         while not self._stop.is_set():
             self.peak_fds = max(self.peak_fds, self._fds())
             self.peak_conntrack = max(self.peak_conntrack, self._conntrack())
-            self._stop.wait(self.interval)
+            self._stop.wait(FOOTPRINT_INTERVAL_S)
 
     def __enter__(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -210,18 +252,7 @@ class Footprint:
 async def run_blastdns(hosts, resolvers, regime):
     from blastdns import Client, ClientConfig, DNSError
 
-    client = Client(
-        resolvers,
-        ClientConfig(
-            max_concurrency=1000,
-            max_inflight_per_resolver=regime.inflight,
-            persistent_socket=regime.persistent,
-            cache_capacity=0,
-            request_timeout_ms=regime.timeout_ms,
-            max_retries=regime.retries,
-            adaptive=True,
-        ),
-    )
+    client = Client(resolvers, ClientConfig(**COMMON_CONFIG, **regime.config))
     # Warm up before timing: building sockets costs the same at any query count.
     async for _ in client.resolve_batch_full(["warmup.invalid"], "A"):
         pass
@@ -254,23 +285,15 @@ async def run_blastdns(hosts, resolvers, regime):
 
 
 async def worker(regime, args):
-    if regime.dead:
-        hosts = []
-        for names, one_in in regime.dead:
-            for j in range(names):
-                i = len(hosts)
-                hosts.append(f"dead{i}.bench.local" if j % one_in == 0 else f"{i}.bench.local")
-    else:
-        count = max(2000, args.num_queries // 10) if regime.small else args.num_queries
-        hosts = [f"{i}.bench.local" for i in range(count)]
-    # One server answers on every loopback alias, so a pool needs no extra servers.
-    host, _, port = args.real_resolver.partition(":")
-    if regime.resolvers == "real":
+    hosts = regime.hosts(args.num_queries)
+    if regime.resolvers is Resolvers.REAL:
         return await run_blastdns(hosts, [args.real_resolver], regime)
-    if regime.resolvers == "pool":
-        return await run_blastdns(hosts, [f"127.0.0.{i}:{port}" for i in range(1, 33)], regime)
-    with ThreadedImpaired(IMPAIRED_PORT, seed=args.seed, **regime.impair):
-        return await run_blastdns(hosts, [f"127.0.0.1:{IMPAIRED_PORT}"], regime)
+    if regime.resolvers is Resolvers.POOL:
+        _, _, port = args.real_resolver.partition(":")
+        pool = [f"127.0.0.{i}:{port}" for i in range(1, POOL_SIZE + 1)]
+        return await run_blastdns(hosts, pool, regime)
+    with ThreadedImpaired(seed=args.seed, **regime.impair) as server:
+        return await run_blastdns(hosts, [f"127.0.0.1:{server.port}"], regime)
 
 
 # ---------------------------------------------------------------- comparison
@@ -300,6 +323,8 @@ def run_one(python, regime, args, seed):
 
 
 def compare(args):
+    """Run every regime under both builds and print the report. Returns how many
+    runs measured nothing."""
     builds = {"base": args.base, "head": args.head}
     regimes = [r for r in REGIMES if not args.only or args.only in r.name]
     results = {r.name: {"base": [], "head": []} for r in regimes}
@@ -312,65 +337,152 @@ def compare(args):
     report(results, args)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(results, indent=2))
+    return sum("note" in r for runs in results.values() for side in runs.values() for r in side)
+
+
+# ---------------------------------------------------------------- statistics
+
+
+def _beta_continued_fraction(a, b, x):
+    """Lentz's method for the continued fraction of the incomplete beta function."""
+    tiny = 1e-300
+    c, d = 1.0, 1 - (a + b) * x / (a + 1)
+    d = 1 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 300):
+        for numerator in (
+            m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+            -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1)),
+        ):
+            d = 1 + numerator * d
+            d = 1 / (d if abs(d) > tiny else tiny)
+            c = 1 + numerator / c
+            c = c if abs(c) > tiny else tiny
+            h *= d * c
+        if abs(d * c - 1) < 1e-14:
+            break
+    return h
+
+
+def regularized_beta(a, b, x):
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    log_front = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x)
+    if x < (a + 1) / (a + b + 2):
+        return math.exp(log_front) * _beta_continued_fraction(a, b, x) / a
+    return 1 - math.exp(log_front) * _beta_continued_fraction(b, a, 1 - x) / b
+
+
+def t_test_p(base, head):
+    """Two-sided p-value of a pooled two-sample t-test that the samples share a mean.
+
+    Pooled rather than Welch: both builds get the same number of rounds, which keeps
+    it robust to unequal spread, and it keeps its degrees of freedom when one build
+    is noisier, which Welch at a handful of rounds does not.
+    """
+    nb, nh = len(base), len(head)
+    df = nb + nh - 2
+    pooled = ((nb - 1) * statistics.variance(base) + (nh - 1) * statistics.variance(head)) / df
+    diff = statistics.fmean(head) - statistics.fmean(base)
+    if pooled == 0:
+        return 1.0 if diff == 0 else 0.0
+    t = diff / math.sqrt(pooled * (1 / nb + 1 / nh))
+    return regularized_beta(df / 2, 0.5, df / (df + t * t))
+
+
+def discoveries(p_values, rate):
+    """Benjamini-Hochberg: the largest p-value still counted as a discovery, or None."""
+    ordered = sorted(p_values)
+    passing = [p for k, p in enumerate(ordered, 1) if p <= k * rate / len(ordered)]
+    return passing[-1] if passing else None
 
 
 # ---------------------------------------------------------------- report
 
-# metric -> (label, formatter)
-METRICS = {
-    "qps": ("qps", lambda v: f"{v:,.0f}"),
-    "unanswered_pct": ("unanswered", lambda v: f"{v:.2f}%"),
-    "attempts_per_query": ("attempts/query", lambda v: f"{v:.2f}"),
-    "p50": ("p50", lambda v: f"{v:.3f}s"),
-    "p99": ("p99", lambda v: f"{v:.3f}s"),
-    "p100": ("p100", lambda v: f"{v:.3f}s"),
-    "peak_fds": ("sockets", lambda v: f"{v:,.0f}"),
-    "conntrack": ("conntrack", lambda v: f"{v:,.0f}"),
-}
+
+@dataclass
+class Metric:
+    key: str
+    label: str
+    fmt: object
+    # In the headline table rather than the details.
+    headline: bool = False
+    # Shown and judged as a relative change.
+    relative: bool = True
+
+
+METRICS = [
+    Metric("qps", "qps", lambda v: f"{v:,.0f}", headline=True),
+    Metric("unanswered_pct", "unanswered", lambda v: f"{v:.2f}%", headline=True, relative=False),
+    Metric("p99", "p99", lambda v: f"{v:.3f}s", headline=True),
+    Metric("attempts_per_query", "attempts/query", lambda v: f"{v:.2f}", headline=True, relative=False),
+    Metric("p50", "p50", lambda v: f"{v:.3f}s"),
+    Metric("p100", "p100", lambda v: f"{v:.3f}s"),
+    Metric("peak_fds", "sockets", lambda v: f"{v:,.0f}"),
+    Metric("conntrack", "conntrack", lambda v: f"{v:,.0f}"),
+]
+
+
+def change_text(change):
+    return f"{change:+.1%}" if abs(change) < 0.1 else f"{change:+.0%}"
+
+
+@dataclass
+class Cell:
+    text: str
+    p: float = None
+    meaningful: bool = False
 
 
 def cell(base_runs, head_runs, metric):
-    fmt = METRICS[metric][1]
-    b = [r[metric] for r in base_runs if r.get(metric) is not None]
-    h = [r[metric] for r in head_runs if r.get(metric) is not None]
+    b = [r[metric.key] for r in base_runs if r.get(metric.key) is not None]
+    h = [r[metric.key] for r in head_runs if r.get(metric.key) is not None]
     if not b or not h:
         notes = {r["note"] for r in base_runs + head_runs if "note" in r}
-        return "_" + "; ".join(sorted(notes)) + "_" if notes else "n/a"
+        return Cell("_" + "; ".join(sorted(notes)) + "_" if notes else "n/a")
     bm, hm = statistics.median(b), statistics.median(h)
-    text = f"{fmt(bm)} → {fmt(hm)}"
-    visible = fmt(bm) != fmt(hm)
-    if bm and metric not in ("unanswered_pct", "attempts_per_query"):
-        change = round((hm - bm) / bm, 2)
-        text += f" ({change:+.0%})" if change else " (0%)"
-        visible = visible and change != 0
-    # Bold only a visible change the run-to-run spread can't explain, which takes
-    # a spread to judge.
-    apart = min(h) > max(b) or max(h) < min(b)
-    if apart and visible and len(b) > 1 and len(h) > 1:
-        text = f"**{text}**"
-    return text
+    text = f"{metric.fmt(bm)} → {metric.fmt(hm)}"
+    meaningful = metric.fmt(bm) != metric.fmt(hm)
+    if metric.relative and bm:
+        change = (hm - bm) / bm
+        text += f" ({change_text(change)})"
+        meaningful = abs(change) >= MIN_EFFECT
+    p = None
+    if len(b) > 1 and len(h) > 1:
+        # Rates and times vary in proportion to their size, so compare them as logs.
+        if metric.relative and min(b + h) > 0:
+            b, h = [math.log(v) for v in b], [math.log(v) for v in h]
+        p = t_test_p(b, h)
+    return Cell(text, p, meaningful)
 
 
 def report(results, args):
+    cells = {name: {m.key: cell(runs["base"], runs["head"], m) for m in METRICS} for name, runs in results.items()}
+    p_values = [c.p for row in cells.values() for c in row.values() if c.p is not None]
+    cutoff = discoveries(p_values, FALSE_DISCOVERY_RATE) if p_values else None
+
+    def render(c):
+        bold = cutoff is not None and c.p is not None and c.p <= cutoff and c.meaningful
+        return f"**{c.text}**" if bold else c.text
+
+    def table(metrics):
+        print("| regime | " + " | ".join(m.label for m in metrics) + " |")
+        print("|---" * (len(metrics) + 1) + "|")
+        for name, row in cells.items():
+            print(f"| {name} | " + " | ".join(render(row[m.key]) for m in metrics) + " |")
+
+    rounds = f"{args.rounds} interleaved round{'s' if args.rounds != 1 else ''}"
     print("## DNS Resolver Benchmark\n")
     print(
-        f"`{args.head_label}` against `{args.base_label}`, base → head, median of "
-        f"{args.rounds} interleaved round{'s' if args.rounds != 1 else ''}. **Bold** is "
-        "outside both builds' run-to-run range; the rest is noise.\n"
+        f"`{args.head_label}` against `{args.base_label}`, base → head, median of {rounds}. "
+        f"**Bold** is significant across all {len(p_values)} comparisons "
+        f"(Benjamini-Hochberg at {FALSE_DISCOVERY_RATE:.0%}); the rest is noise.\n"
     )
-    headline = ["qps", "unanswered_pct", "p99", "attempts_per_query"]
-    print("| regime | " + " | ".join(METRICS[m][0] for m in headline) + " |")
-    print("|---" * (len(headline) + 1) + "|")
-    for name, runs in results.items():
-        cells = [cell(runs["base"], runs["head"], m) for m in headline]
-        print(f"| {name} | " + " | ".join(cells) + " |")
+    table([m for m in METRICS if m.headline])
     print("\n<details><summary>All metrics</summary>\n")
-    rest = [m for m in METRICS if m not in headline]
-    print("| regime | " + " | ".join(METRICS[m][0] for m in rest) + " |")
-    print("|---" * (len(rest) + 1) + "|")
-    for name, runs in results.items():
-        cells = [cell(runs["base"], runs["head"], m) for m in rest]
-        print(f"| {name} | " + " | ".join(cells) + " |")
+    table([m for m in METRICS if not m.headline])
     print("\n</details>")
 
 
@@ -399,7 +511,10 @@ def main():
         return
     if not (args.base and args.head):
         p.error("--base and --head are required")
-    compare(args)
+    failed = compare(args)
+    if failed:
+        print(f"{failed} run(s) measured nothing; see the report", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

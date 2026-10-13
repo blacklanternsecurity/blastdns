@@ -68,7 +68,10 @@ jobs:
             --head-label "this PR @ ${HEAD_SHA::7}" \
             > benchmark_report.md
 
+      # The report still gets shown and posted when runs failed: those are the
+      # results that matter most.
       - name: Display benchmark results
+        if: ${{ !cancelled() }}
         run: cat benchmark_report.md
 
       - name: Upload benchmark results
@@ -84,7 +87,7 @@ jobs:
         run: sudo ./scripts/stop-test-dns.sh || true
 
       - name: Comment benchmark results on PR
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         uses: actions/github-script@v9
         with:
           script: |
