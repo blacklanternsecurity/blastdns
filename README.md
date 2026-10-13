@@ -20,7 +20,7 @@ There are three ways to use it:
 
 100K DNS lookups against local `dnsmasq`, with 100 workers:
 
-This is one regime: a single resolver, no loss, no latency, which is the case that most favors raw dispatch and resembles no real workload. `scripts/benchmark.py` now reports several regimes — a resolver pool, injected loss, injected latency, and both socket transports — alongside delivery, retry amplification, completion percentiles, and socket plus connection-tracking peaks. Absolute rates here move over 30% between runs on shared CI hardware, so the ratio column is the durable figure.
+This is one regime: a single resolver, no loss, no latency, which is the case that most favors raw dispatch and resembles no real workload. On every pull request, `scripts/benchmark.py` compares the PR's build against its base branch across several regimes, including a resolver pool, injected loss and latency, both socket transports, and names that never resolve. It posts the comparison on the PR.
 
 | Library         | Language | Time    | QPS    | Success | Failed | vs dnspython |
 |-----------------|----------|---------|--------|---------|--------|--------------|
