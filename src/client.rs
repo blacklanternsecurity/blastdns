@@ -189,8 +189,7 @@ impl BlastDNSClient {
         self.pool.stats()
     }
 
-    /// The global pacing rate, or `None` while unlimited. Mirrors
-    /// `ResolverStats::rate_qps` for the client-wide limit.
+    /// The global pacing rate, or `None` while unlimited.
     #[cfg(test)]
     pub(crate) fn global_rate_qps(&self) -> Option<f64> {
         let rate = self.limiter.rate();

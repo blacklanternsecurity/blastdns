@@ -10,12 +10,9 @@
 //! requires loss in the aggregate across resolvers that have answered at least
 //! once, so a large public list full of dead entries cannot drag the rate down.
 //!
-//! Not all loss is the rate's doing. A recon target list always carries names that
-//! fail however slowly they are asked, such as lame delegations and dead
-//! authoritative servers, and backing off at those walks the rate to the floor
-//! without recovering a query. So a retreat is only repeated while it is visibly
-//! working, and loss it cannot move becomes a baseline that later loss is judged
-//! against.
+//! Not all loss is the rate's doing: some names fail at any rate. A retreat is
+//! only repeated while it visibly helps, and loss it cannot move becomes a
+//! baseline that later loss is judged against.
 //!
 //! Retries are never given up, only paced. Abandoning them under load was tried
 //! and measured: it took unanswered queries from 0% to 3.5% on a 5,000-name
@@ -45,26 +42,14 @@ use crate::{
 const RETREAT: f64 = 0.85;
 /// Per-tick multiplier when climbing back toward the target.
 const GROWTH: f64 = 1.25;
-/// Loss above a path's baseline, as a fraction, at which it counts as congested.
+/// Loss above the baseline at which a path counts as congested.
 const LOSS_THRESHOLD: f64 = 0.02;
-/// Queries against one resolver before its own loss ratio is trusted.
-///
-/// A ratio built from a handful of queries is mostly noise, and noise in this one
-/// reads as a resolver that keeps starting to fail: every high draw crosses the
-/// threshold and buys another retreat, and the rate walks down a step at a time.
+/// Queries against one resolver before its own loss ratio is trusted. Fewer is
+/// mostly noise, and noise reads as a resolver that keeps starting to fail.
 const MIN_SAMPLES: u64 = 100;
 /// Request timeouts a resolver's window may stay open gathering `MIN_SAMPLES`.
-///
-/// A resolver that cannot fill a window in this long is not individually
-/// measurable, and its window is discarded rather than carried further. That is
-/// the line between a small pool, where each resolver carries enough to be judged
-/// on its own, and brute-force scale, where each carries a trickle and the
-/// aggregate is the only signal. Carrying a trickle until it filled would put
-/// thousands of resolvers under pacing designed for a handful, each judged on a
-/// minute of history about names rather than about itself. A hundred queries over
-/// five timeouts works out to twenty per timeout, which is what a resolver has to
-/// carry to be judged at all; the longer window only gives each judgment more to
-/// go on.
+/// A resolver that can't fill one is left to the aggregate, which keeps
+/// brute-force scale (a trickle per resolver) out of per-resolver pacing.
 const MAX_WINDOW_TIMEOUTS: f64 = 5.0;
 /// Queries that must finish before the global failure rate is trusted. Gathered
 /// over as many ticks as it takes, so a low rate is judged late rather than never.
@@ -81,40 +66,18 @@ const MIN_RATE_QPS: f64 = 1.0;
 ///
 /// Backing off only helps when the rate is what caused the loss. A resolver
 /// dropping a fixed share of queries loses just as much at any rate, and retreating
-/// on every window would walk it to the floor without recovering a query. Comparing
-/// against the best loss of the episode rather than merely the previous window
-/// makes sampling noise work harder to pass for progress, though not hard enough
-/// on its own; `RETREAT_MUST_DELIVER` covers what it still lets through. The margin
+/// every tick would walk it to the floor without recovering a query. The margin
 /// stays small because real convergence toward a capacity limit improves gradually.
 const RETREAT_MUST_IMPROVE: f64 = 0.99;
-/// Share of an episode's best delivered throughput a retreat has to leave intact
-/// to count as having paid for itself.
-///
-/// Loss falling is not proof that retreating is what lowered it. A workload moving
-/// on from a bad patch of names lowers it too, and sampling noise lowers it about
-/// half the time on its own; either reads as success, and each one walks the rate
-/// down another step. Answered queries per second tell the cases apart, for the
-/// whole client and for any one resolver. Loss the rate is causing is loss above
-/// a capacity, so a saturated path keeps answering at that capacity while the rate
-/// comes down to it; loss the rate is not causing takes a fixed share of whatever
-/// is sent, so what is answered falls with every cut. The bar sits between a cut
-/// that costs nothing and one that costs `RETREAT`, and an answered count is many
-/// times the failure count a loss ratio is built from, so it is the steadier of
-/// the two numbers.
+/// Share of an episode's best answered rate a retreat must keep to count as
+/// working. Falling loss alone can be noise or a changing workload; a saturated
+/// path keeps answering at capacity when sent less, a fixed-share loss doesn't.
 const RETREAT_MUST_DELIVER: f64 = 0.95;
-/// Loss above which a path is not merely expensive but broken, and the global rate
-/// is held where it is rather than grown back.
-///
-/// A baseline says "this is what the workload costs, so stop paying to avoid it"
-/// and hands the rate back. That is right for a target list carrying some dead
-/// names and wrong for a path answering almost nothing: there is no throughput
-/// there to win back, and a fan-out big enough to flatten a link is one plausible
-/// cause of the state. Past this the client holds what it has instead of growing
-/// into it.
+/// Outright-failure share above which the global rate holds rather than grows:
+/// a path answering almost nothing has no throughput to win back.
 const MAX_BASELINE_LOSS: f64 = 0.5;
-/// Consecutive windows in which the loss has failed to improve before it is taken
-/// as what the path costs. A retreat that cost answered queries needs no second
-/// reading; see `RETREAT_MUST_DELIVER`.
+/// Consecutive windows without improvement before the loss becomes the baseline.
+/// A retreat that cost answers needs only one.
 ///
 /// One flat window is not proof: loss is a sampled ratio, and a noisy reading
 /// during a genuine convergence would otherwise stop it short of the path's real
@@ -125,71 +88,47 @@ const STALL_TICKS: u8 = 2;
 /// What a window of loss is worth doing about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Verdict {
-    /// Loss the rate is plausibly causing, and worth retreating from.
-    /// `converging` marks a window that has shown the retreats so far to be
-    /// working: the loss is falling and the queries are still being answered. It
-    /// is never set on the window that opens an episode, which has nothing to
-    /// compare against yet.
+    /// Worth retreating from. `converging`: the retreats so far are working
+    /// (never set on an episode's first window).
     Congested { converging: bool },
     /// Nothing to act on.
     Clear,
-    /// Retreating has stopped reducing it, so this is what the path costs at any
-    /// rate. Newly taken as the baseline the next episode is judged against.
+    /// Retreating stopped helping; this loss is now the baseline.
     Baseline,
 }
 
-/// Decides whether a window's loss is the rate's fault.
-///
-/// Three readings separate the cases. Loss is judged against what the path loses
-/// anyway rather than against zero, because a recon target list always carries
-/// some unanswerable names and an absolute bar reads that as permanent congestion.
-/// Above the bar, a retreat is only worth repeating while the loss is still
-/// falling and the path is still answering what it did before. Loss the client
-/// cannot fix — a lame delegation, a dead authoritative server, a resolver
-/// dropping a fixed share — fails one test or the other: the first when it holds
-/// steady, the second when it falls for reasons of its own.
+/// Decides whether a window's loss is the rate's fault: congestion is loss above
+/// a learned baseline, and a retreat continues only while loss falls and answers
+/// hold up.
 #[derive(Default, Clone)]
 struct LossJudge {
-    /// Lowest loss seen since the current episode of loss began, so the next
-    /// window can tell whether backing off is buying anything.
+    /// Lowest loss this episode.
     best: Option<f64>,
-    /// Most queries per second answered in any window of the episode, so the next
-    /// window can tell what backing off is costing.
+    /// Highest answered rate this episode.
     best_delivered: Option<f64>,
-    /// Consecutive windows in which retreating has not earned its keep.
+    /// Consecutive windows a retreat hasn't earned its keep.
     stalled: u8,
-    /// What the path loses regardless of rate, learned from the level at which
-    /// retreating stopped moving it.
+    /// Loss the path shows at any rate.
     baseline: Option<f64>,
 }
 
 impl LossJudge {
     /// `delivered` is answered queries per second over the same window as `loss`.
     fn judge(&mut self, loss: f64, delivered: f64) -> Verdict {
-        // A baseline is a reading, not a fact, and the one thing that always
-        // refutes it is the path doing better than it. Following the loss down
-        // keeps a bar set during a bad patch from hiding congestion once it has
-        // passed, and takes it to nothing on a path that comes clean; only a
-        // fresh stall can raise it again. Nothing short of that clears it: one
-        // lucky window below the threshold says little about a path losing a
-        // steady few percent, and forgetting the baseline on it would mean
-        // retreating all over again to relearn it.
+        // The baseline follows the loss down, so a bar set in a bad patch can't hide
+        // later congestion; only a fresh stall raises it.
         if let Some(baseline) = self.baseline {
             self.baseline = Some(baseline.min(loss));
         }
 
-        // Congestion is loss above what the workload costs anyway. Same bar as
-        // ever, just measured from the baseline rather than from nothing.
+        // Congestion is loss above the baseline, not above zero.
         if loss <= self.baseline.unwrap_or(0.0) + LOSS_THRESHOLD {
             self.end_episode();
             return Verdict::Clear;
         }
 
-        // The first sight of loss earns a retreat. After that the loss has to be
-        // falling, and the retreats so far have to still be delivering what the
-        // episode delivered at its best. Comparing against the best of the episode
-        // rather than merely the previous window keeps sampling noise from looking
-        // like progress.
+        // The first sight of loss earns a retreat; after that, loss must keep
+        // falling and answers must hold up.
         let improving = match self.best {
             Some(best) => loss < best * RETREAT_MUST_IMPROVE,
             None => true,
@@ -203,9 +142,8 @@ impl LossJudge {
             self.stalled = 0;
         } else {
             self.stalled = self.stalled.saturating_add(1);
-            // A retreat that cost answered queries is settled on one reading,
-            // the answered count being the steady number of the two. A loss
-            // ratio that merely failed to improve gets another window first.
+            // A retreat that cost answers is settled at once; loss that merely
+            // failed to improve gets another window.
             if !paying || self.stalled >= STALL_TICKS {
                 self.baseline = Some(loss);
                 self.end_episode();
@@ -224,9 +162,7 @@ impl LossJudge {
         Verdict::Congested { converging }
     }
 
-    /// Judge the next episode on its own evidence rather than against a reading
-    /// from whatever went wrong before it. The baseline outlives it: that is a
-    /// property of the path, not of one bout of loss.
+    /// Start the next episode fresh. The baseline stays: it belongs to the path.
     fn end_episode(&mut self) {
         self.best = None;
         self.best_delivered = None;
@@ -238,11 +174,8 @@ impl LossJudge {
 struct Observation {
     attempted: u64,
     lost: u64,
-    /// Queries answered, counted where the answer arrives. Not the same as
-    /// `attempted - lost`: a loss only lands a timeout after the dispatch that
-    /// caused it, so that difference runs ahead of what was really answered
-    /// whenever the rate changes, and would make every window after a cut look
-    /// like a shortfall.
+    /// Counted when the answer arrives; `attempted - lost` lags, since a loss lands
+    /// a timeout after its dispatch.
     responded: u64,
 }
 
@@ -260,12 +193,9 @@ pub(crate) struct AdaptiveController {
     global_ceiling: f64,
     per_resolver: Vec<Observation>,
     edges: Vec<Option<Edge>>,
-    /// Whether a resolver's last retreat actually lowered its pacing. A retreat
-    /// that re-applies a held edge changes nothing, so the window after it
-    /// measures the same rate again and cannot say whether pacing helps.
+    /// Whether a resolver's last retreat actually lowered its pacing.
     stepped: Vec<bool>,
-    /// A resolver's edge and pacing from before its last real retreat, so a
-    /// retreat that turns out to have bought nothing can be taken back.
+    /// Edge and rate from before a resolver's last retreat, to undo it if it fails.
     undo: Vec<Option<(Option<Edge>, f64)>>,
     /// Per-resolver verdict on the loss it is showing.
     judge: Vec<LossJudge>,
@@ -371,10 +301,9 @@ impl AdaptiveController {
             self.window[i].responded += current.responded.saturating_sub(previous.responded);
             self.window_seconds[i] += seconds;
 
-            // Keep gathering until the window is both long enough and holds enough
-            // queries to judge, up to the point where the resolver has shown it is
-            // not individually measurable. Let any stale edge expire meanwhile, so
-            // an idle resolver does not stay throttled forever.
+            // Gather until the window is long and full enough to judge, or shows
+            // the resolver can't be measured on its own. Relax meanwhile so an idle
+            // resolver doesn't stay throttled.
             let timeout = resolver.request_timeout().as_secs_f64();
             if self.window_seconds[i] < timeout
                 || (self.window[i].attempted < MIN_SAMPLES
@@ -390,9 +319,8 @@ impl AdaptiveController {
             self.window[i] = Observation::default();
             self.window_seconds[i] = 0.0;
 
-            // Throttling one resolver needs that resolver's own loss ratio, which
-            // needs enough queries against it. One that could not gather them in
-            // the time allowed is left to the aggregate.
+            // Too few queries to judge this resolver alone: leave it to the
+            // aggregate.
             if dispatched < MIN_SAMPLES {
                 self.relax(i, now, resolver);
                 continue;
@@ -410,11 +338,8 @@ impl AdaptiveController {
                     continue;
                 }
                 Verdict::Baseline => {
-                    // The retreat this window was measuring bought nothing, so take
-                    // it back: this resolver loses a fixed share whatever it is
-                    // sent, and pacing it only costs the queries it would have
-                    // answered. Earlier retreats in the episode passed their own
-                    // tests and stand.
+                    // The retreat bought nothing: undo it. Earlier retreats passed
+                    // their own tests and stand.
                     if std::mem::take(&mut self.stepped[i])
                         && let Some((edge, rate)) = self.undo[i].take()
                     {
@@ -430,44 +355,31 @@ impl AdaptiveController {
                 Verdict::Congested { converging } => converging,
             };
 
-            // The edge steps down from where this resolver's own pacing stands,
-            // the way the global limit retreats from its standing value, and never
-            // to what was observed. Observed throughput is capped by every other
-            // limit on the path as well -- the global rate, the workload, the host
-            // -- so walking the edge down to it would credit this resolver's pacing
-            // with their doing, and compound retreat onto retreat for as long as
-            // any loss persisted. Only the first edge, with nothing standing yet,
-            // is taken from observation.
+            // Step down from this resolver's own rate, never to observed
+            // throughput, which every other limit on the path also caps. Only the
+            // first edge comes from observation.
             let observed_qps = dispatched as f64 / window_seconds.max(1e-6);
             let rate = resolver.rate();
-            // A window only says whether this resolver's pacing helps if that
-            // pacing shaped it: the retreat before it really lowered the limit, and
-            // the traffic ran up against the result. Otherwise a loss that improved
-            // by chance, or because some other limit eased, reads as this pacing
-            // working, and each such reading steps it down for nothing.
+            // A window only shows whether this resolver's pacing helps if that
+            // pacing shaped it: the last retreat really lowered the limit and
+            // traffic hit it.
             let shaped = self.stepped[i] && observed_qps >= RETREAT * rate;
             let edge = match self.edges[i] {
                 None => Edge {
                     qps: observed_qps,
                     seen_at: now,
                 },
-                // The retreats are working, so the rate this resolver is paced at
-                // still loses queries and becomes the new edge.
+                // Working: the current rate still loses, so it becomes the edge.
                 Some(edge) if converging && shaped => Edge {
                     qps: edge.qps.min(rate),
                     seen_at: now,
                 },
-                // Otherwise the edge stays where it stands, and keeps aging toward
-                // its expiry: re-applying it is not a fresh sighting, and treating
-                // it as one would let noise renew it forever.
+                // Otherwise hold the edge, still aging toward expiry.
                 Some(edge) => edge,
             };
             let edge_qps = edge.qps;
             let target = (RETREAT * edge_qps).max(MIN_RATE_QPS);
-            // Whether this lowers the pacing by a real step. The limiter keeps its
-            // rate as whole nanoseconds between queries, so re-applying the current
-            // pace reads back a hair either side of it; anything short of half a
-            // step is that, not a retreat.
+            // A real step, not the limiter's nanosecond rounding of the same rate.
             self.stepped[i] = target < rate * (1.0 + RETREAT) / 2.0;
             if self.stepped[i] {
                 self.undo[i] = Some((self.edges[i], rate));
@@ -494,9 +406,7 @@ impl AdaptiveController {
         if now.duration_since(edge.seen_at) >= EDGE_TTL {
             self.edges[i] = None;
             // Forget what the episode achieved too: the next one gets judged on its
-            // own, not against a reading from 30 seconds ago. What the path costs
-            // outlives the probe, so the baseline is kept and the rate this
-            // releases to is only retreated from again if the loss rises above it.
+            // own, not against a reading from 30 seconds ago. The baseline stays.
             self.judge[i].end_episode();
             resolver.set_rate(UNLIMITED_QPS);
             debug!(
@@ -525,8 +435,7 @@ impl AdaptiveController {
         let current = Observation {
             attempted: self.outcomes.completed.load(Ordering::Relaxed),
             lost: self.outcomes.failed.load(Ordering::Relaxed),
-            // Both counters above move where a query finishes, so the aggregate's
-            // answered count is simply their difference.
+            // Answered is `attempted - lost` here: both move as a query finishes.
             ..Observation::default()
         };
         let previous = std::mem::replace(&mut self.previous_outcomes, current);
@@ -589,10 +498,8 @@ impl AdaptiveController {
             return;
         }
 
-        // Almost nothing is getting through. Hold what we have rather than grow
-        // into it: there is no throughput to win back, and the volume may well be
-        // the cause. Judged on this window's own loss, so the first one after the
-        // path recovers releases it.
+        // Almost nothing is getting through: hold rather than grow into it. The
+        // first window after recovery releases it.
         if loss > MAX_BASELINE_LOSS {
             return;
         }
@@ -722,10 +629,9 @@ mod tests {
         let (falling_first, stuck_first) = (falling.rate(), stuck.rate());
         assert!(falling_first < UNLIMITED_QPS && stuck_first < UNLIMITED_QPS);
 
-        // The pacing takes hold. One resolver is saturated at 150 answers a second:
-        // sent less, it loses less and answers just as much, because its loss was
-        // the rate's doing. The stuck one keeps losing the same share of everything
-        // it sends.
+        // One resolver is saturated at 150 answers a second: sent less, it loses
+        // less but answers as much. The other loses the same share of anything it
+        // sends.
         for (attempted, lost) in [(170, 20), (150, 6), (140, 2)] {
             drive(falling, attempted, lost);
             drive(stuck, 200, 50);
@@ -932,11 +838,8 @@ mod tests {
         // too few queries to sample, at which point congestion and recovery both
         // became invisible and the rate stayed pinned for the life of the client.
         //
-        // The loss has to be the kind retreating can fix, or the controller stops
-        // retreating long before it is deep enough to reach that sampling floor.
-        // A path that drops everything over a capacity is exactly that, and the
-        // capacity is low enough that a tick there finishes well under
-        // MIN_AGGREGATE_SAMPLES queries.
+        // Capacity congestion, because only loss retreating can fix drives it that
+        // deep; at this capacity a tick finishes well under MIN_AGGREGATE_SAMPLES.
         const CAPACITY: f64 = 40.0;
         let pool = pool(5);
         let ceiling = 5_000.0;
@@ -957,8 +860,8 @@ mod tests {
             c.tick(&pool, tick, Instant::now());
         };
 
-        // Sixty ticks of a path that cannot carry what it is being sent: more than
-        // the twenty it takes to compound 15% retreats below the old sampling floor.
+        // Sixty ticks over capacity: more than the twenty it takes to compound 15%
+        // retreats below the old sampling floor.
         for _ in 0..60 {
             step(&mut c, Some(CAPACITY));
         }
@@ -1182,9 +1085,8 @@ mod tests {
             .unwrap(),
         );
 
-        // Push hard for long enough that the controller sees several windows. At
-        // this capacity a window worth trusting takes about a second to fill, so
-        // "several" is a matter of seconds rather than ticks.
+        // Push hard for long enough that the controller sees several windows (about
+        // a second each at this capacity).
         let hosts: Vec<String> = (0..12000).map(|i| format!("h{i}.example.com.")).collect();
         let mut stream = client.clone().resolve_batch_full(
             hosts.into_iter().map(Ok::<_, std::convert::Infallible>),
@@ -1204,10 +1106,8 @@ mod tests {
             }
         }
 
-        // One resolver means its own pacing and the global rate answer the same
-        // loss, and whichever pulls ahead is the one shaping traffic; the other
-        // then has nothing to measure and rightly stops. What has to settle at the
-        // edge is the pace actually in force.
+        // With one resolver, whichever limit pulls ahead shapes traffic and the
+        // other stops; check the pace actually in force.
         let rate = client.stats()[0]
             .rate_qps
             .into_iter()
@@ -1242,10 +1142,7 @@ mod tests {
         sim.dropped() as f64 / received
     }
 
-    /// The guard must not stop a real convergence short. When the rate is what is
-    /// causing the loss, every retreat shows up as less loss, so the improvement
-    /// test keeps passing and the controller follows it down to the path's real
-    /// capacity.
+    /// Real congestion is still followed down to the path's capacity.
     #[tokio::test]
     async fn global_retreat_continues_while_the_loss_is_falling() {
         const CAPACITY: f64 = 400.0;
@@ -1256,8 +1153,7 @@ mod tests {
         let seconds = tick.as_secs_f64();
 
         for _ in 0..40 {
-            // Everything over the path's capacity is lost, so loss falls as the
-            // rate does: the textbook case retreating is for.
+            // Everything over capacity is lost, so loss falls with the rate.
             let dispatched = global.rate().min(ceiling) * seconds;
             let lost = (dispatched - CAPACITY * seconds).max(0.0);
             drive(&pool.resolvers()[0], dispatched as u64, 0);
@@ -1277,10 +1173,8 @@ mod tests {
         );
     }
 
-    /// The point of the whole guard. Loss that reads the same at any rate is what
-    /// the workload costs, not a congestion signal, so once retreating has been
-    /// shown not to move it the client takes it as the bar and goes back to full
-    /// speed. A recon target list always carries some of it.
+    /// Loss that reads the same at any rate becomes the baseline, and the rate
+    /// returns.
     #[tokio::test]
     async fn rate_insensitive_loss_is_learned_as_a_baseline_and_the_rate_returns() {
         let pool = pool(1);
@@ -1306,9 +1200,7 @@ mod tests {
         );
     }
 
-    /// A baseline hands the rate back, which is right for a workload that costs
-    /// something and wrong for a path that is answering nothing: there is no
-    /// throughput to win back, and the volume may be what flattened it.
+    /// A path answering nothing is held, not grown back into.
     #[tokio::test]
     async fn a_broken_path_is_not_grown_into() {
         let pool = pool(1);
@@ -1318,7 +1210,7 @@ mod tests {
         let seconds = tick.as_secs_f64();
         let mut now = Instant::now();
 
-        // Every single query fails, however few are sent.
+        // Every query fails.
         for _ in 0..80 {
             let finished = (global.rate().min(ceiling) * seconds).max(1.0) as u64;
             drive(&pool.resolvers()[0], finished, 0);
@@ -1334,9 +1226,7 @@ mod tests {
         );
     }
 
-    /// A baseline is a reading, not a fact, and it was taken under conditions that
-    /// need not still hold. Left standing where a bad patch put it, it would hide
-    /// real congestion that arrived later, so it follows the loss down.
+    /// The baseline follows loss down, so a stale one can't hide later congestion.
     #[tokio::test]
     async fn a_baseline_follows_the_loss_down() {
         let pool = pool(1);
@@ -1345,8 +1235,7 @@ mod tests {
         let tick = Duration::from_millis(500);
         let seconds = tick.as_secs_f64();
 
-        // `loss` is given as a fraction of the rate in use, so a flat value is loss
-        // no pacing can fix and a scaled one is loss that answers to it.
+        // `loss` maps the current rate to a loss fraction.
         let step = |c: &mut AdaptiveController, loss: &dyn Fn(f64) -> f64| {
             let rate = global.rate().min(ceiling);
             let finished = (rate * seconds) as u64;
@@ -1375,10 +1264,8 @@ mod tests {
             "a smaller cost is still not congestion"
         );
 
-        // Now congestion: everything over a capacity three quarters of the ceiling
-        // is dropped, so a quarter of the queries are lost at full rate and none
-        // once the rate is under it. Against the stale 30% bar that would read as
-        // well inside the path's own cost and never be acted on at all.
+        // Now real congestion: 25% loss at full rate, which a stale 30% bar would
+        // never act on.
         let capacity = ceiling * 0.75;
         let mut lowest = f64::INFINITY;
         for _ in 0..20 {
@@ -1412,11 +1299,7 @@ mod tests {
         );
     }
 
-    /// Recon workloads always contain names that fail outright at any rate:
-    /// lame delegations, dead authoritative servers. Backing off cannot fix
-    /// them, so they must not ratchet the global rate down indefinitely. The
-    /// per-resolver path already guards against this (RETREAT_MUST_IMPROVE /
-    /// STALL_TICKS); the global path does not.
+    /// Names that fail at any rate must not ratchet the global rate down.
     #[tokio::test]
     async fn rate_insensitive_failures_do_not_collapse_the_global_rate() {
         let pool = pool(3);
@@ -1444,12 +1327,8 @@ mod tests {
         );
     }
 
-    /// The same case at brute-force scale, which has to be judged on its own: the
-    /// aggregate is the only signal there, and per-resolver pacing has to stay out
-    /// of it. Thousands of resolvers each carry a trickle, and with bbot's twenty
-    /// retries every unanswerable name times out on twenty-one of them, so the
-    /// per-attempt loss each resolver sees is far above anything a small pool
-    /// would. None of that is any one resolver's doing.
+    /// The same at brute-force scale, where the aggregate is the only signal and no
+    /// resolver may be paced individually.
     #[tokio::test]
     async fn rate_insensitive_failures_do_not_collapse_the_rate_at_brute_force_scale() {
         const RESOLVERS: usize = 2000;
@@ -1469,8 +1348,8 @@ mod tests {
             let failed = (finished_total * 3 / 100) - failed_total;
             failed_total += failed;
 
-            // Round-robin dispatch: an answered name is one attempt somewhere in
-            // the pool, an unanswerable one is every retry timing out in turn.
+            // Round-robin: one attempt per answered name, every retry timing out
+            // for the rest.
             let timeouts = failed * (1 + RETRIES);
             for n in 0..(finished - failed + timeouts) {
                 let r = &pool.resolvers()[cursor % RESOLVERS];
@@ -1497,11 +1376,8 @@ mod tests {
         );
     }
 
-    /// A resolver's edge steps down from its own standing rate, never to what was
-    /// observed. When something else caps the traffic reaching it -- the global
-    /// rate, the workload, the host -- the observed rate is that other limit's
-    /// number, and adopting it as the edge credits this resolver's pacing with
-    /// the other limit's doing.
+    /// A resolver's edge steps from its own rate, not to a rate another limit
+    /// imposed.
     #[tokio::test]
     async fn a_resolver_edge_steps_down_from_its_own_rate_not_another_limit() {
         let pool = pool(1);
@@ -1514,9 +1390,8 @@ mod tests {
         let standing = resolver.rate();
         assert!(standing < UNLIMITED_QPS, "heavy loss should earn a retreat");
 
-        // Then some other limit caps what reaches it far below its own pacing. It
-        // answers as many as before and loses fewer, so the retreat looks like it
-        // worked, but the rate it was measured at belongs to the other limit.
+        // Another limit now caps its traffic far below its own pacing; loss drops,
+        // so the retreat looks like it worked.
         drive(resolver, 110, 10);
         c.tick(&pool, Duration::from_secs(1), Instant::now());
 
@@ -1527,9 +1402,7 @@ mod tests {
         );
     }
 
-    /// A retreat that cost answered queries and bought nothing is taken back. The
-    /// resolver drops a fixed share of whatever it is sent, so stepping it down
-    /// only lost queries it would have answered.
+    /// A retreat that bought nothing is undone.
     #[tokio::test]
     async fn a_retreat_that_buys_nothing_is_taken_back() {
         let pool = pool(1);
@@ -1555,9 +1428,7 @@ mod tests {
         );
     }
 
-    /// A held edge keeps aging toward its expiry. Re-applying it when noise
-    /// reopens an episode is not a fresh sighting; counting it as one let a limit
-    /// set in a single bad moment outlive its expiry for as long as noise lasted.
+    /// A held edge still expires, even while noise keeps reopening episodes.
     #[tokio::test]
     async fn a_held_edge_still_expires() {
         let pool = pool(1);
@@ -1566,9 +1437,8 @@ mod tests {
         let start = Instant::now();
         let at = |s: u64| start + Duration::from_secs(s);
 
-        // A resolver saturated at 600 answers a second, followed down to it. Bounded,
-        // so a controller that never gets there fails the assertion below rather
-        // than spinning here.
+        // A resolver saturated at 600 answers a second, followed down to it.
+        // Bounded, so a regression fails below instead of looping.
         let mut t = 0;
         while t < 20 {
             t += 1;
@@ -1582,8 +1452,7 @@ mod tests {
         let held = resolver.rate();
         assert!(held < UNLIMITED_QPS, "the capacity should have been found");
 
-        // Then noise: every other window reads a few percent of loss, each
-        // reopening an episode that re-applies the edge without moving it.
+        // Noise: every other window reads a few percent of loss.
         let mut released = false;
         for _ in 0..EDGE_TTL.as_secs() + 10 {
             t += 1;
@@ -1599,12 +1468,7 @@ mod tests {
         );
     }
 
-    /// A window only shows a retreat working if a retreat shaped it. When noise
-    /// reopens an episode on a resolver already paced below its edge, the opening
-    /// retreat re-applies the edge and changes nothing, so the next window
-    /// measures the same rate again. Loss that improves there by chance has to
-    /// leave the resolver where it is: stepping on it walked a resolver down a
-    /// rung at a time for as long as the noise lasted.
+    /// Chance improvement on an unchanged rate must not step a resolver down.
     #[tokio::test]
     async fn noise_on_a_held_edge_does_not_step_a_resolver_down() {
         let pool = pool(1);
@@ -1613,9 +1477,8 @@ mod tests {
         let start = Instant::now();
         let at = |s: u64| start + Duration::from_secs(s);
 
-        // A resolver saturated at 600 answers a second, followed down to it. Bounded,
-        // so a controller that never gets there fails the assertion below rather
-        // than spinning here.
+        // A resolver saturated at 600 answers a second, followed down to it.
+        // Bounded, so a regression fails below instead of looping.
         let mut t = 0;
         while t < 20 {
             t += 1;
@@ -1629,8 +1492,8 @@ mod tests {
         let held = resolver.rate();
         assert!(held < UNLIMITED_QPS, "the capacity should have been found");
 
-        // One window reads 6% loss and reopens an episode; the next reads 4%, as
-        // though that had helped. Nothing was sent any differently.
+        // 6% then 4% loss at the same rate: looks like progress, but nothing
+        // changed.
         for percent in [6, 4] {
             t += 1;
             let sent = resolver.rate().min(1000.0) as u64;
@@ -1645,10 +1508,7 @@ mod tests {
         );
     }
 
-    /// Per-resolver loss that keeps crossing the threshold must not ratchet the
-    /// resolver down. Each lossy window opens a fresh episode, and each used to
-    /// record the rate it was measured at -- already the resolver's own retreat --
-    /// as a new and lower edge, so the rate stepped down once per crossing.
+    /// Loss crossing the threshold back and forth must not ratchet a resolver down.
     #[tokio::test]
     async fn loss_crossing_the_threshold_does_not_ratchet_a_resolver_down() {
         let pool = pool(1);
@@ -1658,8 +1518,7 @@ mod tests {
         let start = Instant::now();
 
         let mut first = None;
-        // Inside one edge lifetime, so nothing expires and only the ratchet could
-        // move the rate.
+        // Within one edge lifetime, so only a ratchet could move the rate.
         for i in 0..20u64 {
             let sent = resolver.rate().min(demand) as u64;
             // A fixed share no rate can fix, read as 6% and 1% by turns.
