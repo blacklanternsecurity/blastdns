@@ -452,7 +452,7 @@ impl ResolverHealth {
     fn decay_errors(&self) {
         let _ = self
             .consecutive_errors
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
     }
