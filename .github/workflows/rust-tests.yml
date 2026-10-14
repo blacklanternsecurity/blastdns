@@ -11,13 +11,13 @@ concurrency:
 
 jobs:
   rust-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -46,13 +46,13 @@ jobs:
         run: ./scripts/stop-test-dns.sh || true
 
   cli-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -75,7 +75,7 @@ jobs:
 
   rust-publish:
     needs: rust-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'push' && github.ref == 'refs/heads/stable'
 
     steps:

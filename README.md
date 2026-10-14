@@ -8,7 +8,7 @@
 [![Rust Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml)
 [![Python Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml)
 
-[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. Features include built-in caching, and high accuracy even with unreliable DNS servers. For details, see [Architecture](#architecture). BlastDNS is the main DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
+[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. It's designed to be faster the more resolvers you give it. Features include built-in caching, and high accuracy even with unreliable DNS servers. For details, see [Architecture](#architecture). BlastDNS is the main DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 There are three ways to use it:
 
@@ -18,16 +18,7 @@ There are three ways to use it:
 
 ## Benchmark
 
-100K DNS lookups against local `dnsmasq`, with 100 workers:
-
-This is one regime: a single resolver, no loss, no latency, which is the case that most favors raw dispatch and resembles no real workload. `scripts/benchmark.py` now reports several regimes — a resolver pool, injected loss, injected latency, and both socket transports — alongside delivery, retry amplification, completion percentiles, and socket plus connection-tracking peaks. Absolute rates here move over 30% between runs on shared CI hardware, so the ratio column is the durable figure.
-
-| Library         | Language | Time    | QPS    | Success | Failed | vs dnspython |
-|-----------------|----------|---------|--------|---------|--------|--------------|
-| massdns         | C        | 1.370s  | 72,998 | 100,000 | 0      | 28.63x       |
-| blastdns-cli    | Rust     | 1.654s  | 60,470 | 100,000 | 0      | 23.72x       |
-| blastdns-python | Python   | 2.485s  | 40,249 | 100,000 | 0      | 15.79x       |
-| dnspython       | Python   | 39.223s | 2,550  | 100,000 | 0      | 1.00x        |
+On every pull request, `scripts/benchmark.py` compares the PR's build against its base branch across several regimes, including a resolver pool, injected loss and latency, both socket transports, and names that never resolve. It posts the comparison on the PR, marking only changes that are statistically significant.
 
 ### CLI
 
@@ -635,9 +626,17 @@ The cost is connection-tracking state. Every query is a fresh source port, so ev
 
 With `adaptive` enabled (the default), BlastDNS does not need to be told how fast to go. It watches loss per resolver, and when a resolver starts dropping queries it records the rate at which that happened and holds below it. A configured `rate_limit` is a separate hard cap applied on top: adaptation happens either way, and the configured value only ever lowers the effective rate.
 
-A discovered per-resolver limit expires after a while so the controller probes upward again, which keeps one transient blip from capping the rest of a long run. The global limit has no expiry and does not need one: it is re-judged on every batch of finished queries and climbs straight back on clean ones.
+A discovered per-resolver limit expires after a while so the controller probes upward again, which keeps one transient blip from capping the rest of a long run. The global limit has no expiry and does not need one: it is re-judged on every batch of finished queries and climbs straight back on any that show no loss the rate can fix.
 
-Backing off is only repeated while it is working. A resolver earns its first retreat as soon as it starts losing queries, and further ones only while the loss is actually falling. That distinction matters because not all loss is caused by the rate: a resolver that drops a fixed share of what it receives, or one behind a lossy link, loses just as much however slowly it is asked, and retreating on every tick would walk the rate to a standstill without recovering a single query. Two readings in a row that fail to improve hold the rate where it is instead.
+Backing off is only repeated while it is working, for the global rate and for each resolver alike. The first sign of loss earns a retreat, and further ones come only while the loss is actually falling. That distinction matters because not all loss is caused by the rate. A recon target list always carries names that fail however slowly they are asked, such as lame delegations and dead authoritative servers. A resolver that drops a fixed share of what it receives, or one behind a lossy link, loses just as much at any rate. Retreating on every reading walks the rate to a standstill without recovering a single query. Measured on a local pool of 1,600 resolvers where 2.5% of names never answer, it took a brute-force capable of several thousand queries per second down to under thirty.
+
+So a retreat that fails to help marks the loss as the path's *baseline*. One reading settles it when the retreat cost answered queries, and two in a row when the loss merely failed to improve. From then on, congestion means loss above that baseline and not above zero, and the rate is handed back. The baseline follows the loss down as conditions improve, so a bar set during a bad patch cannot hide congestion that arrives later. Only a fresh stall can raise it.
+
+A falling loss is not by itself proof that retreating lowered it. A workload moving on from a bad patch of names lowers it too, and so does sampling noise, about half the time. Either one would read as success all the way down. So a retreat also has to keep the path delivering: it only counts as working if answered queries per second held up across it. Loss the rate is causing sits above a capacity, so a saturated path keeps answering at that capacity while the rate comes down to it. Loss the rate is not causing takes a fixed share of everything sent, so what gets answered falls with every cut. This holds for the whole client and for any single resolver alike.
+
+A single resolver's retreats carry two further guards. A retreat that fails its test is taken back, because all it bought was fewer answers from that resolver. And a resolver's pacing only steps down on a window that its own pacing actually shaped. When the global rate, the workload, or the host is what held its traffic down, the window says nothing about that resolver. Reading it as though it did walks the resolver's limit down to whatever those other limits happened to allow.
+
+A path answering almost nothing is the exception. With more than half of all queries failing outright, the global rate is held where it is and not handed back. There is no throughput to win back, and the volume may be what flattened the link. A clean batch still releases it.
 
 Loss is measured over a window at least as long as `request_timeout_ms`, because a query only counts as lost once its timeout expires. A shorter window puts a dispatch and its eventual timeout in different windows, so lowering the rate would drop the denominator while the previous rate's losses were still arriving — which reads as more than 100% loss and, worse, reads as *improvement* on the way back down.
 
@@ -647,7 +646,7 @@ The global ratio is judged once enough queries have finished to trust it, over a
 
 `Client.stats()` reports the current pacing rate per resolver, so a run that is going slowly can be explained rather than guessed at. Note the field is an instantaneous reading: a resolver that was throttled and has since recovered reports no rate, so it undercounts episodes rather than accumulating them.
 
-Per-resolver judgement needs enough queries against that one resolver to trust the ratio, which only happens when a resolver is carrying real load. Spread a few hundred queries per second across thousands of resolvers and no single one is individually measurable, so at brute-force scale the politeness bound is `max_inflight_per_resolver` rather than the controller — each resolver is capped at roughly `max_inflight_per_resolver / RTT` regardless.
+Per-resolver judgement needs enough queries against that one resolver to trust the ratio, which only happens when a resolver is carrying real load. A ratio built from a handful is mostly noise, and noise reads as a resolver that keeps starting to fail. So a resolver's window stays open for up to five request timeouts while it gathers a hundred queries, and a resolver that cannot gather them is left to the aggregate. Spread a few hundred queries per second across thousands of resolvers and no single one is individually measurable, so at brute-force scale the politeness bound is `max_inflight_per_resolver` rather than the controller — each resolver is capped at roughly `max_inflight_per_resolver / RTT` regardless.
 
 ### Optional Startup Probe
 
