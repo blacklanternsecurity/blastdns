@@ -1,85 +1,154 @@
 #!/usr/bin/env python3
-"""Benchmark blastdns across the regimes a caller actually runs in.
+"""Compare two blastdns builds across the regimes a caller actually runs in.
 
-The existing benchmark reports one number -- queries per second against a single
-local resolver with no impairment. That number moves 36% between identical
-commits on a shared CI runner, and no real workload resembles the regime, so it
-neither detects regressions nor predicts behavior.
+    python scripts/benchmark.py --base BASE_PYTHON --head HEAD_PYTHON
 
-This measures several regimes and reports, per regime:
+Each build is an interpreter whose environment has that build of blastdns
+installed. Every regime runs in a fresh process under each build, alternating
+which goes first each round so runner drift lands on both sides. The report shows
+medians side by side and bolds a change only when a t-test finds it significant
+after a Benjamini-Hochberg correction over every cell in the report, so a build
+compared against itself shows any bold at all only 1% of the time.
 
-  throughput          queries per second (report only -- not stable across hardware)
-  vs dnspython        same-run ratio, which is stable across hardware
-  unanswered          fraction of requested names that never came back at all
-  attempts/query      retry amplification, i.e. what the delivery cost
-  p50 / p99 / p100    completion percentiles; the tail is what sets wall clock
-  sockets             peak file descriptors held
-  conntrack           peak connection-tracking entries added
-
-Only the last five are worth gating on. Throughput belongs in the report so a
-human can see it, and nowhere near a pass/fail threshold.
-
-Impairment is generated in-process so it is deterministic and needs no root:
-`--impair loss=N` drops every Nth response, `latency=MS` delays every response.
-High-throughput regimes point at a real resolver instead, since a Python server
+Impairment is generated in-process and needs no root. Which queries it drops or
+refuses is random, seeded per round and shared by both builds. Regimes that need
+throughput point at a real resolver (`--real-resolver`), since a Python server
 would itself become the ceiling.
 """
 
 import argparse
 import asyncio
+import enum
 import json
+import math
 import os
-import shutil
+import random
+import statistics
 import subprocess
-import tempfile
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import sys
-
-import dns.message
-import dns.rcode
-import dns.rdatatype
-import dns.rrset
-
 CONNTRACK_COUNT = Path("/proc/sys/net/netfilter/nf_conntrack_count")
+# Loopback aliases one real resolver answers on, so a pool needs no extra servers.
+POOL_SIZE = 32
+# A Python server caps throughput, so impaired regimes are sized to finish quickly.
+IMPAIRED_QUERIES = 2000
+# Names starting with this are never answered by the impaired server.
+DEAD_PREFIX = "dead"
+FOOTPRINT_INTERVAL_S = 0.002
+# Every query goes to the network, and the global cap stays out of the way of the
+# per-resolver limit each regime sets.
+COMMON_CONFIG = {"cache_capacity": 0, "max_concurrency": 1000}
+# False discovery rate; also the chance of any bold when nothing changed.
+FALSE_DISCOVERY_RATE = 0.01
+# Smallest relative change worth bolding, however significant.
+MIN_EFFECT = 0.01
+
+
+# ---------------------------------------------------------------- regimes
+
+
+class Resolvers(enum.Enum):
+    REAL = "real"
+    POOL = "pool"
+    IMPAIRED = "impaired"
+
+
+@dataclass
+class Regime:
+    resolvers: Resolvers
+    # ClientConfig overrides on top of COMMON_CONFIG.
+    config: dict = field(default_factory=dict)
+    # ImpairedResolver options.
+    impair: dict = field(default_factory=dict)
+    # (names, one_in) segments, in order: every one_in-th name is never answered.
+    dead: tuple = ()
+
+    @property
+    def name(self):
+        if self.resolvers is Resolvers.REAL:
+            return "ceiling/1-resolver"
+        if self.resolvers is Resolvers.POOL:
+            kind = "persistent" if self.config.get("persistent_socket") else "resolvers"
+            return f"pool/{POOL_SIZE}-{kind}"
+        parts = []
+        if "loss_one_in" in self.impair:
+            parts.append(f"{100 / self.impair['loss_one_in']:g}%-loss")
+        if "refuse_one_in" in self.impair:
+            parts.append(f"{100 / self.impair['refuse_one_in']:g}%-REFUSED")
+        if "latency_ms" in self.impair:
+            parts.append(f"{self.impair['latency_ms']}ms-latency")
+        if self.dead:
+            parts.append("-then-".join(f"{100 / one_in:g}%" for _, one_in in self.dead) + "-dead-names")
+        return "impaired/" + "-".join(parts)
+
+    def hosts(self, num_queries):
+        if not self.dead:
+            count = IMPAIRED_QUERIES if self.resolvers is Resolvers.IMPAIRED else num_queries
+            return [f"{i}.bench.local" for i in range(count)]
+        hosts = []
+        for names, one_in in self.dead:
+            for j in range(names):
+                prefix = DEAD_PREFIX if j % one_in == 0 else ""
+                hosts.append(f"{prefix}{len(hosts)}.bench.local")
+        return hosts
+
+
+REGIMES = [
+    Regime(Resolvers.REAL, config={"max_inflight_per_resolver": 32}),
+    Regime(Resolvers.POOL),
+    Regime(Resolvers.POOL, config={"persistent_socket": True, "max_inflight_per_resolver": 8}),
+    Regime(Resolvers.IMPAIRED, config={"max_inflight_per_resolver": 32}, impair={"loss_one_in": 10}),
+    Regime(Resolvers.IMPAIRED, config={"max_inflight_per_resolver": 32}, impair={"refuse_one_in": 5}),
+    Regime(Resolvers.IMPAIRED, config={"max_inflight_per_resolver": 32}, impair={"latency_ms": 50}),
+    # Shaped like bbot's main client: a bad patch where a fifth of names never
+    # answer, then a steady 2.5%. Pacing can't fix either, so once the patch
+    # passes the rate has to come back.
+    Regime(
+        Resolvers.IMPAIRED,
+        config={"max_inflight_per_resolver": 25, "request_timeout_ms": 500, "max_retries": 1},
+        dead=((500, 5), (2500, 40)),
+    ),
+]
 
 
 # ---------------------------------------------------------------- impaired server
 
 
 class ImpairedResolver(asyncio.DatagramProtocol):
-    """A DNS server that answers everything, with optional loss and latency.
-
-    Deterministic by construction: the Nth query is the one dropped, so a run is
-    reproducible and a delivery number means something.
+    """A DNS server that answers everything, with optional loss, latency, refusals,
+    and names it never answers. Loss and refusals are random, from `seed`.
     """
 
-    def __init__(self, loss_one_in=0, latency_ms=0, refuse_one_in=0):
+    def __init__(self, loss_one_in=0, latency_ms=0, refuse_one_in=0, seed=0):
         self.loss_one_in = loss_one_in
         self.latency_ms = latency_ms
         self.refuse_one_in = refuse_one_in
-        self.received = 0
-        self.dropped = 0
+        self.rng = random.Random(seed)
         self.transport = None
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        self.received += 1
-        n = self.received
-        if self.loss_one_in and n % self.loss_one_in == 0:
-            self.dropped += 1
+        import dns.message
+        import dns.rcode
+        import dns.rdatatype
+        import dns.rrset
+
+        if self.loss_one_in and self.rng.random() < 1 / self.loss_one_in:
             return
         try:
             query = dns.message.from_wire(data)
         except Exception:
             return
+        if any(q.name.labels and q.name.labels[0].startswith(DEAD_PREFIX.encode()) for q in query.question):
+            return
         response = dns.message.make_response(query)
-        if self.refuse_one_in and n % self.refuse_one_in == 0:
+        if self.refuse_one_in and self.rng.random() < 1 / self.refuse_one_in:
             response.set_rcode(dns.rcode.REFUSED)
         else:
             for question in query.question:
@@ -93,16 +162,16 @@ class ImpairedResolver(asyncio.DatagramProtocol):
 
 
 class ThreadedImpaired:
-    """Runs an impaired resolver on its own event loop in its own thread.
+    """Runs an impaired resolver on its own event loop in its own thread, on a port
+    the OS picks.
 
     It cannot share the caller's loop: the client holds that loop while awaiting a
     batch, so a server on it could never answer the queries being awaited.
     """
 
-    def __init__(self, port, **kwargs):
-        self.port = port
+    def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.protocol = None
+        self.port = None
         self._loop = None
         self._thread = None
         self._ready = threading.Event()
@@ -112,8 +181,9 @@ class ThreadedImpaired:
         asyncio.set_event_loop(self._loop)
 
         async def boot():
-            self.protocol = ImpairedResolver(**self.kwargs)
-            await self._loop.create_datagram_endpoint(lambda: self.protocol, local_addr=("127.0.0.1", self.port))
+            protocol = ImpairedResolver(**self.kwargs)
+            transport, _ = await self._loop.create_datagram_endpoint(lambda: protocol, local_addr=("127.0.0.1", 0))
+            self.port = transport.get_extra_info("sockname")[1]
             self._ready.set()
 
         self._loop.run_until_complete(boot())
@@ -123,7 +193,7 @@ class ThreadedImpaired:
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
-            raise RuntimeError(f"impaired resolver on :{self.port} did not start")
+            raise RuntimeError("impaired resolver did not start")
         return self
 
     def __exit__(self, *exc):
@@ -137,9 +207,7 @@ class ThreadedImpaired:
 class Footprint:
     """Samples what the process is holding while a run is in flight."""
 
-    def __init__(self, pid=None, interval=0.002):
-        self.pid = pid or os.getpid()
-        self.interval = interval
+    def __init__(self):
         self.peak_fds = 0
         self.peak_conntrack = 0
         self.base_conntrack = self._conntrack()
@@ -154,7 +222,7 @@ class Footprint:
 
     def _fds(self):
         try:
-            return len(os.listdir(f"/proc/{self.pid}/fd"))
+            return len(os.listdir(f"/proc/{os.getpid()}/fd"))
         except OSError:
             return 0
 
@@ -162,7 +230,7 @@ class Footprint:
         while not self._stop.is_set():
             self.peak_fds = max(self.peak_fds, self._fds())
             self.peak_conntrack = max(self.peak_conntrack, self._conntrack())
-            self._stop.wait(self.interval)
+            self._stop.wait(FOOTPRINT_INTERVAL_S)
 
     def __enter__(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -178,380 +246,276 @@ class Footprint:
         return max(0, self.peak_conntrack - self.base_conntrack)
 
 
-# ---------------------------------------------------------------- results
+# ---------------------------------------------------------------- worker
 
 
-@dataclass
-class Result:
-    engine: str
-    regime: str
-    requested: int
-    delivered: int = 0
-    elapsed: float = 0.0
-    attempts: int = 0
-    marks: list = field(default_factory=list)
-    peak_fds: int = 0
-    conntrack: int = 0
-    resolvers_used: int = 0
-    inflight: int = 0
-    concurrency: int = 0
-    note: str = ""
-
-    @property
-    def qps(self):
-        return self.requested / self.elapsed if self.elapsed else 0
-
-    @property
-    def unanswered_pct(self):
-        missing = self.requested - self.delivered
-        return 100 * missing / self.requested if self.requested else 0
-
-    @property
-    def attempts_per_query(self):
-        return self.attempts / self.requested if self.requested and self.attempts else 0
-
-    def pct(self, p):
-        if not self.marks:
-            return None
-        ordered = sorted(self.marks)
-        return ordered[min(int(len(ordered) * p / 100), len(ordered) - 1)]
-
-
-# ---------------------------------------------------------------- engines
-
-
-# A persistent socket multiplexes through one bounded channel, so this is the most
-# any single resolver can carry on that transport. Kept here so a new regime cannot
-# quietly configure past it and report the resulting collapse as a measurement.
-PERSISTENT_INFLIGHT_LIMIT = 32
-
-
-async def run_blastdns(hosts, resolvers, regime, persistent=False, inflight=2, concurrency=1000):
+async def run_blastdns(hosts, resolvers, regime):
     from blastdns import Client, ClientConfig, DNSError
 
-    if persistent and inflight > PERSISTENT_INFLIGHT_LIMIT:
-        raise ValueError(
-            f"regime {regime!r} asks for {inflight} in flight per resolver on a "
-            f"persistent socket, which cannot carry more than "
-            f"{PERSISTENT_INFLIGHT_LIMIT}"
-        )
-
-    client = Client(
-        resolvers,
-        ClientConfig(
-            max_concurrency=concurrency,
-            max_inflight_per_resolver=inflight,
-            persistent_socket=persistent,
-            cache_capacity=0,
-            request_timeout_ms=1000,
-            max_retries=10,
-            adaptive=True,
-        ),
-    )
-    # Warm up before timing. Building sockets and probing costs the same whatever
-    # the query count, so leaving it inside the measurement makes two runs at
-    # different sizes incomparable.
+    client = Client(resolvers, ClientConfig(**COMMON_CONFIG, **regime.config))
+    # Warm up before timing: building sockets costs the same at any query count.
     async for _ in client.resolve_batch_full(["warmup.invalid"], "A"):
         pass
 
-    result = Result("blastdns", regime, len(hosts))
-    # Report the per-resolver depth separately from the aggregate. The transport
-    # bound that matters for persistent sockets is per resolver, so showing only a
-    # total invites reading a valid config as one that exceeds it.
-    result.inflight = inflight
-    result.concurrency = min(concurrency, inflight * len(resolvers))
+    marks, delivered = [], 0
     with Footprint() as fp:
         start = time.monotonic()
         async for _host, item in client.resolve_batch_full(hosts, "A"):
-            result.marks.append(time.monotonic() - start)
+            marks.append(time.monotonic() - start)
             if not isinstance(item, DNSError):
-                result.delivered += 1
-        result.elapsed = time.monotonic() - start
-    stats = client.stats()
-    result.attempts = sum(s.attempted for s in stats)
-    result.resolvers_used = sum(1 for s in stats if s.attempted > 0)
-    result.peak_fds, result.conntrack = fp.peak_fds, fp.conntrack_added
-    return result
+                delivered += 1
+        elapsed = time.monotonic() - start
+
+    marks.sort()
+
+    def pct(p):
+        return marks[min(int(len(marks) * p / 100), len(marks) - 1)] if marks else None
+
+    attempts = sum(s.attempted for s in client.stats())
+    return {
+        "qps": len(hosts) / elapsed if elapsed else 0,
+        "unanswered_pct": 100 * (len(hosts) - delivered) / len(hosts),
+        "attempts_per_query": attempts / len(hosts),
+        "p50": pct(50),
+        "p99": pct(99),
+        "p100": pct(100),
+        "peak_fds": fp.peak_fds,
+        "conntrack": fp.conntrack_added,
+    }
 
 
-async def run_dnspython(hosts, resolvers, regime, workers=100):
-    import dns.asyncresolver
-
-    resolver = dns.asyncresolver.Resolver(configure=False)
-    host, _, port = resolvers[0].partition(":")
-    resolver.nameservers = [host]
-    resolver.port = int(port or 53)
-    resolver.lifetime = 2.0
-
-    result = Result("dnspython", regime, len(hosts))
-    result.inflight = workers
-    result.concurrency = workers
-    queue = asyncio.Queue()
-    for name in hosts:
-        queue.put_nowait(name)
-
-    async def worker():
-        while True:
-            try:
-                name = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            try:
-                await resolver.resolve(name, "A")
-                result.delivered += 1
-            except Exception:
-                pass
-            result.marks.append(time.monotonic() - start)
-
-    with Footprint() as fp:
-        start = time.monotonic()
-        await asyncio.gather(*(worker() for _ in range(workers)))
-        result.elapsed = time.monotonic() - start
-    result.peak_fds, result.conntrack = fp.peak_fds, fp.conntrack_added
-    return result
+async def worker(regime, args):
+    hosts = regime.hosts(args.num_queries)
+    if regime.resolvers is Resolvers.REAL:
+        return await run_blastdns(hosts, [args.real_resolver], regime)
+    if regime.resolvers is Resolvers.POOL:
+        _, _, port = args.real_resolver.partition(":")
+        pool = [f"127.0.0.{i}:{port}" for i in range(1, POOL_SIZE + 1)]
+        return await run_blastdns(hosts, pool, regime)
+    with ThreadedImpaired(seed=args.seed, **regime.impair) as server:
+        return await run_blastdns(hosts, [f"127.0.0.1:{server.port}"], regime)
 
 
-def run_massdns(hosts, resolvers, regime):
-    binary = shutil.which("massdns")
-    if not binary:
-        r = Result("massdns", regime, len(hosts))
-        r.note = "not installed"
-        return r
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as hf:
-        hf.write("\n".join(hosts))
-        hosts_path = hf.name
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as rf:
-        rf.write("\n".join(resolvers))
-        resolvers_path = rf.name
-
-    result = Result("massdns", regime, len(hosts))
-    # massdns is a batch tool: it reports no per-query timing, so percentiles are
-    # left unset rather than invented.
-    cmd = [binary, "-r", resolvers_path, "-t", "A", "-o", "J", "-q", hosts_path]
-    start = time.monotonic()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    with Footprint(pid=proc.pid) as fp:
-        try:
-            out, _ = proc.communicate(timeout=120)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, _ = proc.communicate()
-            result.note = "timed out after 120s"
-    result.elapsed = time.monotonic() - start
-    for line in out.splitlines():
-        try:
-            if json.loads(line).get("data", {}).get("answers"):
-                result.delivered += 1
-        except Exception:
-            pass
-    result.peak_fds, result.conntrack = fp.peak_fds, fp.conntrack_added
-    os.unlink(hosts_path)
-    os.unlink(resolvers_path)
-    return result
+# ---------------------------------------------------------------- comparison
 
 
-# ---------------------------------------------------------------- regimes
+def run_one(python, regime, args, seed):
+    cmd = [
+        python,
+        __file__,
+        "--worker",
+        regime.name,
+        "-n",
+        str(args.num_queries),
+        "--real-resolver",
+        args.real_resolver,
+        "--seed",
+        str(seed),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.limit)
+    except subprocess.TimeoutExpired:
+        return {"note": f"did not finish within {args.limit}s"}
+    if out.returncode != 0:
+        lines = (out.stderr or "").strip().splitlines()
+        return {"note": f"failed: {lines[-1] if lines else 'exit ' + str(out.returncode)}"}
+    return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-async def main():
+def compare(args):
+    """Run every regime under both builds and print the report. Returns how many
+    runs measured nothing."""
+    builds = {"base": args.base, "head": args.head}
+    regimes = [r for r in REGIMES if not args.only or args.only in r.name]
+    results = {r.name: {"base": [], "head": []} for r in regimes}
+    for rnd in range(args.rounds):
+        order = ["base", "head"] if rnd % 2 == 0 else ["head", "base"]
+        for regime in regimes:
+            for build in order:
+                print(f"  .. round {rnd + 1}/{args.rounds} {regime.name} {build}", file=sys.stderr, flush=True)
+                results[regime.name][build].append(run_one(builds[build], regime, args, seed=rnd))
+    report(results, args)
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(results, indent=2))
+    return sum("note" in r for runs in results.values() for side in runs.values() for r in side)
+
+
+# ---------------------------------------------------------------- statistics
+
+
+def _beta_continued_fraction(a, b, x):
+    """Lentz's method for the continued fraction of the incomplete beta function."""
+    tiny = 1e-300
+    c, d = 1.0, 1 - (a + b) * x / (a + 1)
+    d = 1 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 300):
+        for numerator in (
+            m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+            -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1)),
+        ):
+            d = 1 + numerator * d
+            d = 1 / (d if abs(d) > tiny else tiny)
+            c = 1 + numerator / c
+            c = c if abs(c) > tiny else tiny
+            h *= d * c
+        if abs(d * c - 1) < 1e-14:
+            break
+    return h
+
+
+def regularized_beta(a, b, x):
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    log_front = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x)
+    if x < (a + 1) / (a + b + 2):
+        return math.exp(log_front) * _beta_continued_fraction(a, b, x) / a
+    return 1 - math.exp(log_front) * _beta_continued_fraction(b, a, 1 - x) / b
+
+
+def t_test_p(base, head):
+    """Two-sided p-value of a pooled two-sample t-test that the samples share a mean.
+
+    Pooled rather than Welch: both builds get the same number of rounds, which keeps
+    it robust to unequal spread, and it keeps its degrees of freedom when one build
+    is noisier, which Welch at a handful of rounds does not.
+    """
+    nb, nh = len(base), len(head)
+    df = nb + nh - 2
+    pooled = ((nb - 1) * statistics.variance(base) + (nh - 1) * statistics.variance(head)) / df
+    diff = statistics.fmean(head) - statistics.fmean(base)
+    if pooled == 0:
+        return 1.0 if diff == 0 else 0.0
+    t = diff / math.sqrt(pooled * (1 / nb + 1 / nh))
+    return regularized_beta(df / 2, 0.5, df / (df + t * t))
+
+
+def discoveries(p_values, rate):
+    """Benjamini-Hochberg: the largest p-value still counted as a discovery, or None."""
+    ordered = sorted(p_values)
+    passing = [p for k, p in enumerate(ordered, 1) if p <= k * rate / len(ordered)]
+    return passing[-1] if passing else None
+
+
+# ---------------------------------------------------------------- report
+
+
+@dataclass
+class Metric:
+    key: str
+    label: str
+    fmt: object
+    # In the headline table rather than the details.
+    headline: bool = False
+    # Shown and judged as a relative change.
+    relative: bool = True
+
+
+METRICS = [
+    Metric("qps", "qps", lambda v: f"{v:,.0f}", headline=True),
+    Metric("unanswered_pct", "unanswered", lambda v: f"{v:.2f}%", headline=True, relative=False),
+    Metric("p99", "p99", lambda v: f"{v:.3f}s", headline=True),
+    Metric("attempts_per_query", "attempts/query", lambda v: f"{v:.2f}", headline=True, relative=False),
+    Metric("p50", "p50", lambda v: f"{v:.3f}s"),
+    Metric("p100", "p100", lambda v: f"{v:.3f}s"),
+    Metric("peak_fds", "sockets", lambda v: f"{v:,.0f}"),
+    Metric("conntrack", "conntrack", lambda v: f"{v:,.0f}"),
+]
+
+
+def change_text(change):
+    return f"{change:+.1%}" if abs(change) < 0.1 else f"{change:+.0%}"
+
+
+@dataclass
+class Cell:
+    text: str
+    p: float = None
+    meaningful: bool = False
+
+
+def cell(base_runs, head_runs, metric):
+    b = [r[metric.key] for r in base_runs if r.get(metric.key) is not None]
+    h = [r[metric.key] for r in head_runs if r.get(metric.key) is not None]
+    if not b or not h:
+        notes = {r["note"] for r in base_runs + head_runs if "note" in r}
+        return Cell("_" + "; ".join(sorted(notes)) + "_" if notes else "n/a")
+    bm, hm = statistics.median(b), statistics.median(h)
+    text = f"{metric.fmt(bm)} → {metric.fmt(hm)}"
+    meaningful = metric.fmt(bm) != metric.fmt(hm)
+    if metric.relative and bm:
+        change = (hm - bm) / bm
+        text += f" ({change_text(change)})"
+        meaningful = abs(change) >= MIN_EFFECT
+    p = None
+    if len(b) > 1 and len(h) > 1:
+        # Rates and times vary in proportion to their size, so compare them as logs.
+        if metric.relative and min(b + h) > 0:
+            b, h = [math.log(v) for v in b], [math.log(v) for v in h]
+        p = t_test_p(b, h)
+    return Cell(text, p, meaningful)
+
+
+def report(results, args):
+    cells = {name: {m.key: cell(runs["base"], runs["head"], m) for m in METRICS} for name, runs in results.items()}
+    p_values = [c.p for row in cells.values() for c in row.values() if c.p is not None]
+    cutoff = discoveries(p_values, FALSE_DISCOVERY_RATE) if p_values else None
+
+    def render(c):
+        bold = cutoff is not None and c.p is not None and c.p <= cutoff and c.meaningful
+        return f"**{c.text}**" if bold else c.text
+
+    def table(metrics):
+        print("| regime | " + " | ".join(m.label for m in metrics) + " |")
+        print("|---" * (len(metrics) + 1) + "|")
+        for name, row in cells.items():
+            print(f"| {name} | " + " | ".join(render(row[m.key]) for m in metrics) + " |")
+
+    rounds = f"{args.rounds} interleaved round{'s' if args.rounds != 1 else ''}"
+    print("## DNS Resolver Benchmark\n")
+    print(
+        f"`{args.head_label}` against `{args.base_label}`, base → head, median of {rounds}. "
+        f"**Bold** is significant across all {len(p_values)} comparisons "
+        f"(Benjamini-Hochberg at {FALSE_DISCOVERY_RATE:.0%}); the rest is noise.\n"
+    )
+    table([m for m in METRICS if m.headline])
+    print("\n<details><summary>All metrics</summary>\n")
+    table([m for m in METRICS if not m.headline])
+    print("\n</details>")
+
+
+# ---------------------------------------------------------------- entry
+
+
+def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--base", help="interpreter with the base build of blastdns")
+    p.add_argument("--head", help="interpreter with the head build of blastdns")
+    p.add_argument("--base-label", default="base")
+    p.add_argument("--head-label", default="head")
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--limit", type=int, default=120, help="seconds before a run counts as not finishing")
     p.add_argument("-n", "--num-queries", type=int, default=20000)
-    p.add_argument("--real-resolver", default="127.0.0.1:5353", help="unimpaired server for ceiling regimes")
+    p.add_argument("--real-resolver", default="127.0.0.1:5353", help="unimpaired server for throughput regimes")
+    p.add_argument("--only", help="run only regimes whose name contains this")
     p.add_argument("--json-out")
+    p.add_argument("--worker", help=argparse.SUPPRESS)
+    p.add_argument("--seed", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args()
 
-    hosts = [f"{i}.bench.local" for i in range(args.num_queries)]
-    small = hosts[: max(2000, args.num_queries // 10)]
-    real = args.real_resolver
-    # One server answers on every loopback alias, so a pool of N distinct resolver
-    # entries needs no extra servers.
-    host, _, port = real.partition(":")
-    pool = [f"127.0.0.{i}:{port}" for i in range(1, 33)]
-
-    results = []
-
-    def step(msg):
-        print(f"  .. {msg}", file=sys.stderr, flush=True)
-
-    async def bounded(coro, engine, regime, requested, limit=120):
-        """Cap every regime. Not finishing is itself a result worth reporting."""
-        try:
-            return await asyncio.wait_for(coro, timeout=limit)
-        except asyncio.TimeoutError:
-            r = Result(engine, regime, requested)
-            r.note = f"did not finish within {limit}s"
-            print(f"     ! {engine}/{regime} did not finish", file=sys.stderr, flush=True)
-            return r
-
-    # Regimes against the real resolver: dispatch ceiling and pool behavior.
-    step("blastdns ceiling")
-    results.append(
-        await bounded(
-            run_blastdns(hosts, [real], "ceiling/1-resolver", inflight=32),
-            "blastdns",
-            "ceiling/1-resolver",
-            len(hosts),
-        )
-    )
-    step("dnspython ceiling")
-    results.append(
-        await bounded(
-            run_dnspython(small, [real], "ceiling/1-resolver"), "dnspython", "ceiling/1-resolver", len(small)
-        )
-    )
-    step("massdns ceiling")
-    results.append(
-        await bounded(
-            asyncio.to_thread(run_massdns, hosts, [real], "ceiling/1-resolver"),
-            "massdns",
-            "ceiling/1-resolver",
-            len(hosts),
-        )
-    )
-
-    step("blastdns pool")
-    results.append(
-        await bounded(run_blastdns(hosts, pool, "pool/32-resolvers"), "blastdns", "pool/32-resolvers", len(hosts))
-    )
-    step("massdns pool")
-    results.append(
-        await bounded(
-            asyncio.to_thread(run_massdns, hosts, pool, "pool/32-resolvers"),
-            "massdns",
-            "pool/32-resolvers",
-            len(hosts),
-        )
-    )
-    step("blastdns pool persistent")
-    results.append(
-        await bounded(
-            run_blastdns(hosts, pool, "pool/32-persistent", persistent=True, inflight=8),
-            "blastdns",
-            "pool/32-persistent",
-            len(hosts),
-        )
-    )
-
-    # Impaired regimes: server is in-process, so throughput is capped by it. The
-    # point here is delivery and tail, not speed.
-    imp_port = 15399
-    with ThreadedImpaired(imp_port, loss_one_in=10):
-        imp = [f"127.0.0.1:{imp_port}"]
-        step("blastdns loss")
-        results.append(
-            await bounded(
-                run_blastdns(small, imp, "impaired/10%-loss", inflight=32), "blastdns", "impaired/10%-loss", len(small)
-            )
-        )
-        step("massdns loss")
-        results.append(
-            await bounded(
-                asyncio.to_thread(run_massdns, small, imp, "impaired/10%-loss"),
-                "massdns",
-                "impaired/10%-loss",
-                len(small),
-            )
-        )
-
-    with ThreadedImpaired(imp_port + 1, refuse_one_in=5):
-        imp = [f"127.0.0.1:{imp_port + 1}"]
-        step("blastdns refused")
-        results.append(
-            await bounded(
-                run_blastdns(small, imp, "impaired/20%-REFUSED", inflight=32),
-                "blastdns",
-                "impaired/20%-REFUSED",
-                len(small),
-            )
-        )
-        step("massdns refused")
-        results.append(
-            await bounded(
-                asyncio.to_thread(run_massdns, small, imp, "impaired/20%-REFUSED"),
-                "massdns",
-                "impaired/20%-REFUSED",
-                len(small),
-            )
-        )
-
-    with ThreadedImpaired(imp_port + 2, latency_ms=50):
-        imp = [f"127.0.0.1:{imp_port + 2}"]
-        step("blastdns latency")
-        results.append(
-            await bounded(
-                run_blastdns(small, imp, "impaired/50ms-latency", inflight=32),
-                "blastdns",
-                "impaired/50ms-latency",
-                len(small),
-            )
-        )
-
-    report(results, args.json_out)
-
-
-def report(results, json_out=None):
-    by_regime = {}
-    for r in results:
-        by_regime.setdefault(r.regime, []).append(r)
-
-    print("## DNS Resolver Benchmark\n")
-    print("Throughput is reported, never gated: it moves with hardware. The stable")
-    print("columns are unanswered, attempts/query, sockets, and conntrack.\n")
-
-    for regime, group in by_regime.items():
-        baseline = next((r.qps for r in group if r.engine == "dnspython"), None)
-        print(f"### {regime}\n")
-        header = (
-            "| engine | in flight | qps | vs dnspython | unanswered | atts/query | "
-            "p50 | p99 | p100 | sockets | conntrack |"
-        )
-        print(header)
-        print("|" + "---|" * 11)
-        for r in group:
-            if r.note:
-                print(f"| {r.engine} | | _{r.note}_ | | | | | | | | |")
-                continue
-            ratio = f"{r.qps / baseline:.2f}x" if baseline else "-"
-            p50 = f"{r.pct(50):.3f}s" if r.pct(50) is not None else "n/a"
-            p99 = f"{r.pct(99):.3f}s" if r.pct(99) is not None else "n/a"
-            p100 = f"{r.pct(100):.3f}s" if r.pct(100) is not None else "n/a"
-            atts = f"{r.attempts_per_query:.2f}" if r.attempts_per_query else "n/a"
-            # e.g. "8/res, 256 total" -- the per-resolver figure is the one any
-            # transport limit applies to.
-            if not r.inflight:
-                depth = "-"
-            elif r.concurrency and r.concurrency != r.inflight:
-                depth = f"{r.inflight}/res, {r.concurrency} total"
-            else:
-                depth = str(r.inflight)
-            print(
-                f"| {r.engine} | {depth} | {r.qps:,.0f} | {ratio} | {r.unanswered_pct:.3f}% | {atts} "
-                f"| {p50} | {p99} | {p100} | {r.peak_fds:,} | {r.conntrack:,} |"
-            )
-        print()
-
-    if json_out:
-        payload = [
-            {
-                "engine": r.engine,
-                "regime": r.regime,
-                "qps": round(r.qps),
-                "unanswered_pct": round(r.unanswered_pct, 4),
-                "attempts_per_query": round(r.attempts_per_query, 3),
-                "p99": r.pct(99),
-                "p100": r.pct(100),
-                "peak_fds": r.peak_fds,
-                "conntrack": r.conntrack,
-                "resolvers_used": r.resolvers_used,
-                "inflight_per_resolver": r.inflight,
-                "concurrency": r.concurrency,
-            }
-            for r in results
-            if not r.note
-        ]
-        Path(json_out).write_text(json.dumps(payload, indent=2))
-        print(f"_machine-readable results written to {json_out}_")
+    if args.worker:
+        regime = next(r for r in REGIMES if r.name == args.worker)
+        print(json.dumps(asyncio.run(worker(regime, args))))
+        return
+    if not (args.base and args.head):
+        p.error("--base and --head are required")
+    failed = compare(args)
+    if failed:
+        print(f"{failed} run(s) measured nothing; see the report", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

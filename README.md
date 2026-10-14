@@ -8,7 +8,7 @@
 [![Rust Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/rust-tests.yml)
 [![Python Tests](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml/badge.svg)](https://github.com/blacklanternsecurity/blastdns/actions/workflows/python-tests.yml)
 
-[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. Like [massdns](https://github.com/blechschmidt/massdns), it's designed to be faster the more resolvers you give it. Features include built-in caching, and high accuracy even with unreliable DNS servers. For details, see [Architecture](#architecture). BlastDNS is the main DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
+[BlastDNS](https://github.com/blacklanternsecurity/blastdns) is an ultra-fast DNS resolver written in Rust. It's designed to be faster the more resolvers you give it. Features include built-in caching, and high accuracy even with unreliable DNS servers. For details, see [Architecture](#architecture). BlastDNS is the main DNS library used by [BBOT](https://github.com/blacklanternsecurity/bbot).
 
 There are three ways to use it:
 
@@ -18,16 +18,7 @@ There are three ways to use it:
 
 ## Benchmark
 
-100K DNS lookups against local `dnsmasq`, with 100 workers:
-
-This is one regime: a single resolver, no loss, no latency, which is the case that most favors raw dispatch and resembles no real workload. `scripts/benchmark.py` now reports several regimes — a resolver pool, injected loss, injected latency, and both socket transports — alongside delivery, retry amplification, completion percentiles, and socket plus connection-tracking peaks. Absolute rates here move over 30% between runs on shared CI hardware, so the ratio column is the durable figure.
-
-| Library         | Language | Time    | QPS    | Success | Failed | vs dnspython |
-|-----------------|----------|---------|--------|---------|--------|--------------|
-| massdns         | C        | 1.370s  | 72,998 | 100,000 | 0      | 28.63x       |
-| blastdns-cli    | Rust     | 1.654s  | 60,470 | 100,000 | 0      | 23.72x       |
-| blastdns-python | Python   | 2.485s  | 40,249 | 100,000 | 0      | 15.79x       |
-| dnspython       | Python   | 39.223s | 2,550  | 100,000 | 0      | 1.00x        |
+On every pull request, `scripts/benchmark.py` compares the PR's build against its base branch across several regimes, including a resolver pool, injected loss and latency, both socket transports, and names that never resolve. It posts the comparison on the PR, marking only changes that are statistically significant.
 
 ### CLI
 

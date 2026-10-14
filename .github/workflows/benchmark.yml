@@ -1,8 +1,6 @@
 name: Benchmark
 
 on:
-  push:
-    branches: [dev, stable]
   pull_request:
 
 concurrency:
@@ -17,19 +15,24 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # The PR merged into its base, so the comparison isolates exactly this change.
       - uses: actions/checkout@v7
+
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .bench-base
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v2
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Build MassDNS
-        run: |
-          git clone --depth 1 https://github.com/blechschmidt/massdns.git /tmp/massdns
-          cd /tmp/massdns && make
-          sudo cp /tmp/massdns/bin/massdns /usr/local/bin/massdns
+        with:
+          # A base built with a newer toolchain can carry warnings; that's for the
+          # test workflows to catch, not a reason to skip the comparison.
+          build-warnings: warn
+          cache-workspaces: |
+            . -> target
+            .bench-base -> target
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -39,11 +42,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Install Python dependencies
-        run: uv sync
+      - name: Build head
+        run: uv sync && uv run maturin develop --release
 
-      - name: Build Python extension
-        run: uv run maturin develop --release
+      - name: Build base
+        working-directory: .bench-base
+        run: uv sync && uv run maturin develop --release
 
       - name: Install dnsmasq
         run: sudo apt-get update && sudo apt-get install -y dnsmasq
@@ -52,9 +56,22 @@ jobs:
         run: sudo ./scripts/start-test-dns.sh
 
       - name: Run benchmark
-        run: uv run python scripts/benchmark.py > benchmark_report.md
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          uv run python scripts/benchmark.py \
+            --base .bench-base/.venv/bin/python \
+            --head .venv/bin/python \
+            --base-label "$BASE_REF @ ${BASE_SHA::7}" \
+            --head-label "this PR @ ${HEAD_SHA::7}" \
+            > benchmark_report.md
 
+      # The report still gets shown and posted when runs failed: those are the
+      # results that matter most.
       - name: Display benchmark results
+        if: ${{ !cancelled() }}
         run: cat benchmark_report.md
 
       - name: Upload benchmark results
@@ -70,7 +87,7 @@ jobs:
         run: sudo ./scripts/stop-test-dns.sh || true
 
       - name: Comment benchmark results on PR
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         uses: actions/github-script@v9
         with:
           script: |
