@@ -10,6 +10,10 @@
 //! requires loss in the aggregate across resolvers that have answered at least
 //! once, so a large public list full of dead entries cannot drag the rate down.
 //!
+//! Not all loss is the rate's doing: some names fail at any rate. A retreat is
+//! only repeated while it visibly helps, and loss it cannot move becomes a
+//! baseline that later loss is judged against.
+//!
 //! Retries are never given up, only paced. Abandoning them under load was tried
 //! and measured: it took unanswered queries from 0% to 3.5% on a 5,000-name
 //! brute-force, losing real results to save load that was never shown to be a
@@ -38,10 +42,15 @@ use crate::{
 const RETREAT: f64 = 0.85;
 /// Per-tick multiplier when climbing back toward the target.
 const GROWTH: f64 = 1.25;
-/// Loss fraction above which a resolver counts as degraded.
+/// Loss above the baseline at which a path counts as congested.
 const LOSS_THRESHOLD: f64 = 0.02;
-/// Queries against one resolver in a tick before its own loss ratio is trusted.
-const MIN_SAMPLES: u64 = 20;
+/// Queries against one resolver before its own loss ratio is trusted. Fewer is
+/// mostly noise, and noise reads as a resolver that keeps starting to fail.
+const MIN_SAMPLES: u64 = 100;
+/// Request timeouts a resolver's window may stay open gathering `MIN_SAMPLES`.
+/// A resolver that can't fill one is left to the aggregate, which keeps
+/// brute-force scale (a trickle per resolver) out of per-resolver pacing.
+const MAX_WINDOW_TIMEOUTS: f64 = 5.0;
 /// Queries that must finish before the global failure rate is trusted. Gathered
 /// over as many ticks as it takes, so a low rate is judged late rather than never.
 const MIN_AGGREGATE_SAMPLES: u64 = 100;
@@ -57,26 +66,121 @@ const MIN_RATE_QPS: f64 = 1.0;
 ///
 /// Backing off only helps when the rate is what caused the loss. A resolver
 /// dropping a fixed share of queries loses just as much at any rate, and retreating
-/// every tick would walk it to the floor without recovering a query. Comparing
-/// against the best loss of the episode rather than merely the previous tick keeps
-/// sampling noise from looking like progress; the margin stays small because real
-/// convergence toward a capacity limit improves gradually.
+/// every tick would walk it to the floor without recovering a query. The margin
+/// stays small because real convergence toward a capacity limit improves gradually.
 const RETREAT_MUST_IMPROVE: f64 = 0.99;
-/// Consecutive ticks without improvement before a resolver's rate is held.
+/// Share of an episode's best answered rate a retreat must keep to count as
+/// working. Falling loss alone can be noise or a changing workload; a saturated
+/// path keeps answering at capacity when sent less, a fixed-share loss doesn't.
+const RETREAT_MUST_DELIVER: f64 = 0.95;
+/// Outright-failure share above which the global rate holds rather than grows:
+/// a path answering almost nothing has no throughput to win back.
+const MAX_BASELINE_LOSS: f64 = 0.5;
+/// Consecutive windows without improvement before the loss becomes the baseline.
+/// A retreat that cost answers needs only one.
 ///
-/// One flat tick is not proof: loss is a sampled ratio, and a noisy reading during
-/// a genuine convergence would otherwise stop it short of the resolver's real
+/// One flat window is not proof: loss is a sampled ratio, and a noisy reading
+/// during a genuine convergence would otherwise stop it short of the path's real
 /// capacity. Requiring a couple in a row still bounds how far a rate can walk when
 /// the loss truly is not ours to fix.
 const STALL_TICKS: u8 = 2;
+
+/// What a window of loss is worth doing about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// Worth retreating from. `converging`: the retreats so far are working
+    /// (never set on an episode's first window).
+    Congested { converging: bool },
+    /// Nothing to act on.
+    Clear,
+    /// Retreating stopped helping; this loss is now the baseline.
+    Baseline,
+}
+
+/// Decides whether a window's loss is the rate's fault: congestion is loss above
+/// a learned baseline, and a retreat continues only while loss falls and answers
+/// hold up.
+#[derive(Default, Clone)]
+struct LossJudge {
+    /// Lowest loss this episode.
+    best: Option<f64>,
+    /// Highest answered rate this episode.
+    best_delivered: Option<f64>,
+    /// Consecutive windows a retreat hasn't earned its keep.
+    stalled: u8,
+    /// Loss the path shows at any rate.
+    baseline: Option<f64>,
+}
+
+impl LossJudge {
+    /// `delivered` is answered queries per second over the same window as `loss`.
+    fn judge(&mut self, loss: f64, delivered: f64) -> Verdict {
+        // The baseline follows the loss down, so a bar set in a bad patch can't hide
+        // later congestion; only a fresh stall raises it.
+        if let Some(baseline) = self.baseline {
+            self.baseline = Some(baseline.min(loss));
+        }
+
+        // Congestion is loss above the baseline, not above zero.
+        if loss <= self.baseline.unwrap_or(0.0) + LOSS_THRESHOLD {
+            self.end_episode();
+            return Verdict::Clear;
+        }
+
+        // The first sight of loss earns a retreat; after that, loss must keep
+        // falling and answers must hold up.
+        let improving = match self.best {
+            Some(best) => loss < best * RETREAT_MUST_IMPROVE,
+            None => true,
+        };
+        let paying = match self.best_delivered {
+            Some(best) => delivered >= best * RETREAT_MUST_DELIVER,
+            None => true,
+        };
+        let converging = self.best.is_some() && improving && paying;
+        if improving && paying {
+            self.stalled = 0;
+        } else {
+            self.stalled = self.stalled.saturating_add(1);
+            // A retreat that cost answers is settled at once; loss that merely
+            // failed to improve gets another window.
+            if !paying || self.stalled >= STALL_TICKS {
+                self.baseline = Some(loss);
+                self.end_episode();
+                return Verdict::Baseline;
+            }
+        }
+
+        self.best = Some(match self.best {
+            Some(best) => best.min(loss),
+            None => loss,
+        });
+        self.best_delivered = Some(match self.best_delivered {
+            Some(best) => best.max(delivered),
+            None => delivered,
+        });
+        Verdict::Congested { converging }
+    }
+
+    /// Start the next episode fresh. The baseline stays: it belongs to the path.
+    fn end_episode(&mut self) {
+        self.best = None;
+        self.best_delivered = None;
+        self.stalled = 0;
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 struct Observation {
     attempted: u64,
     lost: u64,
+    /// Counted when the answer arrives; `attempted - lost` lags, since a loss lands
+    /// a timeout after its dispatch.
+    responded: u64,
 }
 
 /// A rate at which loss was observed, and when it was seen.
+#[derive(Clone, Copy)]
 struct Edge {
     qps: f64,
     seen_at: Instant,
@@ -89,11 +193,12 @@ pub(crate) struct AdaptiveController {
     global_ceiling: f64,
     per_resolver: Vec<Observation>,
     edges: Vec<Option<Edge>>,
-    /// Lowest loss seen for each resolver since its current episode of loss began,
-    /// so the next tick can tell whether backing off is actually buying anything.
-    best_loss: Vec<Option<f64>>,
-    /// Consecutive ticks a resolver's loss has failed to improve.
-    stalled: Vec<u8>,
+    /// Whether a resolver's last retreat actually lowered its pacing.
+    stepped: Vec<bool>,
+    /// Edge and rate from before a resolver's last retreat, to undo it if it fails.
+    undo: Vec<Option<(Option<Edge>, f64)>>,
+    /// Per-resolver verdict on the loss it is showing.
+    judge: Vec<LossJudge>,
     /// Loss accumulated per resolver since its window opened, and how long that
     /// window has been open. The window has to outlast the request timeout for the
     /// ratio to compare the same period's dispatches and losses.
@@ -108,6 +213,8 @@ pub(crate) struct AdaptiveController {
     global_window: Observation,
     global_window_dispatched: u64,
     global_window_seconds: f64,
+    /// Verdict on the aggregate loss across every resolver that answered.
+    global_judge: LossJudge,
     /// Current global ceiling, or `None` while unthrottled. Retreat is relative to
     /// this rather than to observed throughput: observed can sit far below the
     /// limit simply because the workload is small, and retreating from it would
@@ -127,8 +234,9 @@ impl AdaptiveController {
             global_ceiling,
             per_resolver: vec![Observation::default(); resolver_count],
             edges: (0..resolver_count).map(|_| None).collect(),
-            best_loss: vec![None; resolver_count],
-            stalled: vec![0; resolver_count],
+            stepped: vec![false; resolver_count],
+            undo: vec![None; resolver_count],
+            judge: vec![LossJudge::default(); resolver_count],
             window: vec![Observation::default(); resolver_count],
             window_seconds: vec![0.0; resolver_count],
             outcomes,
@@ -136,6 +244,7 @@ impl AdaptiveController {
             global_window: Observation::default(),
             global_window_dispatched: 0,
             global_window_seconds: 0.0,
+            global_judge: LossJudge::default(),
             global_limit: None,
         }
     }
@@ -172,6 +281,7 @@ impl AdaptiveController {
             let current = Observation {
                 attempted: stats.attempted,
                 lost: stats.timeout + stats.error,
+                responded: stats.answered + stats.empty,
             };
             let previous = std::mem::replace(&mut self.per_resolver[i], current);
 
@@ -188,20 +298,29 @@ impl AdaptiveController {
             // as long as the timeout, then judge once and start over.
             self.window[i].attempted += tick_attempted;
             self.window[i].lost += tick_lost;
+            self.window[i].responded += current.responded.saturating_sub(previous.responded);
             self.window_seconds[i] += seconds;
-            if self.window_seconds[i] < resolver.request_timeout().as_secs_f64() {
+
+            // Gather until the window is long and full enough to judge, or shows
+            // the resolver can't be measured on its own. Relax meanwhile so an idle
+            // resolver doesn't stay throttled.
+            let timeout = resolver.request_timeout().as_secs_f64();
+            if self.window_seconds[i] < timeout
+                || (self.window[i].attempted < MIN_SAMPLES
+                    && self.window_seconds[i] < timeout * MAX_WINDOW_TIMEOUTS)
+            {
                 self.relax(i, now, resolver);
                 continue;
             }
             let dispatched = self.window[i].attempted;
             let lost = self.window[i].lost;
+            let responded = self.window[i].responded;
             let window_seconds = self.window_seconds[i];
             self.window[i] = Observation::default();
             self.window_seconds[i] = 0.0;
 
-            // Throttling one resolver needs that resolver's own loss ratio, which
-            // needs enough queries against it. Let any stale edge expire
-            // regardless, so an idle resolver does not stay throttled forever.
+            // Too few queries to judge this resolver alone: leave it to the
+            // aggregate.
             if dispatched < MIN_SAMPLES {
                 self.relax(i, now, resolver);
                 continue;
@@ -211,49 +330,65 @@ impl AdaptiveController {
             // absorbing losses from the busier period before it, which reads as more
             // than everything it sent.
             let loss = (lost as f64 / dispatched as f64).min(1.0);
-            if loss <= LOSS_THRESHOLD {
-                self.best_loss[i] = None;
-                self.stalled[i] = 0;
-                self.relax(i, now, resolver);
-                continue;
-            }
-
-            // Retreat only while there is evidence it is doing something. The first
-            // sight of loss earns one, and after that the loss has to actually be
-            // falling. Otherwise the loss is not coming from our rate, and lowering
-            // it again would only trade throughput for nothing.
-            let improving = match self.best_loss[i] {
-                Some(best) => loss < best * RETREAT_MUST_IMPROVE,
-                None => true,
-            };
-            if improving {
-                self.stalled[i] = 0;
-            } else {
-                self.stalled[i] = self.stalled[i].saturating_add(1);
-                if self.stalled[i] >= STALL_TICKS {
+            let delivered = responded as f64 / window_seconds.max(1e-6);
+            let converging = match self.judge[i].judge(loss, delivered) {
+                Verdict::Clear => {
+                    self.stepped[i] = false;
+                    self.relax(i, now, resolver);
+                    continue;
+                }
+                Verdict::Baseline => {
+                    // The retreat bought nothing: undo it. Earlier retreats passed
+                    // their own tests and stand.
+                    if std::mem::take(&mut self.stepped[i])
+                        && let Some((edge, rate)) = self.undo[i].take()
+                    {
+                        self.edges[i] = edge;
+                        resolver.set_rate(rate);
+                    }
                     debug!(
                         resolver = %resolver.addr(),
-                        loss, stalled = self.stalled[i],
-                        "loss is not responding to retreat, holding rate"
+                        loss, "loss is not responding to retreat, taking it as the resolver's cost"
                     );
                     continue;
                 }
-            }
+                Verdict::Congested { converging } => converging,
+            };
 
+            // Step down from this resolver's own rate, never to observed
+            // throughput, which every other limit on the path also caps. Only the
+            // first edge comes from observation.
             let observed_qps = dispatched as f64 / window_seconds.max(1e-6);
-            let target = (RETREAT * observed_qps).max(MIN_RATE_QPS);
-            self.edges[i] = Some(Edge {
-                qps: observed_qps,
-                seen_at: now,
-            });
-            self.best_loss[i] = Some(match self.best_loss[i] {
-                Some(best) => best.min(loss),
-                None => loss,
-            });
+            let rate = resolver.rate();
+            // A window only shows whether this resolver's pacing helps if that
+            // pacing shaped it: the last retreat really lowered the limit and
+            // traffic hit it.
+            let shaped = self.stepped[i] && observed_qps >= RETREAT * rate;
+            let edge = match self.edges[i] {
+                None => Edge {
+                    qps: observed_qps,
+                    seen_at: now,
+                },
+                // Working: the current rate still loses, so it becomes the edge.
+                Some(edge) if converging && shaped => Edge {
+                    qps: edge.qps.min(rate),
+                    seen_at: now,
+                },
+                // Otherwise hold the edge, still aging toward expiry.
+                Some(edge) => edge,
+            };
+            let edge_qps = edge.qps;
+            let target = (RETREAT * edge_qps).max(MIN_RATE_QPS);
+            // A real step, not the limiter's nanosecond rounding of the same rate.
+            self.stepped[i] = target < rate * (1.0 + RETREAT) / 2.0;
+            if self.stepped[i] {
+                self.undo[i] = Some((self.edges[i], rate));
+            }
+            self.edges[i] = Some(edge);
             resolver.set_rate(target);
             debug!(
                 resolver = %resolver.addr(),
-                loss, observed_qps, target,
+                loss, observed_qps, edge_qps, target,
                 "resolver losing queries, retreating below the edge"
             );
         }
@@ -271,9 +406,8 @@ impl AdaptiveController {
         if now.duration_since(edge.seen_at) >= EDGE_TTL {
             self.edges[i] = None;
             // Forget what the episode achieved too: the next one gets judged on its
-            // own, not against a reading from 30 seconds ago.
-            self.best_loss[i] = None;
-            self.stalled[i] = 0;
+            // own, not against a reading from 30 seconds ago. The baseline stays.
+            self.judge[i].end_episode();
             resolver.set_rate(UNLIMITED_QPS);
             debug!(
                 resolver = %resolver.addr(),
@@ -301,6 +435,8 @@ impl AdaptiveController {
         let current = Observation {
             attempted: self.outcomes.completed.load(Ordering::Relaxed),
             lost: self.outcomes.failed.load(Ordering::Relaxed),
+            // Answered is `attempted - lost` here: both move as a query finishes.
+            ..Observation::default()
         };
         let previous = std::mem::replace(&mut self.previous_outcomes, current);
         self.global_window.attempted += current.attempted.saturating_sub(previous.attempted);
@@ -335,7 +471,16 @@ impl AdaptiveController {
 
         let loss = failed as f64 / completed as f64;
 
-        if loss > LOSS_THRESHOLD {
+        let delivered = completed.saturating_sub(failed) as f64 / window_seconds.max(1e-6);
+        let verdict = self.global_judge.judge(loss, delivered);
+        if verdict == Verdict::Baseline {
+            debug!(
+                loss,
+                "global loss is not responding to retreat, taking it as the path's cost"
+            );
+        }
+
+        if matches!(verdict, Verdict::Congested { .. }) {
             // Retreat from the standing limit, not from observed throughput. The
             // first event has no limit yet, so observed is the only number
             // available; after that, compounding on observed would ratchet toward
@@ -350,6 +495,12 @@ impl AdaptiveController {
                 loss,
                 completed, failed, target, "queries failing outright, lowering global rate"
             );
+            return;
+        }
+
+        // Almost nothing is getting through: hold rather than grow into it. The
+        // first window after recovery releases it.
+        if loss > MAX_BASELINE_LOSS {
             return;
         }
 
@@ -470,20 +621,20 @@ mod tests {
         let falling = &pool.resolvers()[0];
         let stuck = &pool.resolvers()[1];
 
-        // Both start at 10% loss and earn their first retreat.
+        // Both start at 25% loss and earn their first retreat.
         for r in pool.resolvers() {
-            drive(r, 200, 20);
+            drive(r, 200, 50);
         }
         c.tick(&pool, Duration::from_secs(1), Instant::now());
         let (falling_first, stuck_first) = (falling.rate(), stuck.rate());
         assert!(falling_first < UNLIMITED_QPS && stuck_first < UNLIMITED_QPS);
 
-        // The pacing takes hold, so the resolver whose loss is rate-driven both
-        // sends less and loses proportionally less. The stuck one keeps losing the
-        // same share of everything it sends.
-        for (attempted, lost) in [(150, 9), (110, 5), (80, 3)] {
+        // One resolver is saturated at 150 answers a second: sent less, it loses
+        // less but answers as much. The other loses the same share of anything it
+        // sends.
+        for (attempted, lost) in [(170, 20), (150, 6), (140, 2)] {
             drive(falling, attempted, lost);
-            drive(stuck, 200, 20);
+            drive(stuck, 200, 50);
             c.tick(&pool, Duration::from_secs(1), Instant::now());
         }
 
@@ -686,35 +837,43 @@ mod tests {
         // Under that feedback the retreat used to compound until a tick finished
         // too few queries to sample, at which point congestion and recovery both
         // became invisible and the rate stayed pinned for the life of the client.
+        //
+        // Capacity congestion, because only loss retreating can fix drives it that
+        // deep; at this capacity a tick finishes well under MIN_AGGREGATE_SAMPLES.
+        const CAPACITY: f64 = 40.0;
         let pool = pool(5);
         let ceiling = 5_000.0;
         let (mut c, global, outcomes) = controller(5, ceiling);
         let tick = Duration::from_millis(500);
         let seconds = tick.as_secs_f64();
 
-        let step = |c: &mut AdaptiveController, loss: f64| {
+        let step = |c: &mut AdaptiveController, capacity: Option<f64>| {
             let finished = (global.rate().min(ceiling) * seconds) as u64;
             for r in pool.resolvers() {
                 drive(r, finished / 5, 0);
             }
-            finish(&outcomes, finished, (finished as f64 * loss).round() as u64);
+            let failed = match capacity {
+                Some(capacity) => finished.saturating_sub((capacity * seconds) as u64),
+                None => 0,
+            };
+            finish(&outcomes, finished, failed);
             c.tick(&pool, tick, Instant::now());
         };
 
-        // Thirty seconds of queries failing outright: far more than the twenty
-        // ticks it takes to compound 15% retreats below the old sampling floor.
+        // Sixty ticks over capacity: more than the twenty it takes to compound 15%
+        // retreats below the old sampling floor.
         for _ in 0..60 {
-            step(&mut c, 0.03);
+            step(&mut c, Some(CAPACITY));
         }
         let throttled = global.rate();
         assert!(
             throttled < ceiling,
-            "sustained unrecoverable loss should have paced the client down"
+            "a path losing everything over {CAPACITY} qps should have paced the client down"
         );
 
         // The path is clean from here on, and the client has to find that out.
         for _ in 0..400 {
-            step(&mut c, 0.0);
+            step(&mut c, None);
         }
 
         assert_eq!(
@@ -926,8 +1085,9 @@ mod tests {
             .unwrap(),
         );
 
-        // Push hard for long enough that the controller sees several ticks.
-        let hosts: Vec<String> = (0..4000).map(|i| format!("h{i}.example.com.")).collect();
+        // Push hard for long enough that the controller sees several windows (about
+        // a second each at this capacity).
+        let hosts: Vec<String> = (0..12000).map(|i| format!("h{i}.example.com.")).collect();
         let mut stream = client.clone().resolve_batch_full(
             hosts.into_iter().map(Ok::<_, std::convert::Infallible>),
             RecordType::A,
@@ -935,7 +1095,7 @@ mod tests {
             false,
         );
 
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut early_loss = None;
         while Instant::now() < deadline {
             if stream.next().await.is_none() {
@@ -946,8 +1106,13 @@ mod tests {
             }
         }
 
+        // With one resolver, whichever limit pulls ahead shapes traffic and the
+        // other stops; check the pace actually in force.
         let rate = client.stats()[0]
             .rate_qps
+            .into_iter()
+            .chain(client.global_rate_qps())
+            .reduce(f64::min)
             .expect("controller should have set a pacing rate");
         // Retreat stops once loss falls under the threshold, so the rate settles at
         // the capacity rather than somewhere well beneath it. Landing just above,
@@ -977,6 +1142,147 @@ mod tests {
         sim.dropped() as f64 / received
     }
 
+    /// Real congestion is still followed down to the path's capacity.
+    #[tokio::test]
+    async fn global_retreat_continues_while_the_loss_is_falling() {
+        const CAPACITY: f64 = 400.0;
+        let pool = pool(1);
+        let ceiling = 5_000.0;
+        let (mut c, global, outcomes) = controller(1, ceiling);
+        let tick = Duration::from_millis(500);
+        let seconds = tick.as_secs_f64();
+
+        for _ in 0..40 {
+            // Everything over capacity is lost, so loss falls with the rate.
+            let dispatched = global.rate().min(ceiling) * seconds;
+            let lost = (dispatched - CAPACITY * seconds).max(0.0);
+            drive(&pool.resolvers()[0], dispatched as u64, 0);
+            finish(&outcomes, dispatched as u64, lost as u64);
+            c.tick(&pool, tick, Instant::now());
+        }
+
+        let rate = global.rate();
+        assert!(
+            rate < CAPACITY * 2.0,
+            "loss that answers to the rate must be followed down to the \
+             {CAPACITY} qps capacity, got {rate}"
+        );
+        assert!(
+            rate > CAPACITY * 0.5,
+            "and not overshot into a collapse, got {rate}"
+        );
+    }
+
+    /// Loss that reads the same at any rate becomes the baseline, and the rate
+    /// returns.
+    #[tokio::test]
+    async fn rate_insensitive_loss_is_learned_as_a_baseline_and_the_rate_returns() {
+        let pool = pool(1);
+        let ceiling = 5_000.0;
+        let (mut c, global, outcomes) = controller(1, ceiling);
+        let tick = Duration::from_millis(500);
+        let seconds = tick.as_secs_f64();
+        let mut now = Instant::now();
+
+        // A tenth of everything fails, at whatever rate it is sent.
+        for _ in 0..40 {
+            let finished = (global.rate().min(ceiling) * seconds) as u64;
+            drive(&pool.resolvers()[0], finished, 0);
+            finish(&outcomes, finished, finished / 10);
+            now += tick;
+            c.tick(&pool, tick, now);
+        }
+
+        assert_eq!(
+            global.rate(),
+            ceiling,
+            "loss no rate can fix must not cost the client its rate"
+        );
+    }
+
+    /// A path answering nothing is held, not grown back into.
+    #[tokio::test]
+    async fn a_broken_path_is_not_grown_into() {
+        let pool = pool(1);
+        let ceiling = 5_000.0;
+        let (mut c, global, outcomes) = controller(1, ceiling);
+        let tick = Duration::from_millis(500);
+        let seconds = tick.as_secs_f64();
+        let mut now = Instant::now();
+
+        // Every query fails.
+        for _ in 0..80 {
+            let finished = (global.rate().min(ceiling) * seconds).max(1.0) as u64;
+            drive(&pool.resolvers()[0], finished, 0);
+            finish(&outcomes, finished, finished);
+            now += tick;
+            c.tick(&pool, tick, now);
+        }
+
+        assert!(
+            global.rate() < ceiling,
+            "a path answering nothing must not be driven at the ceiling, got {}",
+            global.rate()
+        );
+    }
+
+    /// The baseline follows loss down, so a stale one can't hide later congestion.
+    #[tokio::test]
+    async fn a_baseline_follows_the_loss_down() {
+        let pool = pool(1);
+        let ceiling = 5_000.0;
+        let (mut c, global, outcomes) = controller(1, ceiling);
+        let tick = Duration::from_millis(500);
+        let seconds = tick.as_secs_f64();
+
+        // `loss` maps the current rate to a loss fraction.
+        let step = |c: &mut AdaptiveController, loss: &dyn Fn(f64) -> f64| {
+            let rate = global.rate().min(ceiling);
+            let finished = (rate * seconds) as u64;
+            drive(&pool.resolvers()[0], finished, 0);
+            finish(&outcomes, finished, (finished as f64 * loss(rate)) as u64);
+            c.tick(&pool, tick, Instant::now());
+        };
+
+        // A bad patch no rate can fix sets the bar high.
+        for _ in 0..40 {
+            step(&mut c, &|_| 0.30);
+        }
+        assert_eq!(
+            global.rate(),
+            ceiling,
+            "the baseline should have been learned"
+        );
+
+        // It passes, and the path settles at a far smaller standing cost.
+        for _ in 0..20 {
+            step(&mut c, &|_| 0.05);
+        }
+        assert_eq!(
+            global.rate(),
+            ceiling,
+            "a smaller cost is still not congestion"
+        );
+
+        // Now real congestion: 25% loss at full rate, which a stale 30% bar would
+        // never act on.
+        let capacity = ceiling * 0.75;
+        let mut lowest = f64::INFINITY;
+        for _ in 0..20 {
+            step(&mut c, &|rate| (1.0 - capacity / rate).max(0.0));
+            lowest = lowest.min(global.rate());
+        }
+
+        assert!(
+            lowest < ceiling,
+            "congestion above the path's real cost must still be acted on"
+        );
+        assert!(
+            lowest > ceiling * 0.5,
+            "and followed down to the capacity, not past it, got {lowest}"
+        );
+    }
+
     #[tokio::test]
     async fn small_samples_are_not_treated_as_signal() {
         let pool = pool(1);
@@ -990,6 +1296,253 @@ mod tests {
             pool.resolvers()[0].rate(),
             UNLIMITED_QPS,
             "a handful of failures is not enough to conclude anything"
+        );
+    }
+
+    /// Names that fail at any rate must not ratchet the global rate down.
+    #[tokio::test]
+    async fn rate_insensitive_failures_do_not_collapse_the_global_rate() {
+        let pool = pool(3);
+        let (mut c, global, outcomes) = controller(3, UNLIMITED_QPS);
+        let tick = Duration::from_millis(500);
+        let demand = 2000.0_f64; // what the workload would dispatch if unpaced
+        let (mut finished_total, mut failed_total) = (0u64, 0u64);
+        for _ in 0..240 {
+            // 120 seconds
+            let finished = (global.rate().min(demand) * tick.as_secs_f64()).max(1.0) as u64;
+            finished_total += finished;
+            // a fixed 3% of names can never be answered, whatever the rate
+            let failed = (finished_total * 3 / 100) - failed_total;
+            failed_total += failed;
+            for r in pool.resolvers() {
+                drive(r, finished / 3, 0);
+            }
+            finish(&outcomes, finished, failed);
+            c.tick(&pool, tick, Instant::now());
+        }
+        let rate = global.rate().min(demand);
+        assert!(
+            rate >= demand * 0.5,
+            "loss that does not respond to retreat drove the global rate from {demand} to {rate:.1} qps"
+        );
+    }
+
+    /// The same at brute-force scale, where the aggregate is the only signal and no
+    /// resolver may be paced individually.
+    #[tokio::test]
+    async fn rate_insensitive_failures_do_not_collapse_the_rate_at_brute_force_scale() {
+        const RESOLVERS: usize = 2000;
+        const RETRIES: u64 = 20;
+        let pool = pool_of(RESOLVERS);
+        let (mut c, global, outcomes) = controller(RESOLVERS, UNLIMITED_QPS);
+        let tick = Duration::from_millis(500);
+        let demand = 4000.0_f64;
+        let (mut finished_total, mut failed_total) = (0u64, 0u64);
+        let mut cursor = 0usize;
+
+        for _ in 0..240 {
+            // 120 seconds
+            let finished = (global.rate().min(demand) * tick.as_secs_f64()).max(1.0) as u64;
+            finished_total += finished;
+            // a fixed 3% of names can never be answered, whatever the rate
+            let failed = (finished_total * 3 / 100) - failed_total;
+            failed_total += failed;
+
+            // Round-robin: one attempt per answered name, every retry timing out
+            // for the rest.
+            let timeouts = failed * (1 + RETRIES);
+            for n in 0..(finished - failed + timeouts) {
+                let r = &pool.resolvers()[cursor % RESOLVERS];
+                cursor += 1;
+                r.record_dispatch();
+                if n < timeouts {
+                    r.record_error(true);
+                } else {
+                    r.record_response(Duration::from_millis(10), true);
+                }
+            }
+            finish(&outcomes, finished, failed);
+            c.tick(&pool, tick, Instant::now());
+        }
+
+        let rate = global.rate().min(demand);
+        assert!(
+            rate >= demand * 0.5,
+            "loss that does not respond to retreat drove the global rate from {demand} to {rate:.1} qps"
+        );
+        assert!(
+            pool.resolvers().iter().all(|r| r.rate() == UNLIMITED_QPS),
+            "a resolver carrying a trickle is not individually measurable and must not be paced"
+        );
+    }
+
+    /// A resolver's edge steps from its own rate, not to a rate another limit
+    /// imposed.
+    #[tokio::test]
+    async fn a_resolver_edge_steps_down_from_its_own_rate_not_another_limit() {
+        let pool = pool(1);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
+        let resolver = &pool.resolvers()[0];
+
+        // Driven hard, the resolver answers a hundred a second and loses the rest.
+        drive(resolver, 400, 300);
+        c.tick(&pool, Duration::from_secs(1), Instant::now());
+        let standing = resolver.rate();
+        assert!(standing < UNLIMITED_QPS, "heavy loss should earn a retreat");
+
+        // Another limit now caps its traffic far below its own pacing; loss drops,
+        // so the retreat looks like it worked.
+        drive(resolver, 110, 10);
+        c.tick(&pool, Duration::from_secs(1), Instant::now());
+
+        assert!(
+            resolver.rate() >= standing * RETREAT * 0.99,
+            "one step down from {standing:.0} qps, not a fall to what another limit allowed: {:.0}",
+            resolver.rate()
+        );
+    }
+
+    /// A retreat that bought nothing is undone.
+    #[tokio::test]
+    async fn a_retreat_that_buys_nothing_is_taken_back() {
+        let pool = pool(1);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
+        let resolver = &pool.resolvers()[0];
+
+        // A tenth of everything lost, at whatever rate.
+        let step = |c: &mut AdaptiveController| {
+            let sent = resolver.rate().min(1000.0) as u64;
+            drive(resolver, sent, sent / 10);
+            c.tick(&pool, Duration::from_secs(1), Instant::now());
+        };
+        step(&mut c);
+        assert!(
+            resolver.rate() < UNLIMITED_QPS,
+            "the first sight of loss earns a retreat"
+        );
+        step(&mut c);
+        assert_eq!(
+            resolver.rate(),
+            UNLIMITED_QPS,
+            "a retreat that bought nothing must be taken back"
+        );
+    }
+
+    /// A held edge still expires, even while noise keeps reopening episodes.
+    #[tokio::test]
+    async fn a_held_edge_still_expires() {
+        let pool = pool(1);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
+        let resolver = &pool.resolvers()[0];
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+
+        // A resolver saturated at 600 answers a second, followed down to it.
+        // Bounded, so a regression fails below instead of looping.
+        let mut t = 0;
+        while t < 20 {
+            t += 1;
+            let sent = resolver.rate().min(1000.0) as u64;
+            drive(resolver, sent, sent.saturating_sub(600));
+            c.tick(&pool, Duration::from_secs(1), at(t));
+            if sent <= 600 {
+                break;
+            }
+        }
+        let held = resolver.rate();
+        assert!(held < UNLIMITED_QPS, "the capacity should have been found");
+
+        // Noise: every other window reads a few percent of loss.
+        let mut released = false;
+        for _ in 0..EDGE_TTL.as_secs() + 10 {
+            t += 1;
+            let sent = resolver.rate().min(1000.0) as u64;
+            let lost = if t % 2 == 0 { 0 } else { sent / 20 };
+            drive(resolver, sent, lost);
+            c.tick(&pool, Duration::from_secs(1), at(t));
+            released |= resolver.rate() == UNLIMITED_QPS;
+        }
+        assert!(
+            released,
+            "an edge held at {held:.0} qps must still expire on schedule"
+        );
+    }
+
+    /// Chance improvement on an unchanged rate must not step a resolver down.
+    #[tokio::test]
+    async fn noise_on_a_held_edge_does_not_step_a_resolver_down() {
+        let pool = pool(1);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
+        let resolver = &pool.resolvers()[0];
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+
+        // A resolver saturated at 600 answers a second, followed down to it.
+        // Bounded, so a regression fails below instead of looping.
+        let mut t = 0;
+        while t < 20 {
+            t += 1;
+            let sent = resolver.rate().min(1000.0) as u64;
+            drive(resolver, sent, sent.saturating_sub(600));
+            c.tick(&pool, Duration::from_secs(1), at(t));
+            if sent <= 600 {
+                break;
+            }
+        }
+        let held = resolver.rate();
+        assert!(held < UNLIMITED_QPS, "the capacity should have been found");
+
+        // 6% then 4% loss at the same rate: looks like progress, but nothing
+        // changed.
+        for percent in [6, 4] {
+            t += 1;
+            let sent = resolver.rate().min(1000.0) as u64;
+            drive(resolver, sent, sent * percent / 100);
+            c.tick(&pool, Duration::from_secs(1), at(t));
+        }
+
+        assert_eq!(
+            resolver.rate(),
+            held,
+            "chance improvement on an unchanged rate must not step the resolver down"
+        );
+    }
+
+    /// Loss crossing the threshold back and forth must not ratchet a resolver down.
+    #[tokio::test]
+    async fn loss_crossing_the_threshold_does_not_ratchet_a_resolver_down() {
+        let pool = pool(1);
+        let (mut c, _global, _outcomes) = controller(1, UNLIMITED_QPS);
+        let resolver = &pool.resolvers()[0];
+        let demand = 1000.0_f64;
+        let start = Instant::now();
+
+        let mut first = None;
+        // Within one edge lifetime, so only a ratchet could move the rate.
+        for i in 0..20u64 {
+            let sent = resolver.rate().min(demand) as u64;
+            // A fixed share no rate can fix, read as 6% and 1% by turns.
+            let lost = if i % 2 == 0 {
+                sent * 6 / 100
+            } else {
+                sent / 100
+            };
+            drive(resolver, sent, lost);
+            c.tick(
+                &pool,
+                Duration::from_secs(1),
+                start + Duration::from_secs(i + 1),
+            );
+            if first.is_none() && resolver.rate() < UNLIMITED_QPS {
+                first = Some(resolver.rate());
+            }
+        }
+
+        let first = first.expect("the first lossy window should have earned a retreat");
+        assert!(
+            resolver.rate() >= first * 0.99,
+            "loss that ignores the rate stepped the resolver from {first:.0} down to {:.0} qps",
+            resolver.rate()
         );
     }
 }
