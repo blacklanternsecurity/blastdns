@@ -2,7 +2,7 @@ name: Publish
 
 on:
   push:
-    tags: ["v*"]
+    branches: [stable]
 
 permissions:
   contents: read
@@ -13,27 +13,29 @@ concurrency:
 
 jobs:
   check:
-    uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+    uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
 
   tests:
     needs: check
+    if: needs.check.outputs.release == 'true'
     uses: ./.github/workflows/tests.yml
 
   wheels:
     needs: tests
-    uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+    uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
 
   crates:
-    needs: wheels
-    uses: blacklanternsecurity/CLA/.github/workflows/crates.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
-    secrets:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    needs: [check, wheels]
+    if: needs.check.outputs.release == 'true'
+    uses: blacklanternsecurity/CLA/.github/workflows/crates.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
+    with:
+      version: ${{ needs.check.outputs.version }}
 
   # Trusted publishing only matches a top-level job, so PyPI cannot move into a reusable workflow.
   pypi:
     needs: wheels
     runs-on: ubuntu-24.04
-    environment: pypi
+    environment: release
     permissions:
       id-token: write
       attestations: write
@@ -47,14 +49,20 @@ jobs:
         with:
           subject-path: dist/*
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
 
   release:
     needs: [check, wheels, crates, pypi]
+    if: needs.check.outputs.release == 'true'
     permissions:
-      contents: write
-    uses: blacklanternsecurity/CLA/.github/workflows/publish.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+      contents: read
+    uses: blacklanternsecurity/CLA/.github/workflows/publish.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
     with:
+      release-app-id: ${{ vars.RELEASE_APP_ID }}
+      tag: ${{ needs.check.outputs.tag }}
       version: ${{ needs.check.outputs.version }}
-      prerelease: ${{ needs.check.outputs.prerelease }}
       artifacts: ${{ needs.wheels.outputs.artifacts }}
       assets: dist/*
+    secrets:
+      release-app-key: ${{ secrets.RELEASE_APP_KEY }}
