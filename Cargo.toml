@@ -1,6 +1,6 @@
 [package]
 name = "blastdns"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 description = "Async DNS lookup library for bulk/parallel DNS resolution"
 license = "AGPL-3.0"
@@ -33,10 +33,10 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "time", "net", "sync", "fs", "io-std"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-pyo3 = { version = "0.27", features = ["serde"], optional = true }
-pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"], optional = true }
+pyo3 = { version = "0.30", features = ["serde"], optional = true }
+pyo3-async-runtimes = { version = "0.30", features = ["attributes", "tokio-runtime"], optional = true }
 
 [dev-dependencies]
-pyo3 = { version = "0.27", features = ["auto-initialize"] }
-pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
-rand = "0.9.2"
+pyo3 = { version = "0.30", features = ["auto-initialize"] }
+pyo3-async-runtimes = { version = "0.30", features = ["attributes", "tokio-runtime"] }
+rand = "0.10.3"
