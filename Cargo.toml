@@ -1,6 +1,6 @@
 [package]
 name = "blastdns"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 description = "Async DNS lookup library for bulk/parallel DNS resolution"
 license = "AGPL-3.0"
