@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "blastdns"
-version = "2.0.0"
+version = "2.0.2"
 description = "Async Python interface on top of the BlastDNS resolver"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 repository = "https://github.com/blacklanternsecurity/blastdns"
 homepage = "https://github.com/blacklanternsecurity/blastdns"
 authors = [{name = "TheTechromancer", email = "thetechromancer@protonmail.com"}]

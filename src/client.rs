@@ -1136,7 +1136,7 @@ mod tests {
     async fn nxdomain_behavior_matches_mock() {
         use crate::mock::MockBlastDNSClient;
         use crate::resolver::DnsResolver;
-        use rand::{Rng, distr::Alphanumeric};
+        use rand::{RngExt, distr::Alphanumeric};
 
         // Create real client
         let resolvers = vec!["8.8.8.8:53".to_string()];
