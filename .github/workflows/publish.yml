@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   check:
-    uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
+    uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
 
   tests:
     needs: check
@@ -22,16 +22,18 @@ jobs:
 
   wheels:
     needs: tests
-    uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
+    uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
 
   crates:
-    needs: [check, wheels]
+    needs: [check, pypi]
     if: needs.check.outputs.release == 'true'
-    uses: blacklanternsecurity/CLA/.github/workflows/crates.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
+    permissions:
+      contents: read
+      id-token: write
+    uses: blacklanternsecurity/CLA/.github/workflows/crates.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
     with:
       version: ${{ needs.check.outputs.version }}
 
-  # Trusted publishing only matches a top-level job, so PyPI cannot move into a reusable workflow.
   pypi:
     needs: wheels
     runs-on: ubuntu-24.04
@@ -57,12 +59,9 @@ jobs:
     if: needs.check.outputs.release == 'true'
     permissions:
       contents: read
-    uses: blacklanternsecurity/CLA/.github/workflows/publish.yml@4894c4adb0c98b978c7c621903e1f3205fc446b7 # CLA#11
+    uses: blacklanternsecurity/CLA/.github/workflows/publish.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
     with:
-      release-app-id: ${{ vars.RELEASE_APP_ID }}
       tag: ${{ needs.check.outputs.tag }}
       version: ${{ needs.check.outputs.version }}
       artifacts: ${{ needs.wheels.outputs.artifacts }}
       assets: dist/*
-    secrets:
-      release-app-key: ${{ secrets.RELEASE_APP_KEY }}

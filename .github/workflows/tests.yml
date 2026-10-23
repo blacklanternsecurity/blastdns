@@ -2,12 +2,10 @@ name: Tests
 
 on:
   pull_request:
-  push:
-    branches: [stable]
   workflow_call:
 
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -15,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: blacklanternsecurity/CLA/.github/workflows/rust-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+    uses: blacklanternsecurity/CLA/.github/workflows/rust-tests.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
     with:
       cargo-args: --all --locked
       test-args: --include-ignored
@@ -34,8 +32,22 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   python:
-    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@40c6e18c0a6e32116eea4f89fc826f53c70889dc # main
+    uses: blacklanternsecurity/CLA/.github/workflows/python-tests.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
     with:
       pytest-args: blastdns/tests tests/cli_tests.py -vv
       setup-script: scripts/ci-setup.sh
       teardown-script: scripts/ci-teardown.sh
+
+  # Reports the contexts the protecc ruleset requires today. Remove once it requires rust / passed and python / passed.
+  required:
+    name: ${{ matrix.context }}
+    if: always()
+    needs: [rust, clippy-python-feature, python]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        context: ["python-tests (3.11)", "python-tests (3.12)", "python-tests (3.13)", "python-tests (3.14)", "python-tests (3.15)", rust-tests]
+    steps:
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
