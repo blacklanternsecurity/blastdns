@@ -753,4 +753,4 @@ uv run ruff format
 
 ## Releasing
 
-A release is a reviewed pull request into `stable` that bumps the manifest version. The merge starts `publish.yml`, which tests and builds, waits for a `bbot-leads` approval of the `release` environment, publishes, then creates the `v<version>` tag and the GitHub release with its SBOM. See the org [publishing policy](https://github.com/blacklanternsecurity/.github-config/blob/stable/docs/policy/publishing.md).
+A release is a reviewed pull request into `stable` that bumps the manifest version. The merge starts `publish.yml`, which tests and builds, waits for a `bbot-leads` approval of the `release` environment, publishes, then creates the `v<version>` tag and the GitHub release with its SBOM. See the org [publishing policy](https://github.com/blacklanternsecurity/.github/blob/main/standards/releases.md).
