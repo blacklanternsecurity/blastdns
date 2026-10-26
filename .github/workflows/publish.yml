@@ -14,6 +14,8 @@ jobs:
   check:
     permissions:
       contents: read
+      actions: read
+      pull-requests: read
     uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
 
   tests:
@@ -44,6 +46,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release
     permissions:
+      contents: read
       id-token: write
       attestations: write
     steps:

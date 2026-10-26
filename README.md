@@ -754,3 +754,7 @@ uv run ruff format
 ## Releasing
 
 A release is a reviewed pull request into `stable` that bumps the manifest version. The merge starts `publish.yml`, which tests and builds, waits for a `bbot-leads` approval of the `release` environment, publishes, then creates the `v<version>` tag and the GitHub release with its SBOM. See the org [publishing policy](https://github.com/blacklanternsecurity/.github/blob/main/standards/releases.md).
+
+Each job that touches a credential runs in the `release` environment, so one release asks for approval four times: release-check's `credentials` job, `pypi`, `crates`, and the GitHub release.
+
+Wheels are built for released CPython in its default build only. PyPy and free-threaded (`t`) interpreters install from the sdist, which needs a Rust toolchain.
