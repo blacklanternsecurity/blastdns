@@ -4,8 +4,7 @@ on:
   push:
     branches: [stable]
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: publish-${{ github.ref }}
@@ -13,15 +12,21 @@ concurrency:
 
 jobs:
   check:
+    permissions:
+      contents: read
     uses: blacklanternsecurity/CLA/.github/workflows/release-check.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
 
   tests:
     needs: check
     if: needs.check.outputs.release == 'true'
+    permissions:
+      contents: read
     uses: ./.github/workflows/tests.yml
 
   wheels:
     needs: tests
+    permissions:
+      contents: read
     uses: blacklanternsecurity/CLA/.github/workflows/maturin-wheels.yml@07e14bcbba5e737e1b29bd9e3f9128fbf2483be9 # CLA#11
 
   crates:
