@@ -1,5 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 /// Async rate limiter backed by a single atomic cursor.
 ///
@@ -107,6 +110,113 @@ impl RateLimiter {
     }
 }
 
+/// Paces attempts at a rate the adaptive controller can move while traffic is
+/// running.
+///
+/// A ticker adds tokens at the current rate and the bucket holds at most a short
+/// burst. Callers wait on a shared semaphore instead of reserving their own future
+/// slot, so a rate change takes effect on the next tick in either direction: nothing
+/// is banked ahead of a cut, and no queue of reservations is left behind a raise.
+/// Unlimited until a rate is set, and then free to callers again once it is cleared.
+pub(crate) struct AttemptPacer {
+    /// `None` while unlimited.
+    rate: Mutex<Option<f64>>,
+    tokens: Semaphore,
+    /// Fractional tokens carried between ticks.
+    carry: Mutex<f64>,
+    waiting: AtomicU64,
+}
+
+const PACER_TICK: Duration = Duration::from_millis(2);
+/// Refill interval while nothing is paced; a newly set rate starts within it.
+const PACER_IDLE_TICK: Duration = Duration::from_millis(100);
+/// Seconds of tokens the bucket may hold, so a quiet spell cannot bank a burst.
+const PACER_BURST_SECONDS: f64 = 0.01;
+
+/// Counts a caller as waiting until it gets a token or is cancelled.
+struct Waiting<'a>(&'a AtomicU64);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl AttemptPacer {
+    pub(crate) fn new() -> Self {
+        AttemptPacer {
+            rate: Mutex::new(None),
+            tokens: Semaphore::new(0),
+            carry: Mutex::new(0.0),
+            waiting: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn rate(&self) -> Option<f64> {
+        *self.rate.lock().unwrap()
+    }
+
+    pub(crate) fn set_rate(&self, rate: Option<f64>) {
+        *self.rate.lock().unwrap() = rate;
+        *self.carry.lock().unwrap() = 0.0;
+    }
+
+    /// Callers waiting for a token: non-zero means the rate is what holds sends back.
+    pub(crate) fn waiting(&self) -> u64 {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    /// Wait for a token to send one attempt; immediate while unlimited.
+    pub(crate) async fn acquire(&self) {
+        if self.rate().is_none() {
+            return;
+        }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let _waiting = Waiting(&self.waiting);
+        if let Ok(permit) = self.tokens.acquire().await {
+            permit.forget();
+        }
+    }
+
+    fn refill(&self, seconds: f64) {
+        let Some(rate) = self.rate() else {
+            // Unlimited again: let through anyone still waiting from before.
+            let waiting = self.waiting() as usize;
+            self.tokens
+                .add_permits(waiting.saturating_sub(self.tokens.available_permits()));
+            return;
+        };
+        let mut carry = self.carry.lock().unwrap();
+        *carry += rate * seconds;
+        let whole = carry.floor();
+        *carry -= whole;
+        let burst = (rate * PACER_BURST_SECONDS).max(1.0) as usize;
+        let room = burst.saturating_sub(self.tokens.available_permits());
+        self.tokens.add_permits((whole as usize).min(room));
+    }
+
+    /// Refill tokens until the pacer is dropped. While there is nothing to pace the
+    /// task checks in only occasionally, so an idle client costs next to nothing.
+    pub(crate) fn spawn(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut previous = tokio::time::Instant::now();
+            let mut pause = PACER_TICK;
+            loop {
+                tokio::time::sleep(pause).await;
+                let Some(pacer) = weak.upgrade() else {
+                    break;
+                };
+                let now = tokio::time::Instant::now();
+                pacer.refill(now.duration_since(previous).as_secs_f64());
+                previous = now;
+                let idle = pacer.rate().is_none() && pacer.waiting() == 0;
+                pause = if idle { PACER_IDLE_TICK } else { PACER_TICK };
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +287,87 @@ mod tests {
         assert_eq!(
             RateLimiter::new(1000.0).interval(),
             Duration::from_millis(1)
+        );
+    }
+
+    async fn sends_per_second(pacer: &Arc<AttemptPacer>, seconds: f64) -> f64 {
+        let sent = Arc::new(AtomicU64::new(0));
+        let senders: Vec<_> = (0..200)
+            .map(|_| {
+                let (pacer, sent) = (pacer.clone(), sent.clone());
+                tokio::spawn(async move {
+                    loop {
+                        pacer.acquire().await;
+                        sent.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+        let rate = sent.load(Ordering::Relaxed) as f64 / seconds;
+        for sender in senders {
+            sender.abort();
+        }
+        rate
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pacer_holds_the_rate_it_is_given() {
+        let pacer = Arc::new(AttemptPacer::new());
+        pacer.spawn();
+        pacer.set_rate(Some(500.0));
+        let rate = sends_per_second(&pacer, 1.0).await;
+        assert!(
+            (400.0..=600.0).contains(&rate),
+            "expected about 500/s with many waiters, got {rate}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_raised_pacer_rate_applies_at_once() {
+        // a rate limiter that reserves slots ahead keeps a slow backlog after a raise
+        let pacer = Arc::new(AttemptPacer::new());
+        pacer.spawn();
+        pacer.set_rate(Some(50.0));
+        let slow = sends_per_second(&pacer, 0.5).await;
+        pacer.set_rate(Some(2000.0));
+        let fast = sends_per_second(&pacer, 0.2).await;
+        assert!(slow < 100.0, "expected about 50/s, got {slow}");
+        assert!(
+            fast > 1200.0,
+            "a raise must not wait out a backlog, got {fast}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleared_pacer_releases_its_waiters() {
+        let pacer = Arc::new(AttemptPacer::new());
+        pacer.spawn();
+        pacer.set_rate(Some(1.0));
+        let waiter = {
+            let pacer = pacer.clone();
+            tokio::spawn(async move { pacer.acquire().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pacer.set_rate(None);
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter should be released once the rate is cleared")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_pacer_paces_promptly_once_given_a_rate() {
+        // idle, the refill task checks in only occasionally; a new rate must still apply
+        let pacer = Arc::new(AttemptPacer::new());
+        pacer.spawn();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pacer.set_rate(Some(1000.0));
+        let rate = sends_per_second(&pacer, 0.3).await;
+        assert!(
+            rate > 500.0,
+            "expected pacing near 1000/s soon after the rate was set, got {rate}"
         );
     }
 }
