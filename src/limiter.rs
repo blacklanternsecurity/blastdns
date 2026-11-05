@@ -128,6 +128,8 @@ pub(crate) struct AttemptPacer {
 }
 
 const PACER_TICK: Duration = Duration::from_millis(2);
+/// Refill interval while nothing is paced; a newly set rate starts within it.
+const PACER_IDLE_TICK: Duration = Duration::from_millis(100);
 /// Seconds of tokens the bucket may hold, so a quiet spell cannot bank a burst.
 const PACER_BURST_SECONDS: f64 = 0.01;
 
@@ -193,19 +195,23 @@ impl AttemptPacer {
         self.tokens.add_permits((whole as usize).min(room));
     }
 
-    /// Refill tokens until the pacer is dropped.
+    /// Refill tokens until the pacer is dropped. While there is nothing to pace the
+    /// task checks in only occasionally, so an idle client costs next to nothing.
     pub(crate) fn spawn(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut previous = tokio::time::Instant::now();
+            let mut pause = PACER_TICK;
             loop {
-                tokio::time::sleep(PACER_TICK).await;
+                tokio::time::sleep(pause).await;
                 let Some(pacer) = weak.upgrade() else {
                     break;
                 };
                 let now = tokio::time::Instant::now();
                 pacer.refill(now.duration_since(previous).as_secs_f64());
                 previous = now;
+                let idle = pacer.rate().is_none() && pacer.waiting() == 0;
+                pause = if idle { PACER_IDLE_TICK } else { PACER_TICK };
             }
         });
     }
@@ -349,5 +355,19 @@ mod tests {
             .await
             .expect("waiter should be released once the rate is cleared")
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_pacer_paces_promptly_once_given_a_rate() {
+        // idle, the refill task checks in only occasionally; a new rate must still apply
+        let pacer = Arc::new(AttemptPacer::new());
+        pacer.spawn();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pacer.set_rate(Some(1000.0));
+        let rate = sends_per_second(&pacer, 0.3).await;
+        assert!(
+            rate > 500.0,
+            "expected pacing near 1000/s soon after the rate was set, got {rate}"
+        );
     }
 }
