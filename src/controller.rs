@@ -24,18 +24,26 @@
 //! small pool; spread a few hundred queries per second over thousands of
 //! resolvers and no single one is ever measurable. The aggregate is well sampled
 //! either way, so it is what makes this useful at brute-force scale.
+//!
+//! Retries also hide congestion that every resolver shares, such as a home router
+//! or a carrier-grade NAT dropping packets past some rate: names still get answered
+//! somewhere, so outright failures stay near zero while most attempts time out and
+//! everything else on the link is crowded out. A third brake watches per-attempt
+//! loss across the pool for that, and paces attempts per second when the loss is
+//! well above what the path loses at a clearly lower load.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::{
     client::Outcomes,
     health::{ResolverHealth, ResolverPool},
-    limiter::{RateLimiter, UNLIMITED_QPS},
+    limiter::{AttemptPacer, RateLimiter, UNLIMITED_QPS},
 };
 
 /// Fraction of a discovered edge to operate at.
@@ -179,11 +187,288 @@ struct Observation {
     responded: u64,
 }
 
+/// Responding resolvers below which the attempt brake stays off. With a few, each
+/// sees enough queries for the per-resolver controller to judge its loss directly.
+const ATTEMPT_MIN_RESOLVERS: usize = 8;
+/// Request timeouts an attempt window spans. Timed-out attempts are retried
+/// together, so retries arrive in waves a timeout apart; a window several times
+/// longer averages across them instead of landing on a peak or a trough.
+const ATTEMPT_WINDOW_TIMEOUTS: f64 = 4.0;
+/// Finished attempts a window needs to be judged. A batch draining its last slow
+/// names looks like a low load and says nothing about the link.
+const ATTEMPT_MIN_WINDOW: u64 = 500;
+/// A tick sending fewer attempts per second than this counts as idle.
+const ATTEMPT_IDLE_QPS: f64 = 20.0;
+/// Per-attempt loss more than this above the median at a clearly lower load is the
+/// current rate's doing.
+const ATTEMPT_LOSS_THRESHOLD: f64 = 0.03;
+/// What counts as a clearly lower load, and the share of the current rate a probe
+/// measures at when no such window is on record.
+const ATTEMPT_REFERENCE_BELOW: f64 = 0.6;
+const ATTEMPT_PROBE_FRACTION: f64 = 0.5;
+/// Windows a probe measures, so no decision rests on one sample.
+const ATTEMPT_PROBE_WINDOWS: u32 = 2;
+/// How long windows are kept as references. It doubles each time a probe finds no
+/// bottleneck, up to the maximum, so a healthy path is probed less and less often.
+const ATTEMPT_REFERENCE_WINDOW: Duration = Duration::from_secs(60);
+const ATTEMPT_MAX_REFERENCE_WINDOW: Duration = Duration::from_secs(480);
+/// Once answers per second fall this far below what a higher rate delivered
+/// recently, cutting further costs more than it relieves: hold instead.
+const ATTEMPT_GOODPUT_FLOOR: f64 = 0.8;
+/// Share of the limit traffic must reach for a window to count as shaped by it,
+/// when nobody was seen waiting on the pacer.
+const ATTEMPT_SHAPED_FRACTION: f64 = 0.95;
+/// Lowest attempt rate the brake sets, per second.
+const ATTEMPT_MIN_RATE: f64 = 10.0;
+/// Growth per clear window. Much slower than the retreat, as in TCP: a cut followed
+/// by one clear window must not leave the rate higher than before, or the rate
+/// settles where most windows are congested.
+const ATTEMPT_GROWTH: f64 = 1.05;
+
 /// A rate at which loss was observed, and when it was seen.
 #[derive(Clone, Copy)]
 struct Edge {
     qps: f64,
     seen_at: Instant,
+}
+
+/// One judged attempt window.
+#[derive(Clone, Copy)]
+struct Sample {
+    at: Instant,
+    /// Attempts sent per second.
+    rate: f64,
+    loss: f64,
+    /// Attempts answered per second.
+    delivered: f64,
+}
+
+/// A lower rate being measured: the limit to restore and the windows left.
+#[derive(Clone, Copy)]
+struct Probe {
+    restore: Option<f64>,
+    windows: u32,
+}
+
+/// Paces attempts across the pool when per-attempt loss shows a shared bottleneck.
+///
+/// The limit is on attempts per second, applied right before each send: a link that
+/// polices packets or new flows per second tolerates a rate, and with fewer timeouts
+/// each in-flight slot turns over faster, so an in-flight cap would not hold one.
+struct AttemptBrake {
+    pacer: Arc<AttemptPacer>,
+    limit: Option<f64>,
+    /// The open window: attempts lost and answered across resolvers that have
+    /// answered at least once, attempts dispatched, and its length.
+    window: Observation,
+    dispatched: u64,
+    seconds: f64,
+    /// Ticks in the window on which nobody waited on the pacer.
+    unshaped_ticks: u32,
+    /// Set when the sending rate changes: the next window straddles the change and
+    /// mostly shows the old rate, so it is not judged. Starts set, since the first
+    /// window reads clean: answers arrive at once and timeouts land a timeout later.
+    settling: bool,
+    idle_ticks: u32,
+    history: VecDeque<Sample>,
+    reference_window: Duration,
+    probe: Option<Probe>,
+    /// A probe just restored the rate; the next judged window says whether it found
+    /// a bottleneck.
+    probed: bool,
+}
+
+impl AttemptBrake {
+    fn new(pacer: Arc<AttemptPacer>) -> Self {
+        Self {
+            pacer,
+            limit: None,
+            window: Observation::default(),
+            dispatched: 0,
+            seconds: 0.0,
+            unshaped_ticks: 0,
+            settling: true,
+            idle_ticks: 0,
+            history: VecDeque::new(),
+            reference_window: ATTEMPT_REFERENCE_WINDOW,
+            probe: None,
+            probed: false,
+        }
+    }
+
+    fn set_limit(&mut self, limit: Option<f64>) {
+        let limit = limit.map(|l| l.max(ATTEMPT_MIN_RATE));
+        self.limit = limit;
+        self.pacer.set_rate(limit);
+        self.settling = true;
+    }
+
+    fn reset_window(&mut self) {
+        self.window = Observation::default();
+        self.dispatched = 0;
+        self.seconds = 0.0;
+        self.unshaped_ticks = 0;
+    }
+
+    fn tick(
+        &mut self,
+        seconds: f64,
+        attempted: u64,
+        lost: u64,
+        responded: u64,
+        longest_timeout: f64,
+        now: Instant,
+    ) {
+        // Idle: nothing to learn and nothing for a probe to measure.
+        if (attempted as f64) < ATTEMPT_IDLE_QPS * seconds {
+            if let Some(probe) = self.probe.take() {
+                self.set_limit(probe.restore);
+            }
+            self.idle_ticks = self.idle_ticks.saturating_add(1);
+            self.reset_window();
+            return;
+        }
+        if self.idle_ticks > 0 {
+            let idle = seconds * f64::from(std::mem::take(&mut self.idle_ticks));
+            self.settling = true;
+            // Conditions may have changed while nothing was sent: start over.
+            if idle >= ATTEMPT_REFERENCE_WINDOW.as_secs_f64() {
+                self.history.clear();
+                self.reference_window = ATTEMPT_REFERENCE_WINDOW;
+                self.probed = false;
+                self.set_limit(None);
+                debug!(idle, "attempt pacing reset after idle");
+            }
+        }
+
+        self.window.lost += lost;
+        self.window.responded += responded;
+        self.dispatched += attempted;
+        self.seconds += seconds;
+        if self.pacer.waiting() == 0 {
+            self.unshaped_ticks += 1;
+        }
+        let finished = self.window.lost + self.window.responded;
+        if finished < ATTEMPT_MIN_WINDOW || self.seconds < longest_timeout * ATTEMPT_WINDOW_TIMEOUTS
+        {
+            return;
+        }
+        let loss = self.window.lost as f64 / finished as f64;
+        let rate = self.dispatched as f64 / self.seconds;
+        let delivered = self.window.responded as f64 / self.seconds;
+        // Whether the limit, rather than the workload or another limit, set the rate.
+        let shaped = self.limit.is_none_or(|limit| {
+            self.unshaped_ticks == 0 || rate >= limit * ATTEMPT_SHAPED_FRACTION
+        });
+        self.reset_window();
+        let settling = std::mem::take(&mut self.settling);
+        trace!(loss, rate, delivered, limit = ?self.limit, shaped, settling, "attempt window");
+        if settling {
+            return;
+        }
+        let rate = self.limit.unwrap_or(rate);
+
+        if let Some(probe) = self.probe.take() {
+            self.record(now, rate, loss, delivered);
+            debug!(loss, rate, "attempt pacing probe measured");
+            if probe.windows > 1 {
+                self.probe = Some(Probe {
+                    windows: probe.windows - 1,
+                    ..probe
+                });
+            } else {
+                self.set_limit(probe.restore);
+                self.probed = true;
+            }
+            return;
+        }
+
+        if self.limit.is_some() && !shaped {
+            // Traffic ran below the limit, so this is no measurement at it. Hold while
+            // congested, since a draining workload is not the link recovering;
+            // otherwise the limit constrains nothing.
+            if self.congested(rate, loss) != Some(true) {
+                self.set_limit(None);
+                debug!("attempt pacing released");
+            }
+            return;
+        }
+
+        let best_higher = self
+            .history
+            .iter()
+            .filter(|s| s.rate > rate)
+            .map(|s| s.delivered)
+            .fold(0.0, f64::max);
+        self.record(now, rate, loss, delivered);
+
+        let Some(congested) = self.congested(rate, loss) else {
+            // Nothing measured at a clearly lower load: go and measure it.
+            let probe = rate * ATTEMPT_PROBE_FRACTION;
+            self.probe = Some(Probe {
+                restore: self.limit,
+                windows: ATTEMPT_PROBE_WINDOWS,
+            });
+            self.set_limit(Some(probe));
+            debug!(loss, rate, probe, "attempt pacing probing a lower load");
+            return;
+        };
+        if std::mem::take(&mut self.probed) && !congested {
+            self.reference_window = (self.reference_window * 2).min(ATTEMPT_MAX_REFERENCE_WINDOW);
+        }
+
+        if congested {
+            self.reference_window = ATTEMPT_REFERENCE_WINDOW;
+            if delivered < best_higher * ATTEMPT_GOODPUT_FLOOR {
+                debug!(
+                    loss,
+                    delivered, best_higher, "attempt pacing holding: cutting would cost answers"
+                );
+                return;
+            }
+            let target = rate * RETREAT;
+            self.set_limit(Some(target));
+            debug!(
+                loss,
+                rate, target, "pool losing attempts, lowering the attempt rate"
+            );
+            return;
+        }
+        if let Some(limit) = self.limit {
+            self.set_limit(Some(limit * ATTEMPT_GROWTH));
+        }
+    }
+
+    fn record(&mut self, now: Instant, rate: f64, loss: f64, delivered: f64) {
+        self.history.push_back(Sample {
+            at: now,
+            rate,
+            loss,
+            delivered,
+        });
+        while let Some(oldest) = self.history.front()
+            && now.duration_since(oldest.at) > self.reference_window
+        {
+            self.history.pop_front();
+        }
+    }
+
+    /// Whether loss at `rate` is well above the median at a clearly lower load, or
+    /// `None` when no such load is on record.
+    fn congested(&self, rate: f64, loss: f64) -> Option<bool> {
+        let mut lower: Vec<f64> = self
+            .history
+            .iter()
+            .filter(|s| s.rate <= rate * ATTEMPT_REFERENCE_BELOW)
+            .map(|s| s.loss)
+            .collect();
+        if lower.is_empty() {
+            return None;
+        }
+        lower.sort_by(f64::total_cmp);
+        let reference = lower[lower.len() / 2];
+        Some(loss > ATTEMPT_LOSS_THRESHOLD && loss > reference + ATTEMPT_LOSS_THRESHOLD)
+    }
 }
 
 /// Watches per-resolver loss and adjusts pacing to stay below the loss edge.
@@ -220,12 +505,14 @@ pub(crate) struct AdaptiveController {
     /// limit simply because the workload is small, and retreating from it would
     /// clamp the limit for no reason and then compound on every tick.
     global_limit: Option<f64>,
+    attempts: AttemptBrake,
 }
 
 impl AdaptiveController {
     pub(crate) fn new(
         resolver_count: usize,
         global: Arc<RateLimiter>,
+        pacer: Arc<AttemptPacer>,
         global_ceiling: f64,
         outcomes: Arc<Outcomes>,
     ) -> Self {
@@ -246,11 +533,13 @@ impl AdaptiveController {
             global_window_seconds: 0.0,
             global_judge: LossJudge::default(),
             global_limit: None,
+            attempts: AttemptBrake::new(pacer),
         }
     }
 
     /// Run the control loop until the pool is dropped.
     pub(crate) fn spawn(mut self, pool: &Arc<ResolverPool>) {
+        self.attempts.pacer.spawn();
         let weak = Arc::downgrade(pool);
         tokio::spawn(async move {
             let mut previous = Instant::now();
@@ -275,6 +564,10 @@ impl AdaptiveController {
         let resolvers = pool.resolvers();
 
         let mut attempted_total = 0u64;
+        let mut attempts_lost = 0u64;
+        let mut attempts_responded = 0u64;
+        let mut longest_timeout = 0f64;
+        let mut responsive = 0usize;
 
         for (i, resolver) in resolvers.iter().enumerate() {
             let stats = resolver.stats();
@@ -288,6 +581,13 @@ impl AdaptiveController {
             let tick_attempted = current.attempted.saturating_sub(previous.attempted);
             let tick_lost = current.lost.saturating_sub(previous.lost);
             attempted_total += tick_attempted;
+            // Never-answered resolvers are dead entries, not evidence about the path.
+            if current.responded > 0 {
+                responsive += 1;
+                attempts_lost += tick_lost;
+                attempts_responded += current.responded.saturating_sub(previous.responded);
+            }
+            longest_timeout = longest_timeout.max(resolver.request_timeout().as_secs_f64());
 
             // A query becomes "lost" only when its timeout expires, so losses land
             // later than the dispatches that produced them. Measuring over a window
@@ -393,7 +693,24 @@ impl AdaptiveController {
             );
         }
 
+        let global_rate = self.global.rate();
         self.adjust_global(seconds, attempted_total);
+        if self.global.rate() != global_rate {
+            // the other brake moved the sending rate: the next window straddles it
+            self.attempts.settling = true;
+        }
+        if responsive >= ATTEMPT_MIN_RESOLVERS {
+            self.attempts.tick(
+                seconds,
+                attempted_total,
+                attempts_lost,
+                attempts_responded,
+                longest_timeout,
+                now,
+            );
+        } else if self.attempts.limit.is_some() {
+            self.attempts.set_limit(None);
+        }
     }
 
     /// Ease a resolver's pacing back up: expire a stale edge outright, otherwise
@@ -558,7 +875,13 @@ mod tests {
     ) -> (AdaptiveController, Arc<RateLimiter>, Arc<Outcomes>) {
         let global = Arc::new(RateLimiter::new(ceiling));
         let outcomes = Arc::new(Outcomes::default());
-        let c = AdaptiveController::new(count, global.clone(), ceiling, outcomes.clone());
+        let c = AdaptiveController::new(
+            count,
+            global.clone(),
+            Arc::new(AttemptPacer::new()),
+            ceiling,
+            outcomes.clone(),
+        );
         (c, global, outcomes)
     }
 
@@ -1544,5 +1867,169 @@ mod tests {
             "loss that ignores the rate stepped the resolver from {first:.0} down to {:.0} qps",
             resolver.rate()
         );
+    }
+
+    /// A pool behind one shared bottleneck (a home router, a carrier NAT) that drops
+    /// whatever exceeds its capacity. Retries answer every name, so names never fail
+    /// outright and only per-attempt loss shows the bottleneck.
+    struct SharedPath {
+        pool: Arc<ResolverPool>,
+        pacer: Arc<AttemptPacer>,
+        outcomes: Arc<Outcomes>,
+        c: AdaptiveController,
+        now: Instant,
+    }
+
+    impl SharedPath {
+        const TICK: Duration = Duration::from_millis(500);
+        /// Loss the pool shows at any rate.
+        const BASE_LOSS: f64 = 0.25;
+
+        fn new(resolvers: u8) -> Self {
+            let pool = pool(resolvers);
+            let pacer = Arc::new(AttemptPacer::new());
+            let outcomes = Arc::new(Outcomes::default());
+            let c = AdaptiveController::new(
+                resolvers as usize,
+                Arc::new(RateLimiter::new(UNLIMITED_QPS)),
+                pacer.clone(),
+                UNLIMITED_QPS,
+                outcomes.clone(),
+            );
+            Self {
+                pool,
+                pacer,
+                outcomes,
+                c,
+                now: Instant::now(),
+            }
+        }
+
+        /// One tick with the workload offering `offered` attempts per second, of which
+        /// the pacer lets through what it allows, over a link carrying `capacity`.
+        fn tick(&mut self, offered: f64, capacity: f64) {
+            let rate = self.pacer.rate().map_or(offered, |r| r.min(offered));
+            let dispatched = rate * Self::TICK.as_secs_f64();
+            let over = if rate > 0.0 {
+                (rate - capacity).max(0.0) / rate
+            } else {
+                0.0
+            };
+            let lost = dispatched * (Self::BASE_LOSS + (1.0 - Self::BASE_LOSS) * over);
+            // exact totals spread over the resolvers, so rounding adds no loss
+            let (total, total_lost) = (dispatched.round() as u64, lost.round() as u64);
+            let n = self.pool.resolvers().len() as u64;
+            for (i, r) in self.pool.resolvers().iter().enumerate() {
+                let i = i as u64;
+                let per = total / n + u64::from(i < total % n);
+                let per_lost = (total_lost / n + u64::from(i < total_lost % n)).min(per);
+                drive(r, per, per_lost);
+            }
+            finish(&self.outcomes, total - total_lost, 0);
+            self.now += Self::TICK;
+            self.c.tick(&self.pool, Self::TICK, self.now);
+        }
+
+        fn run(&mut self, ticks: usize, offered: f64, capacity: f64) {
+            for _ in 0..ticks {
+                self.tick(offered, capacity);
+            }
+        }
+
+        /// The limit in force, counting the one a running probe will restore.
+        fn limit(&self) -> Option<f64> {
+            match self.c.attempts.probe {
+                Some(probe) => probe.restore,
+                None => self.c.attempts.limit,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shared_bottleneck_is_paced_though_retries_answer_every_name() {
+        const CAPACITY: f64 = 1_000.0;
+        let mut path = SharedPath::new(40);
+        path.run(400, 5_000.0, CAPACITY);
+        let limit = path.limit().expect("a shared bottleneck must be paced");
+        assert!(
+            limit < CAPACITY * 1.5,
+            "pacing should settle toward the {CAPACITY}/s capacity, got {limit}"
+        );
+        assert!(
+            limit > CAPACITY * 0.5,
+            "and not collapse below it, got {limit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn steady_loss_without_a_bottleneck_is_left_unpaced() {
+        let mut path = SharedPath::new(40);
+        path.run(400, 5_000.0, f64::INFINITY);
+        assert_eq!(
+            path.limit(),
+            None,
+            "loss that does not move with the rate must not pace"
+        );
+    }
+
+    #[tokio::test]
+    async fn probing_backs_off_on_a_path_without_a_bottleneck() {
+        let mut path = SharedPath::new(40);
+        let mut probes = Vec::new();
+        for tick in 0..2_400 {
+            let probing = path.c.attempts.probe.is_some();
+            path.tick(5_000.0, f64::INFINITY);
+            if !probing && path.c.attempts.probe.is_some() {
+                probes.push(tick);
+            }
+        }
+        // 20 minutes: probes at roughly 1, 2, 4 and 8 minute gaps, not one a minute
+        assert!(
+            (2..=6).contains(&probes.len()),
+            "probes should grow further apart on a healthy path, got them at ticks {probes:?}"
+        );
+        let gaps: Vec<_> = probes.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.windows(2).all(|g| g[1] >= g[0]),
+            "gaps between probes should not shrink, got {gaps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draining_workload_is_not_judged() {
+        let mut path = SharedPath::new(40);
+        path.run(400, 5_000.0, 1_000.0);
+        let settled = path.limit();
+        assert!(settled.is_some());
+        // the last slow names of a batch: well under what a window needs
+        path.run(40, 15.0, 1_000.0);
+        assert_eq!(
+            path.c.attempts.probe.map(|_| ()),
+            None,
+            "a tail must not start a probe"
+        );
+        assert_eq!(path.limit(), settled, "a tail must not move the limit");
+    }
+
+    #[tokio::test]
+    async fn a_long_idle_starts_attempt_pacing_over() {
+        let mut path = SharedPath::new(40);
+        path.run(400, 5_000.0, 1_000.0);
+        assert!(path.limit().is_some());
+        path.run(140, 0.0, 1_000.0);
+        path.tick(5_000.0, f64::INFINITY);
+        assert_eq!(
+            path.limit(),
+            None,
+            "after a long idle, the old limit must not carry over"
+        );
+        assert!(path.c.attempts.history.is_empty(), "nor the old references");
+    }
+
+    #[tokio::test]
+    async fn a_small_pool_leaves_attempt_pacing_to_the_other_brakes() {
+        let mut path = SharedPath::new(4);
+        path.run(400, 5_000.0, 1_000.0);
+        assert_eq!(path.pacer.rate(), None);
     }
 }

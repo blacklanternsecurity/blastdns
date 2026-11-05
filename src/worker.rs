@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::{
     error::BlastDNSError,
     health::{ResolverHealth, ResolverPool},
-    limiter::RateLimiter,
+    limiter::{AttemptPacer, RateLimiter},
 };
 
 /// DNS query specification containing the hostname and record type to query.
@@ -54,6 +54,7 @@ impl WorkItem {
 pub(crate) struct ResolverWorker {
     pool: Arc<ResolverPool>,
     limiter: Arc<RateLimiter>,
+    pacer: Arc<AttemptPacer>,
     work_rx: MAsyncRx<WorkItem>,
 }
 
@@ -62,6 +63,7 @@ impl ResolverWorker {
     pub fn spawn(
         pool: Arc<ResolverPool>,
         limiter: Arc<RateLimiter>,
+        pacer: Arc<AttemptPacer>,
         work_rx: MAsyncRx<WorkItem>,
         worker_idx: usize,
     ) {
@@ -69,6 +71,7 @@ impl ResolverWorker {
             let worker = Self {
                 pool,
                 limiter,
+                pacer,
                 work_rx,
             };
             worker.run().await;
@@ -105,6 +108,9 @@ impl ResolverWorker {
 
             // Respect the chosen resolver's own pacing on top of the global rate.
             reservation.resolver.acquire_rate().await;
+            // The adaptive attempt pace is taken last, right before the send, so it
+            // governs what actually goes out on the wire.
+            self.pacer.acquire().await;
 
             let result = Self::query(&reservation.resolver, name, query.record_type).await;
             let _ = responder.send(result);

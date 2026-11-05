@@ -22,7 +22,7 @@ use crate::{
     controller::AdaptiveController,
     error::BlastDNSError,
     health::{ResolverPool, ResolverStats},
-    limiter::{RateLimiter, UNLIMITED_QPS},
+    limiter::{AttemptPacer, RateLimiter, UNLIMITED_QPS},
     resolver::DnsResolver,
     utils::{check_ulimits, format_ptr_query, get_system_resolvers, parse_resolver},
     worker::{QuerySpec, ResolverWorker, WorkItem},
@@ -200,6 +200,7 @@ impl BlastDNSClient {
     async fn ensure_workers(&self) {
         let pool = self.pool.clone();
         let limiter = self.limiter.clone();
+        let pacer = Arc::new(AttemptPacer::new());
         let work_rx = self.work_rx.clone();
         let concurrency = self.config.max_concurrency.max(1);
         let probe = self.config.resolver_probe;
@@ -216,6 +217,7 @@ impl BlastDNSClient {
                     AdaptiveController::new(
                         pool.resolvers().len(),
                         limiter.clone(),
+                        pacer.clone(),
                         ceiling,
                         outcomes,
                     )
@@ -228,6 +230,7 @@ impl BlastDNSClient {
                     ResolverWorker::spawn(
                         pool.clone(),
                         limiter.clone(),
+                        pacer.clone(),
                         work_rx.clone(),
                         worker_idx,
                     );
@@ -588,7 +591,13 @@ mod tests {
 
         let pool = Arc::new(ResolverPool::new(&[resolver], &config));
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
-        ResolverWorker::spawn(pool, Arc::new(RateLimiter::new(UNLIMITED_QPS)), rx, 0);
+        ResolverWorker::spawn(
+            pool,
+            Arc::new(RateLimiter::new(UNLIMITED_QPS)),
+            Arc::new(AttemptPacer::new()),
+            rx,
+            0,
+        );
 
         let query = QuerySpec {
             host: "example.com.".into(),
@@ -632,7 +641,13 @@ mod tests {
 
         let pool = Arc::new(ResolverPool::new(&[resolver], &config));
         let (tx, rx) = mpmc::bounded_async::<WorkItem>(1);
-        ResolverWorker::spawn(pool, Arc::new(RateLimiter::new(UNLIMITED_QPS)), rx, 0);
+        ResolverWorker::spawn(
+            pool,
+            Arc::new(RateLimiter::new(UNLIMITED_QPS)),
+            Arc::new(AttemptPacer::new()),
+            rx,
+            0,
+        );
 
         let query = QuerySpec {
             host: "example.com.".into(),
