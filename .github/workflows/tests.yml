@@ -37,17 +37,3 @@ jobs:
       pytest-args: blastdns/tests tests/cli_tests.py -vv
       setup-script: scripts/ci-setup.sh
       teardown-script: scripts/ci-teardown.sh
-
-  # Reports the contexts the protecc ruleset requires today. Remove once it requires rust / passed and python / passed.
-  required:
-    name: ${{ matrix.context }}
-    if: always()
-    needs: [rust, clippy-python-feature, python]
-    runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        context: ["python-tests (3.11)", "python-tests (3.12)", "python-tests (3.13)", "python-tests (3.14)", "python-tests (3.15)", rust-tests]
-    steps:
-      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
-        with:
-          jobs: ${{ toJSON(needs) }}
