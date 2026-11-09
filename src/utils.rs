@@ -135,7 +135,7 @@ pub fn get_system_resolvers() -> Result<Vec<IpAddr>, BlastDNSError> {
     let resolver_ips: Vec<IpAddr> = config
         .name_servers()
         .iter()
-        .map(|ns| ns.socket_addr.ip())
+        .map(|ns| ns.ip)
         .collect::<HashSet<_>>() // Deduplicate
         .into_iter()
         .collect();
