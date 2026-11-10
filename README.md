@@ -470,17 +470,17 @@ from blastdns import MockClient, DNSResult
 def mock_client():
     """Create a mock client with pre-configured test data."""
     client = MockClient()
-    client.mock_dns({
-        "example.com": {
-            "A": ["93.184.216.34"],
-            "AAAA": ["2606:2800:220:1:248:1893:25c8:1946"],
-            "MX": ["10 aspmx.l.google.com.", "20 alt1.aspmx.l.google.com."],
-        },
-        "cname.example.com": {
-            "CNAME": ["example.com."]
-        },
-        "_NXDOMAIN": ["notfound.example.com"],  # hosts that return NXDOMAIN
-    })
+    client.mock_dns(
+        {
+            "example.com": {
+                "A": ["93.184.216.34"],
+                "AAAA": ["2606:2800:220:1:248:1893:25c8:1946"],
+                "MX": ["10 aspmx.l.google.com.", "20 alt1.aspmx.l.google.com."],
+            },
+            "cname.example.com": {"CNAME": ["example.com."]},
+            "_NXDOMAIN": ["notfound.example.com"],  # hosts that return NXDOMAIN
+        }
+    )
     return client
 
 
@@ -515,16 +515,18 @@ Hostnames prefixed with `regex:` are treated as regex patterns, enabling wildcar
 
 ```python
 client = MockClient()
-client.mock_dns({
-    # Exact match
-    "specific.example.com": {"A": ["10.0.0.1"]},
-    # Regex: match any subdomain of example.com
-    "regex:.*\\.example\\.com": {"A": ["192.168.1.1"]},
-    # Regex: match numbered servers
-    "regex:^server-\\d+\\.test\\.com$": {"A": ["10.0.0.1"]},
-    # Regex patterns work for NXDOMAIN too
-    "_NXDOMAIN": ["regex:^bad-.*\\.example\\.com$"],
-})
+client.mock_dns(
+    {
+        # Exact match
+        "specific.example.com": {"A": ["10.0.0.1"]},
+        # Regex: match any subdomain of example.com
+        "regex:.*\\.example\\.com": {"A": ["192.168.1.1"]},
+        # Regex: match numbered servers
+        "regex:^server-\\d+\\.test\\.com$": {"A": ["10.0.0.1"]},
+        # Regex patterns work for NXDOMAIN too
+        "_NXDOMAIN": ["regex:^bad-.*\\.example\\.com$"],
+    }
+)
 ```
 
 Exact matches take priority over regex patterns. When multiple regex patterns match, the first match wins.
