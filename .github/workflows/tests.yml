@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           components: clippy
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -37,17 +37,3 @@ jobs:
       pytest-args: blastdns/tests tests/cli_tests.py -vv
       setup-script: scripts/ci-setup.sh
       teardown-script: scripts/ci-teardown.sh
-
-  # Reports the contexts the protecc ruleset requires today. Remove once it requires rust / passed and python / passed.
-  required:
-    name: ${{ matrix.context }}
-    if: always()
-    needs: [rust, clippy-python-feature, python]
-    runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        context: ["python-tests (3.11)", "python-tests (3.12)", "python-tests (3.13)", "python-tests (3.14)", "python-tests (3.15)", rust-tests]
-    steps:
-      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
-        with:
-          jobs: ${{ toJSON(needs) }}

@@ -135,7 +135,7 @@ pub fn get_system_resolvers() -> Result<Vec<IpAddr>, BlastDNSError> {
     let resolver_ips: Vec<IpAddr> = config
         .name_servers()
         .iter()
-        .map(|ns| ns.socket_addr.ip())
+        .map(|ns| ns.ip)
         .collect::<HashSet<_>>() // Deduplicate
         .into_iter()
         .collect();
@@ -147,6 +147,11 @@ pub fn get_system_resolvers() -> Result<Vec<IpAddr>, BlastDNSError> {
     }
 
     Ok(resolver_ips)
+}
+
+/// Socket addresses for system resolvers, on the standard DNS port.
+pub(crate) fn system_resolver_addrs(ips: Vec<IpAddr>) -> Vec<SocketAddr> {
+    ips.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect()
 }
 
 /// Format an IP address for PTR lookup.
@@ -190,6 +195,20 @@ pub fn format_ptr_query(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_resolver_addrs_keep_ipv6_addresses() {
+        let ips: Vec<IpAddr> = ["2001:db8::1", "2001:db8:1:2:3:4:5:6", "8.8.8.8"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let addrs = system_resolver_addrs(ips.clone());
+        assert_eq!(addrs.len(), ips.len());
+        for (addr, ip) in addrs.iter().zip(&ips) {
+            assert_eq!(addr.ip(), *ip);
+            assert_eq!(addr.port(), 53);
+        }
+    }
 
     #[test]
     fn format_ptr_query_handles_ipv4() {

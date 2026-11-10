@@ -24,7 +24,10 @@ use crate::{
     health::{ResolverPool, ResolverStats},
     limiter::{AttemptPacer, RateLimiter, UNLIMITED_QPS},
     resolver::DnsResolver,
-    utils::{check_ulimits, format_ptr_query, get_system_resolvers, parse_resolver},
+    utils::{
+        check_ulimits, format_ptr_query, get_system_resolvers, parse_resolver,
+        system_resolver_addrs,
+    },
     worker::{QuerySpec, ResolverWorker, WorkItem},
 };
 
@@ -110,21 +113,14 @@ impl BlastDNSClient {
         resolvers: Vec<String>,
         config: BlastDNSConfig,
     ) -> Result<Self, BlastDNSError> {
-        let resolvers = if resolvers.is_empty() {
-            // Get system resolvers and format them as strings
-            let system_ips = get_system_resolvers()?;
-            system_ips
-                .into_iter()
-                .map(|ip| format!("{}:53", ip))
-                .collect()
+        let parsed: Vec<SocketAddr> = if resolvers.is_empty() {
+            system_resolver_addrs(get_system_resolvers()?)
         } else {
             resolvers
+                .into_iter()
+                .map(|input| parse_resolver(&input))
+                .collect::<Result<_, _>>()?
         };
-
-        let parsed: Vec<SocketAddr> = resolvers
-            .into_iter()
-            .map(|input| parse_resolver(&input))
-            .collect::<Result<_, _>>()?;
 
         // A persistent socket puts every query for a resolver through one
         // multiplexed client, whose request channel hickory bounds at
