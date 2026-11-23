@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossfire::MAsyncRx;
+use crossfire::{MAsyncRx, mpmc};
 use hickory_client::{
     client::ClientHandle,
     proto::{
@@ -55,7 +55,7 @@ pub(crate) struct ResolverWorker {
     pool: Arc<ResolverPool>,
     limiter: Arc<RateLimiter>,
     pacer: Arc<AttemptPacer>,
-    work_rx: MAsyncRx<WorkItem>,
+    work_rx: MAsyncRx<mpmc::Array<WorkItem>>,
 }
 
 impl ResolverWorker {
@@ -64,7 +64,7 @@ impl ResolverWorker {
         pool: Arc<ResolverPool>,
         limiter: Arc<RateLimiter>,
         pacer: Arc<AttemptPacer>,
-        work_rx: MAsyncRx<WorkItem>,
+        work_rx: MAsyncRx<mpmc::Array<WorkItem>>,
         worker_idx: usize,
     ) {
         tokio::spawn(async move {
