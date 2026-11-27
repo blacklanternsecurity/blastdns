@@ -16,7 +16,7 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-    uses: blacklanternsecurity/release-workflows/.github/workflows/release-check.yml@b697b5ee082318796a6c52f98fac775ddfd37f33 # v1.2.0
+    uses: blacklanternsecurity/release-workflows/.github/workflows/release-check.yml@4f32510b1cdfe7305aa27daa3f6fd72e4c03c21b # v1.5.0
     secrets:
       BLS_RELEASE_PRIVATE_KEY: ${{ secrets.BLS_RELEASE_PRIVATE_KEY }}
 
@@ -31,7 +31,7 @@ jobs:
     needs: tests
     permissions:
       contents: read
-    uses: blacklanternsecurity/release-workflows/.github/workflows/maturin-wheels.yml@b697b5ee082318796a6c52f98fac775ddfd37f33 # v1.2.0
+    uses: blacklanternsecurity/release-workflows/.github/workflows/maturin-wheels.yml@4f32510b1cdfe7305aa27daa3f6fd72e4c03c21b # v1.5.0
 
   crates:
     needs: [check, pypi]
@@ -39,7 +39,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: blacklanternsecurity/release-workflows/.github/workflows/crates.yml@b697b5ee082318796a6c52f98fac775ddfd37f33 # v1.2.0
+    uses: blacklanternsecurity/release-workflows/.github/workflows/crates.yml@4f32510b1cdfe7305aa27daa3f6fd72e4c03c21b # v1.5.0
     with:
       version: ${{ needs.check.outputs.version }}
 
@@ -69,7 +69,7 @@ jobs:
     if: needs.check.outputs.release == 'true'
     permissions:
       contents: read
-    uses: blacklanternsecurity/release-workflows/.github/workflows/publish.yml@b697b5ee082318796a6c52f98fac775ddfd37f33 # v1.2.0
+    uses: blacklanternsecurity/release-workflows/.github/workflows/publish.yml@4f32510b1cdfe7305aa27daa3f6fd72e4c03c21b # v1.5.0
     with:
       tag: ${{ needs.check.outputs.tag }}
       version: ${{ needs.check.outputs.version }}
